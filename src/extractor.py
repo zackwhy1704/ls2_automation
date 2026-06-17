@@ -23,27 +23,47 @@ logger = logging.getLogger(__name__)
 
 # We ask the model for a flat JSON object with these keys (a superset of WOPayload's source fields,
 # plus confidence + low_confidence_fields). source_path is injected by us, not the model.
-_SYSTEM_PROMPT = """You extract billing fields from a single Work Order (WO) for a pest control company.
-The WO may be supplied as a PDF document or as the plain text of an email.
+_SYSTEM_PROMPT = """You extract billing fields from a single Town Council Work Order (WO) for a pest
+control contractor (LS 2 Services). The WO may be supplied as a PDF document or as the plain text of
+an email.
+
+Layout cues from these WOs (use them, but rely on the actual document):
+- Header line: "WO Date <DD-Mon-YYYY>  No. WO-PO/<digits>".
+- A "G/L <code>" appears near the top, e.g. "731-AN-ANVZLRes-Contractor". There may ALSO be a long
+  numeric account "No. 541330-1-721010-0000". The gl_number we want is the ALPHANUMERIC code that
+  starts with digits then a hyphen and letters (e.g. "731-AN-ANVZLRes-..."), NOT the long numeric.
+- "Remarks:" holds the location + nature of work, e.g.
+  "Blk 330A Anchorvale Street - Inspection for beehive activities at Level 15 - No bees found".
+- A line like "Job Sheet: <number> A <qty> $<rate> $<gross> $<jobcost>" holds the job sheet number,
+  quantity, and the gross Rate (unit_price). There is usually a "Discount %", "Discount Amt",
+  "9% GST", and "Grand Total".
+- "SR" / "Schedule" reference may appear in the email subject/body, e.g. "(SR: 25955)".
 
 Return ONLY a JSON object — no prose, no markdown code fences, no explanation. Use exactly these keys:
 
 {
-  "wo_po_number": string,        // format "WO-PO/" followed by digits, e.g. "WO-PO/123456789"
-  "job_sheet_number": string,    // the job sheet reference; preserve its exact leading character
-  "service_location": string,
-  "nature_of_work": string,      // a short description of the pest control work performed
-  "job_date": string,            // ISO date "YYYY-MM-DD"
-  "prepared_by": string,         // person who prepared the WO (becomes the customer contact)
-  "gl_number": string,           // the GL number; this is CRITICAL — if you cannot find it, return ""
-  "quantity": number,
-  "unit_price": number,
+  "wo_po_number": string,        // "WO-PO/" + digits, preserve leading zeros, e.g. "WO-PO/000060068"
+  "town_council": string,        // the town council name from the header, e.g. "Sengkang Town Council"
+  "job_sheet_number": string,    // the "Job Sheet:" value, e.g. "25955"; preserve its leading char
+  "service_location": string,    // block/street from Remarks, e.g. "Blk 330A Anchorvale Street"
+  "nature_of_work": string,      // the work description from Remarks, e.g. "Inspection for beehive activities..."
+  "job_date": string,            // the WO Date as ISO "YYYY-MM-DD"
+  "prepared_by": string,         // the "Prepared By" person, e.g. "JENNY ANG"
+  "gl_number": string,           // the alphanumeric G/L code (e.g. "731-AN-ANVZLRes-..."); CRITICAL — "" if truly absent
+  "quantity": number,            // the line quantity, e.g. 1.0
+  "unit_price": number,          // the gross Rate per unit before discount, e.g. 30.00
+  "discount_percent": number,    // e.g. 10.0 (0 if none)
+  "discount_amount": number,     // e.g. 3.00 (0 if none)
+  "net_amount": number,          // gross less discount, before GST, e.g. 27.00
+  "gst_percent": number,         // e.g. 9.0 (0 if none)
+  "grand_total": number,         // net + GST, e.g. 29.43
+  "sr_number": string,           // the SR/Schedule reference if present, else ""
   "confidence": number,          // your overall confidence 0..1
-  "low_confidence_fields": [string]  // names of any fields you are unsure about (especially gl_number)
+  "low_confidence_fields": [string]  // fields you are unsure about (especially gl_number)
 }
 
-If a field is genuinely absent from the PDF, return an empty string (or 0 for numbers) and add its name
-to low_confidence_fields. Never invent values.
+If a field is genuinely absent, return an empty string (or 0 for numbers) and add its name to
+low_confidence_fields. Never invent values.
 """
 
 
@@ -152,9 +172,22 @@ def _finalize(raw: str, *, source_path: str) -> WOPayload:
     if low_conf:
         logger.warning("%s: model flagged low-confidence fields: %s", Path(source_path).name, low_conf)
 
+    def _opt_float(key: str) -> float | None:
+        """Optional numeric: missing/empty/0 -> None, so 'absent' is distinct from a real 0.00."""
+        v = data.get(key)
+        if v in (None, "", 0, 0.0):
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    sr = str(data.get("sr_number", "") or "").strip()
+
     try:
         payload = WOPayload(
             wo_po_number=str(data.get("wo_po_number", "")),
+            town_council=str(data.get("town_council", "") or ""),
             job_sheet_number=str(data.get("job_sheet_number", "")),
             service_location=str(data.get("service_location", "")),
             nature_of_work=str(data.get("nature_of_work", "")),
@@ -163,6 +196,12 @@ def _finalize(raw: str, *, source_path: str) -> WOPayload:
             gl_number=str(data.get("gl_number", "")),
             quantity=float(data.get("quantity", 0) or 0),
             unit_price=float(data.get("unit_price", 0) or 0),
+            discount_percent=_opt_float("discount_percent"),
+            discount_amount=_opt_float("discount_amount"),
+            net_amount=_opt_float("net_amount"),
+            gst_percent=_opt_float("gst_percent"),
+            grand_total=_opt_float("grand_total"),
+            sr_number=sr or None,
             source_path=source_path,
             extraction_confidence=float(confidence) if confidence is not None else None,
         )

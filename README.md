@@ -54,9 +54,9 @@ There are two WO ingestion sources. DRY_RUN defaults to true — the Synergix dr
 EXCEPT the final submit/confirm clicks.
 
 ```bash
-# Email flow — ingest Work Orders from .eml files (a single file or a directory of them):
-python -m src.main --emails path/to/eml-dir
-python -m src.main path/to/one-wo.eml          # single .eml shorthand
+# Email flow — ingest Work Orders from .msg (Outlook) or .eml files (single file or a directory):
+python -m src.main --emails path/to/email-dir
+python -m src.main path/to/one-wo.msg          # single .msg/.eml shorthand
 
 # TCMS scrape flow — pull un-invoiced WOs from the TCMS web portal:
 python -m src.main
@@ -69,19 +69,20 @@ logged only).
 
 ### Email ingestion details
 
-`src/email_ingestor.py` parses each `.eml` and captures **both** a PDF attachment (if present) and
-the decoded body text, plus a copy of the original `.eml`. The extractor then uses:
+`src/email_ingestor.py` parses each `.msg`/`.eml` and, based on the real SKTC samples:
 
-- the **PDF attachment** when one exists (sent to Haiku as a document), or
-- the **inline body text** as a fallback (sent as text).
+- extracts **each PDF attachment as one Work Order** — a single email can carry several WOs
+  (e.g. "AN Division - 3 Work Orders" → 3 PDFs → 3 WOs), each processed independently;
+- filters out inline signature images (`image001.png`, …) so they are never treated as WOs;
+- keeps the email body text as a fallback when an email has no PDF attachment;
+- saves a copy of the original email so Synergix stage D always has a file to attach.
 
-The WO source file (PDF, or the `.eml` if there's no attachment) is what Synergix stage D attaches.
-You can test ingestion + extraction in isolation, no Synergix needed:
+The extractor sends the WO **PDF** to Haiku as a document (preferred), or the **body text** when
+there is no PDF. You can test ingestion + extraction in isolation, no Synergix needed:
 
 ```bash
-python -m src.email_ingestor path/to/wo.eml     # show what was parsed out (no LLM)
-python -m src.extractor path/to/wo.eml           # run Haiku extraction on it (needs ANTHROPIC_API_KEY)
-python -m src.extractor path/to/wo.pdf           # or on a PDF directly
+python -m src.email_ingestor path/to/wo.msg     # show what was parsed out (no LLM, no API key)
+python -m src.extractor data/pdfs/000060068.pdf  # run Haiku extraction on a WO PDF (needs ANTHROPIC_API_KEY)
 ```
 
 To go live (only after explicit approval): set `DRY_RUN=false` in `.env`.
@@ -143,7 +144,7 @@ Search the codebase for `TODO(human)` — every real-world unknown is marked the
 | [config/selectors.py](config/selectors.py) | ALL DOM selectors as `TODO_SELECTOR` placeholders |
 | [src/models.py](src/models.py) | `WOPayload`, `WOStatus`, project-code mapping |
 | [src/db.py](src/db.py) | SQLite schema + CRUD for WO state (resumable, auditable) |
-| [src/email_ingestor.py](src/email_ingestor.py) | Parse `.eml`: extract PDF attachment + body text |
+| [src/email_ingestor.py](src/email_ingestor.py) | Parse `.msg`/`.eml`: one WO per PDF attachment + body fallback |
 | [src/tcms_scraper.py](src/tcms_scraper.py) | Playwright: login, list un-invoiced WOs, download PDFs |
 | [src/extractor.py](src/extractor.py) | Claude Haiku: PDF *or* email text → structured JSON + confidence |
 | [src/validator.py](src/validator.py) | Validation rules + project-code resolution + remarks builder |

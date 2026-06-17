@@ -1,14 +1,16 @@
-"""Ingest Work Orders from `.eml` email files.
+"""Ingest Work Orders from email files (`.msg` Outlook or `.eml` MIME).
 
-Replaces the TCMS web scraper as the WO source for the email-based flow. Parses an .eml with the
-stdlib `email` package and produces, per email, an `IngestedWO`:
+Replaces the TCMS web scraper as the WO source for the email-based flow. From the real samples, each
+email carries the Work Order(s) as **PDF attachment(s)** (e.g. `000060068.pdf`); the body is a cover
+note, and inline `image00N.png` parts are email-signature images, not WOs.
 
-  - any PDF attachment(s) saved to data/pdfs/  (preferred WO source)
-  - the plain-text body (fallback / supplement when the WO is inline, not attached)
+A single email may contain MULTIPLE WOs (one PDF each), so ingestion yields ONE `IngestedWO` per PDF
+attachment. When an email has no PDF at all, a single `IngestedWO` is still produced with the email
+body as the source (the saved email file is what Synergix would attach), so the extractor can fall
+back to inline body text.
 
-We do NOT assume the WO is a PDF attachment vs. inline body — both are captured so the extractor can
-use whichever is present. The original .eml is also copied to data/pdfs/ so the Synergix "attach"
-step always has a file to upload even when there is no PDF attachment.
+The original email is always copied into data/pdfs/ so the Synergix "attach" step has a file even
+when there is no PDF attachment.
 """
 from __future__ import annotations
 
@@ -28,24 +30,25 @@ _PDF_CT = "application/pdf"
 
 @dataclass
 class IngestedWO:
-    """The raw materials extracted from one email, before LLM field extraction."""
+    """One Work Order's raw materials, before LLM field extraction.
 
-    eml_path: str                       # source .eml, copied into data/pdfs/
-    pdf_paths: list[str] = field(default_factory=list)  # saved PDF attachment(s), if any
-    body_text: str = ""                 # plain-text body (decoded), if any
+    One per PDF attachment. For a body-only email, pdf_path is None and the source is the saved email.
+    """
+
+    source_email_path: str              # the saved original .msg/.eml
+    pdf_path: str | None = None         # the single WO PDF for this unit (None for body-only emails)
+    body_text: str = ""                 # decoded email body (cover note / fallback WO text)
     subject: str = ""
+    attachment_name: str = ""           # original attachment filename, for logging/audit
 
     @property
     def primary_source_path(self) -> str:
-        """The file the extractor should read, and the file Synergix attaches.
-
-        Prefer the first PDF attachment; fall back to the saved .eml when there is no PDF.
-        """
-        return self.pdf_paths[0] if self.pdf_paths else self.eml_path
+        """The file the extractor reads and Synergix attaches: the PDF if present, else the email."""
+        return self.pdf_path or self.source_email_path
 
     @property
     def has_pdf(self) -> bool:
-        return bool(self.pdf_paths)
+        return self.pdf_path is not None
 
 
 def _safe_stem(name: str) -> str:
@@ -54,17 +57,17 @@ def _safe_stem(name: str) -> str:
     return stem[:80] or "wo"
 
 
-def _decode_body_text(msg: Message) -> str:
-    """Return a best-effort plain-text rendering of the email body.
+def _is_pdf_attachment(filename: str, content_type: str) -> bool:
+    return content_type == _PDF_CT or filename.lower().endswith(".pdf")
 
-    Prefers text/plain parts; falls back to stripped text/html if that's all there is.
-    """
+
+# ---------------------------------------------------------------------------- .eml (MIME) parsing
+def _eml_body_text(msg: Message) -> str:
     plain_chunks: list[str] = []
     html_chunks: list[str] = []
     for part in msg.walk():
         if part.is_multipart():
             continue
-        ctype = part.get_content_type()
         disp = (part.get("Content-Disposition") or "").lower()
         if "attachment" in disp:
             continue
@@ -76,97 +79,138 @@ def _decode_body_text(msg: Message) -> str:
             text = payload.decode(charset, errors="replace")
         except (LookupError, ValueError):
             text = payload.decode("utf-8", errors="replace")
-        if ctype == "text/plain":
+        if part.get_content_type() == "text/plain":
             plain_chunks.append(text)
-        elif ctype == "text/html":
+        elif part.get_content_type() == "text/html":
             html_chunks.append(text)
-
     if plain_chunks:
         return "\n".join(plain_chunks).strip()
     if html_chunks:
-        # Crude HTML -> text: drop tags. Good enough to feed an LLM; not for display.
         stripped = re.sub(r"<[^>]+>", " ", "\n".join(html_chunks))
         return re.sub(r"[ \t]+", " ", stripped).strip()
     return ""
 
 
-def _save_pdf_attachments(msg: Message, stem: str) -> list[str]:
-    saved: list[str] = []
-    idx = 0
+def _eml_pdf_attachments(msg: Message) -> list[tuple[str, bytes]]:
+    out: list[tuple[str, bytes]] = []
     for part in msg.walk():
         if part.is_multipart():
             continue
-        ctype = part.get_content_type()
         filename = part.get_filename() or ""
-        disp = (part.get("Content-Disposition") or "").lower()
-        is_pdf = ctype == _PDF_CT or filename.lower().endswith(".pdf")
-        if not is_pdf:
+        if not _is_pdf_attachment(filename, part.get_content_type()):
             continue
-        # Treat as an attachment even if Content-Disposition is missing, as long as it's a PDF.
         payload = part.get_payload(decode=True)
-        if not payload:
-            continue
-        idx += 1
-        out_name = _safe_stem(Path(filename).stem) if filename else f"{stem}_attach{idx}"
-        dest = settings.PDF_DIR / f"{out_name}.pdf"
-        dest.write_bytes(payload)
-        saved.append(str(dest))
-        logger.info("Saved PDF attachment: %s (disposition=%r)", dest, disp or "none")
-    return saved
+        if payload:
+            out.append((filename or "attachment.pdf", payload))
+    return out
 
 
-def ingest_file(eml_path: str) -> IngestedWO:
-    """Parse one .eml and return its WO materials. Raises FileNotFoundError if missing."""
-    src = Path(eml_path)
-    raw = src.read_bytes()
+def _parse_eml(raw: bytes) -> tuple[str, str, list[tuple[str, bytes]]]:
     msg = email.message_from_bytes(raw)
-
     subject = str(msg.get("Subject", "")).strip()
+    return subject, _eml_body_text(msg), _eml_pdf_attachments(msg)
+
+
+# ---------------------------------------------------------------------------- .msg (Outlook) parsing
+def _parse_msg(path: Path) -> tuple[str, str, list[tuple[str, bytes]]]:
+    # Imported lazily so the pure-logic test suite needn't have extract-msg installed.
+    import extract_msg
+
+    m = extract_msg.Message(str(path))
+    subject = (m.subject or "").strip()
+    body = m.body or ""
+    pdfs: list[tuple[str, bytes]] = []
+    for a in m.attachments:
+        name = a.longFilename or a.shortFilename or ""
+        ctype = (getattr(a, "mimetype", None) or "").lower()
+        if not _is_pdf_attachment(name, ctype):
+            continue  # skips inline image00N.png signature images
+        data = a.data
+        if isinstance(data, (bytes, bytearray)):
+            pdfs.append((name or "attachment.pdf", bytes(data)))
+    return subject, body.strip(), pdfs
+
+
+# ---------------------------------------------------------------------------- public API
+def ingest_file(path_str: str) -> list[IngestedWO]:
+    """Parse one email file (.msg or .eml) into a list of WOs — one per PDF attachment.
+
+    Returns a list because a single email may carry multiple Work Orders. A body-only email yields a
+    single body-source WO. Raises FileNotFoundError if the file is missing; unsupported suffixes raise
+    ValueError.
+    """
+    src = Path(path_str)
+    raw = src.read_bytes()
+    suffix = src.suffix.lower()
+
+    if suffix == ".msg":
+        subject, body_text, pdf_attachments = _parse_msg(src)
+    elif suffix == ".eml":
+        subject, body_text, pdf_attachments = _parse_eml(raw)
+    else:
+        raise ValueError(f"unsupported email format {suffix!r} (expected .msg or .eml): {src.name}")
+
     stem = _safe_stem(subject or src.stem)
+    # Preserve the original extension on the saved copy so it can be re-opened if needed.
+    email_copy = settings.PDF_DIR / f"{stem}{suffix}"
+    email_copy.write_bytes(raw)
 
-    # Copy the original .eml into the data dir so it's the fallback Synergix attachment.
-    eml_copy = settings.PDF_DIR / f"{stem}.eml"
-    eml_copy.write_bytes(raw)
+    wos: list[IngestedWO] = []
+    for idx, (att_name, data) in enumerate(pdf_attachments, start=1):
+        out_name = _safe_stem(Path(att_name).stem) or f"{stem}_attach{idx}"
+        dest = settings.PDF_DIR / f"{out_name}.pdf"
+        dest.write_bytes(data)
+        logger.info("Saved WO PDF: %s (from attachment %r)", dest, att_name)
+        wos.append(
+            IngestedWO(
+                source_email_path=str(email_copy),
+                pdf_path=str(dest),
+                body_text=body_text,
+                subject=subject,
+                attachment_name=att_name,
+            )
+        )
 
-    pdf_paths = _save_pdf_attachments(msg, stem)
-    body_text = _decode_body_text(msg)
+    if not wos:
+        # No PDF — fall back to a single body-source WO.
+        logger.info("No PDF attachment in %s; using email body as WO source", src.name)
+        wos.append(
+            IngestedWO(
+                source_email_path=str(email_copy),
+                pdf_path=None,
+                body_text=body_text,
+                subject=subject,
+            )
+        )
 
-    logger.info(
-        "Ingested %s: subject=%r pdf_attachments=%d body_chars=%d",
-        src.name, subject, len(pdf_paths), len(body_text),
-    )
-    return IngestedWO(
-        eml_path=str(eml_copy),
-        pdf_paths=pdf_paths,
-        body_text=body_text,
-        subject=subject,
-    )
+    logger.info("Ingested %s: subject=%r -> %d WO unit(s)", src.name, subject, len(wos))
+    return wos
 
 
 def ingest_dir(dir_path: str) -> list[IngestedWO]:
-    """Ingest every .eml in a directory (non-recursive). Per-file errors are logged, not fatal."""
+    """Ingest every .msg/.eml in a directory (non-recursive). Per-file errors are logged, not fatal."""
     results: list[IngestedWO] = []
-    for p in sorted(Path(dir_path).glob("*.eml")):
+    paths = sorted(p for p in Path(dir_path).iterdir() if p.suffix.lower() in {".msg", ".eml"})
+    for p in paths:
         try:
-            results.append(ingest_file(str(p)))
+            results.extend(ingest_file(str(p)))
         except Exception:
             logger.exception("Failed to ingest %s — skipping", p)
-    logger.info("Ingested %d email(s) from %s", len(results), dir_path)
+    logger.info("Ingested %d WO unit(s) from %d email(s) in %s", len(results), len(paths), dir_path)
     return results
 
 
 if __name__ == "__main__":
-    # Standalone test: `python -m src.email_ingestor path/to/wo.eml`  (or a directory of .eml)
+    # Standalone test: `python -m src.email_ingestor <file.msg|.eml | dir>`  (no LLM, no network)
     import sys
 
     settings.configure_logging()
     if len(sys.argv) < 2:
-        print("usage: python -m src.email_ingestor <file.eml | dir-of-emls>")
+        print("usage: python -m src.email_ingestor <file.msg|.eml | dir>")
         raise SystemExit(2)
     target = Path(sys.argv[1])
-    items = ingest_dir(str(target)) if target.is_dir() else [ingest_file(str(target))]
+    items = ingest_dir(str(target)) if target.is_dir() else ingest_file(str(target))
     for wo in items:
-        print(f"- subject={wo.subject!r}")
+        print(f"- subject={wo.subject!r} attachment={wo.attachment_name!r}")
         print(f"  primary_source={wo.primary_source_path}")
-        print(f"  pdf_attachments={wo.pdf_paths}")
-        print(f"  body_preview={wo.body_text[:200]!r}")
+        print(f"  has_pdf={wo.has_pdf}  body_preview={wo.body_text[:160]!r}")

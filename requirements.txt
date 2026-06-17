@@ -8,6 +8,9 @@ playwright>=1.42
 # --- LLM extraction ---
 anthropic>=0.40
 
+# --- Email ingestion ---
+extract-msg>=0.48        # parse Outlook .msg (CDFV2) files
+
 # --- Telegram (async) ---
 python-telegram-bot>=21.0,<22
 

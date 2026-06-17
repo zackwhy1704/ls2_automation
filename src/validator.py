@@ -77,18 +77,23 @@ def _wo_po_suffix(wo_po_number: str) -> str:
     return wo_po_number.split("/", 1)[1] if "/" in wo_po_number else wo_po_number
 
 
-# Configurable so the client can tweak wording without touching logic.
-# TODO(human): confirm exact remarks template with client.
+# Configurable so the client can tweak wording without touching logic. The town council is taken
+# from the WO (real samples are Sengkang TC, not Jalan Besar) rather than hardcoded.
+# TODO(human): confirm exact remarks template + wording with client (and the fallback council name).
 REMARKS_TEMPLATE = (
-    "Jalan Besar Town Council – {service_location}. Remarks: {service_location}. "
+    "{town_council} – {service_location}. Remarks: {service_location}. "
     "Job done on {job_date}. {nature_of_work}. Job Sheet: {job_sheet_number}. "
     "WO-PO/{wo_po_suffix}."
 )
+
+# Used only if the WO header didn't yield a town council name.
+DEFAULT_TOWN_COUNCIL = "Town Council"
 
 
 def build_remarks(payload: WOPayload, *, template: str = REMARKS_TEMPLATE) -> str:
     """Build the Synergix remarks string. Pure function — testable in isolation."""
     return template.format(
+        town_council=payload.town_council.strip() or DEFAULT_TOWN_COUNCIL,
         service_location=payload.service_location,
         job_date=payload.job_date.strftime("%d/%m/%Y"),
         nature_of_work=payload.nature_of_work,

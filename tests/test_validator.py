@@ -17,6 +17,7 @@ from src.validator import (
 def make_payload(**overrides) -> WOPayload:
     base = dict(
         wo_po_number="WO-PO/123456789",
+        town_council="Sengkang Town Council",
         job_sheet_number="A1023",
         service_location="Block 123 Jalan Besar",
         nature_of_work="Cockroach treatment",
@@ -92,12 +93,17 @@ def test_unresolvable_project_code_flagged():
 
 def test_remarks_format():
     remarks = build_remarks(make_payload())
-    assert "Jalan Besar Town Council – Block 123 Jalan Besar." in remarks
+    assert "Sengkang Town Council – Block 123 Jalan Besar." in remarks  # council from the WO, not hardcoded
     assert "Remarks: Block 123 Jalan Besar." in remarks
     assert "Job done on 15/01/2026." in remarks
     assert "Cockroach treatment." in remarks
     assert "Job Sheet: A1023." in remarks
     assert "WO-PO/123456789." in remarks
+
+
+def test_remarks_falls_back_to_default_council_when_blank():
+    remarks = build_remarks(make_payload(town_council=""))
+    assert "Town Council – Block 123 Jalan Besar." in remarks
 
 
 def test_remarks_uses_wo_po_suffix_only():

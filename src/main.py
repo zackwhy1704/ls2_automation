@@ -120,12 +120,12 @@ async def _validate_dedup_queue(
 
 
 async def run_ingest_emails(gate: TelegramGate, eml_source: str) -> int:
-    """Email path: ingest .eml file(s) -> extract -> validate -> dedup -> queue. Returns count queued.
+    """Email path: ingest email(s) -> extract -> validate -> dedup -> queue. Returns count queued.
 
-    `eml_source` is a single .eml file or a directory of .eml files. Per-email error isolation:
-    one bad email never aborts the batch.
+    `eml_source` is a single .msg/.eml file or a directory of them. Each PDF attachment is one WO
+    (so one email may yield several). Per-WO error isolation: one bad WO never aborts the batch.
     """
-    items = ingest_dir(eml_source) if Path(eml_source).is_dir() else [ingest_file(eml_source)]
+    items = ingest_dir(eml_source) if Path(eml_source).is_dir() else ingest_file(eml_source)
     if not items:
         await notifier.send_no_new_wos(gate.bot)
         return 0
@@ -135,14 +135,14 @@ async def run_ingest_emails(gate: TelegramGate, eml_source: str) -> int:
     try:
         await synergix.start()
         for wo in items:
-            label = wo.subject or wo.primary_source_path
+            label = wo.attachment_name or wo.subject or wo.primary_source_path
             try:
                 # Prefer the PDF attachment; fall back to inline body text. The WO-PO number is not
                 # known until after extraction, so the DB row is created keyed by it post-extract.
                 if wo.has_pdf:
-                    payload = extract_from_pdf(wo.pdf_paths[0])
+                    payload = extract_from_pdf(wo.pdf_path)
                 else:
-                    payload = extract_from_text(wo.body_text, source_path=wo.eml_path)
+                    payload = extract_from_text(wo.body_text, source_path=wo.source_email_path)
                 await db.upsert_scraped(payload.wo_po_number, payload.source_path)
 
                 await _validate_dedup_queue(payload, synergix, gate)

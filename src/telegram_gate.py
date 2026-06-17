@@ -53,16 +53,28 @@ def _format_message(payload: WOPayload, project_code: str, remarks: str) -> str:
             f"\n⚠️ low confidence ({conf:.2f}) — verify all fields against the PDF, "
             "especially gl_number"
         )
+    # Pricing line: show the full breakdown when present so the admin can sanity-check.
+    price = f"Qty x Rate: {payload.quantity} x {payload.unit_price}"
+    if payload.discount_amount:
+        price += f"  (−{payload.discount_amount} disc)"
+    if payload.net_amount is not None:
+        price += f"  → net {payload.net_amount}"
+    if payload.grand_total is not None:
+        price += f"  | grand total {payload.grand_total}"
+
+    sr = f"\nSR: {payload.sr_number}" if payload.sr_number else ""
+    council = f"{payload.town_council} | " if payload.town_council else ""
+
     return (
         f"🧾 *Work Order for approval*\n"
-        f"WO-PO: {payload.wo_po_number}\n"
+        f"{council}WO-PO: {payload.wo_po_number}{sr}\n"
         f"Job Sheet: {payload.job_sheet_number}  →  Project code: {project_code}\n"
         f"Location: {payload.service_location}\n"
         f"Nature: {payload.nature_of_work}\n"
         f"Job date: {payload.job_date.strftime('%d/%m/%Y')}\n"
         f"Prepared by: {payload.prepared_by}\n"
         f"GL: {payload.gl_number}\n"
-        f"Qty x Unit: {payload.quantity} x {payload.unit_price}\n"
+        f"{price}\n"
         f"\nRemarks preview:\n{remarks}"
         f"{flag}"
     )
