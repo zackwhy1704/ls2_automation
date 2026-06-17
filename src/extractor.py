@@ -1,4 +1,8 @@
-"""Claude Haiku PDF field extraction: PDF bytes -> structured WOPayload + confidence.
+"""Claude Haiku WO field extraction: a WO source (PDF or text) -> structured WOPayload + confidence.
+
+Handles both forms a Work Order can arrive in:
+  - a PDF (a PDF attachment from an email, or a scraped TCMS PDF) -> sent as a document block
+  - inline email body text                                        -> sent as a text block
 
 Parses defensively (strips stray markdown fences, tolerates a confidence/flags wrapper) and
 validates into a WOPayload. On any parse/validation failure the caller marks the WO INVALID and the
@@ -18,8 +22,9 @@ from src.models import WOPayload
 logger = logging.getLogger(__name__)
 
 # We ask the model for a flat JSON object with these keys (a superset of WOPayload's source fields,
-# plus confidence + low_confidence_fields). pdf_path is injected by us, not the model.
-_SYSTEM_PROMPT = """You extract billing fields from a single Work Order (WO) PDF for a pest control company.
+# plus confidence + low_confidence_fields). source_path is injected by us, not the model.
+_SYSTEM_PROMPT = """You extract billing fields from a single Work Order (WO) for a pest control company.
+The WO may be supplied as a PDF document or as the plain text of an email.
 
 Return ONLY a JSON object — no prose, no markdown code fences, no explanation. Use exactly these keys:
 
@@ -73,46 +78,79 @@ def _build_client():
     return anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
 
 
-def extract(pdf_path: str) -> WOPayload:
-    """Extract a WOPayload from a WO PDF. Raises ExtractionError on parse/validation failure."""
-    path = Path(pdf_path)
-    pdf_bytes = path.read_bytes()
+def _pdf_content_block(pdf_bytes: bytes) -> dict:
     b64 = base64.standard_b64encode(pdf_bytes).decode("ascii")
+    return {
+        "type": "document",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
+    }
 
+
+def _call_model(content_blocks: list[dict], label: str) -> str:
+    """Send content blocks to Haiku and return the concatenated text response."""
     client = _build_client()
-    # Anthropic Messages API: a document content block carries the base64 PDF.
     message = client.messages.create(
         model=settings.EXTRACTION_MODEL,
         max_tokens=1024,
         system=_SYSTEM_PROMPT,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "document",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "application/pdf",
-                            "data": b64,
-                        },
-                    },
-                    {"type": "text", "text": "Extract the WO billing fields as the specified JSON."},
-                ],
-            }
-        ],
+        messages=[{"role": "user", "content": content_blocks}],
     )
-
-    # Concatenate any text blocks in the response.
     raw = "".join(block.text for block in message.content if getattr(block, "type", "") == "text")
-    logger.debug("Raw extraction response for %s: %s", path.name, raw)
+    logger.debug("Raw extraction response for %s: %s", label, raw)
+    return raw
 
+
+def extract_from_pdf(pdf_path: str) -> WOPayload:
+    """Extract a WOPayload from a WO PDF file."""
+    path = Path(pdf_path)
+    content = [
+        _pdf_content_block(path.read_bytes()),
+        {"type": "text", "text": "Extract the WO billing fields as the specified JSON."},
+    ]
+    return _finalize(_call_model(content, path.name), source_path=str(path))
+
+
+def extract_from_text(body_text: str, *, source_path: str) -> WOPayload:
+    """Extract a WOPayload from inline email-body text.
+
+    `source_path` is recorded on the payload (e.g. the saved .eml) for the Synergix attach step.
+    """
+    if not body_text.strip():
+        raise ExtractionError("email body text is empty — nothing to extract")
+    content = [
+        {
+            "type": "text",
+            "text": (
+                "The following is the text of a Work Order email. Extract the WO billing fields "
+                "as the specified JSON.\n\n--- EMAIL BODY ---\n" + body_text
+            ),
+        }
+    ]
+    return _finalize(_call_model(content, Path(source_path).name), source_path=source_path)
+
+
+def extract(source_path: str) -> WOPayload:
+    """Dispatch by file type: .pdf -> document extraction; anything else -> read as text.
+
+    Convenience entry point for a single source file. For email ingestion prefer the more explicit
+    extract_from_pdf / extract_from_text driven by the IngestedWO (PDF attachment vs. inline body).
+    """
+    path = Path(source_path)
+    if path.suffix.lower() == ".pdf":
+        return extract_from_pdf(source_path)
+    # .eml / .txt / .html etc. — read as text and extract from the body.
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return extract_from_text(text, source_path=source_path)
+
+
+def _finalize(raw: str, *, source_path: str) -> WOPayload:
+    """Parse a model response and build a validated WOPayload, recording source_path."""
     data = _parse_response(raw)
 
     confidence = data.get("confidence")
     low_conf = data.get("low_confidence_fields") or []
     if low_conf:
-        logger.warning("%s: model flagged low-confidence fields: %s", path.name, low_conf)
+        logger.warning("%s: model flagged low-confidence fields: %s", Path(source_path).name, low_conf)
 
     try:
         payload = WOPayload(
@@ -125,7 +163,7 @@ def extract(pdf_path: str) -> WOPayload:
             gl_number=str(data.get("gl_number", "")),
             quantity=float(data.get("quantity", 0) or 0),
             unit_price=float(data.get("unit_price", 0) or 0),
-            pdf_path=str(path),
+            source_path=source_path,
             extraction_confidence=float(confidence) if confidence is not None else None,
         )
     except Exception as exc:  # pydantic ValidationError, ValueError, etc.
@@ -135,12 +173,12 @@ def extract(pdf_path: str) -> WOPayload:
 
 
 if __name__ == "__main__":
-    # Standalone test: `python -m src.extractor data/pdfs/sample.pdf`
+    # Standalone test: `python -m src.extractor <sample.pdf | sample.eml | sample.txt>`
     import sys
 
     settings.configure_logging()
     if len(sys.argv) < 2:
-        print("usage: python -m src.extractor <path-to-sample.pdf>")
+        print("usage: python -m src.extractor <sample.pdf | sample.eml | sample.txt>")
         raise SystemExit(2)
     sample = sys.argv[1]
     try:

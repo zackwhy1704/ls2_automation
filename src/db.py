@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS work_orders (
     project_code   TEXT,                 -- resolved project code, if known
     remarks        TEXT,                 -- built Synergix remarks string, if known
     error          TEXT,                 -- last error / reason (for INVALID / FAILED / PARTIAL)
-    pdf_path       TEXT,
+    source_path    TEXT,                 -- WO source file (PDF attachment or saved .eml)
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL
 );
@@ -64,19 +64,22 @@ async def _audit(conn: aiosqlite.Connection, wo: str | None, event: str, detail:
     )
 
 
-async def upsert_scraped(wo_po_number: str, pdf_path: str) -> None:
-    """Record a freshly scraped WO (status SCRAPED) before extraction."""
+async def upsert_scraped(wo_po_number: str, source_path: str) -> None:
+    """Record a freshly obtained WO (status SCRAPED) before extraction.
+
+    Used by both the TCMS scrape and the email ingest flows; source_path is the WO PDF or .eml.
+    """
     async with aiosqlite.connect(settings.DB_PATH) as conn:
         await conn.execute(
             """
-            INSERT INTO work_orders (wo_po_number, status, pdf_path, created_at, updated_at)
+            INSERT INTO work_orders (wo_po_number, status, source_path, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(wo_po_number) DO UPDATE SET
-                pdf_path=excluded.pdf_path, status=excluded.status, updated_at=excluded.updated_at
+                source_path=excluded.source_path, status=excluded.status, updated_at=excluded.updated_at
             """,
-            (wo_po_number, WOStatus.SCRAPED.value, pdf_path, _now(), _now()),
+            (wo_po_number, WOStatus.SCRAPED.value, source_path, _now(), _now()),
         )
-        await _audit(conn, wo_po_number, "scraped", pdf_path)
+        await _audit(conn, wo_po_number, "scraped", source_path)
         await conn.commit()
 
 
@@ -94,17 +97,17 @@ async def upsert_payload(
         await conn.execute(
             """
             INSERT INTO work_orders
-                (wo_po_number, status, payload_json, project_code, remarks, error, pdf_path,
+                (wo_po_number, status, payload_json, project_code, remarks, error, source_path,
                  created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(wo_po_number) DO UPDATE SET
                 status=excluded.status, payload_json=excluded.payload_json,
                 project_code=excluded.project_code, remarks=excluded.remarks,
-                error=excluded.error, pdf_path=excluded.pdf_path, updated_at=excluded.updated_at
+                error=excluded.error, source_path=excluded.source_path, updated_at=excluded.updated_at
             """,
             (
                 payload.wo_po_number, status.value, payload_json, project_code, remarks, error,
-                payload.pdf_path, _now(), _now(),
+                payload.source_path, _now(), _now(),
             ),
         )
         await _audit(conn, payload.wo_po_number, f"status:{status.value}", error or "")

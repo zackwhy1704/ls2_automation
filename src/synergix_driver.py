@@ -220,7 +220,7 @@ class SynergixDriver:
         logger.info("Stage D: attach PDF + fulfil SO for %s", payload.wo_po_number)
         await self.page.click(S.require("SYNERGIX_ATTACH_PDF_BUTTON", S.SYNERGIX_ATTACH_PDF_BUTTON))
         await self.page.set_input_files(
-            S.require("SYNERGIX_ATTACH_PDF_INPUT", S.SYNERGIX_ATTACH_PDF_INPUT), payload.pdf_path
+            S.require("SYNERGIX_ATTACH_PDF_INPUT", S.SYNERGIX_ATTACH_PDF_INPUT), payload.source_path
         )
         await self.page.wait_for_load_state("networkidle")
 

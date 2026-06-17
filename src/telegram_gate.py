@@ -9,6 +9,7 @@ The shared Synergix browser context is guarded by an asyncio.Lock so writes run 
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from telegram import (
     InlineKeyboardButton,
@@ -106,15 +107,16 @@ class TelegramGate:
 
         # Send the PDF first (caption carries the fields), then the buttons message.
         try:
-            with open(payload.pdf_path, "rb") as fh:
+            src = payload.source_path
+            with open(src, "rb") as fh:
                 await self.bot.send_document(
                     chat_id=settings.TELEGRAM_CHAT_ID,
-                    document=InputFile(fh, filename=f"{payload.wo_po_number.replace('/', '-')}.pdf"),
-                    caption=f"WO PDF: {payload.wo_po_number}",
+                    document=InputFile(fh, filename=Path(src).name),
+                    caption=f"WO source: {payload.wo_po_number}",
                 )
         except FileNotFoundError:
-            logger.warning("PDF not found for %s at %s; sending without attachment",
-                           payload.wo_po_number, payload.pdf_path)
+            logger.warning("WO source file not found for %s at %s; sending without attachment",
+                           payload.wo_po_number, payload.source_path)
 
         await self.bot.send_message(
             chat_id=settings.TELEGRAM_CHAT_ID,

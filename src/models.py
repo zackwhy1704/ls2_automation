@@ -9,7 +9,8 @@ from pydantic import BaseModel, Field
 
 
 class WOStatus(str, Enum):
-    SCRAPED = "scraped"
+    SCRAPED = "scraped"              # WO source obtained (scraped from TCMS, or ingested from email)
+    INGESTED = "ingested"            # alias used by the email flow; same meaning as SCRAPED
     EXTRACTED = "extracted"
     INVALID = "invalid"              # failed validation
     DUPLICATE = "duplicate"          # already in Synergix
@@ -37,7 +38,10 @@ class WOPayload(BaseModel):
     gl_number: str                   # goes into Reference No.
     quantity: float
     unit_price: float
-    pdf_path: str
+    # The file the extractor read AND the file Synergix attaches in stage D. For the email flow this
+    # is the WO PDF attachment when present, otherwise the saved .eml. (Named source_path rather than
+    # pdf_path because it is not always a PDF.)
+    source_path: str
     # Optional[...] (not `float | None`) so the model also evaluates on Python 3.9 dev machines;
     # pydantic eagerly evaluates field annotations, unlike the deferred `from __future__ import annotations`.
     extraction_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)  # 0..1 from Haiku

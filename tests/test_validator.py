@@ -25,7 +25,7 @@ def make_payload(**overrides) -> WOPayload:
         gl_number="GL-5500",
         quantity=1.0,
         unit_price=120.0,
-        pdf_path="data/pdfs/WO-PO-123456789.pdf",
+        source_path="data/pdfs/WO-PO-123456789.pdf",
     )
     base.update(overrides)
     return WOPayload(**base)

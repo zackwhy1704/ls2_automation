@@ -50,21 +50,46 @@ cp .env.example .env
 
 ## Running
 
+There are two WO ingestion sources. DRY_RUN defaults to true — the Synergix driver does everything
+EXCEPT the final submit/confirm clicks.
+
 ```bash
-# DRY_RUN defaults to true — the Synergix driver does everything EXCEPT the final submit.
+# Email flow — ingest Work Orders from .eml files (a single file or a directory of them):
+python -m src.main --emails path/to/eml-dir
+python -m src.main path/to/one-wo.eml          # single .eml shorthand
+
+# TCMS scrape flow — pull un-invoiced WOs from the TCMS web portal:
 python -m src.main
 ```
 
-The process scrapes un-invoiced WOs, extracts + validates each, runs a duplicate check, and sends
-each surviving WO to Telegram for approval. The bot then stays alive listening for Approve/Reject
-button presses; approved WOs are written to Synergix (in DRY_RUN, the final submit is logged only).
+Either source feeds the same pipeline: extract fields (Claude Haiku) → validate → duplicate-check →
+send each surviving WO to Telegram for approval. The bot then stays alive listening for
+Approve/Reject button presses; approved WOs are written to Synergix (in DRY_RUN, the final submit is
+logged only).
+
+### Email ingestion details
+
+`src/email_ingestor.py` parses each `.eml` and captures **both** a PDF attachment (if present) and
+the decoded body text, plus a copy of the original `.eml`. The extractor then uses:
+
+- the **PDF attachment** when one exists (sent to Haiku as a document), or
+- the **inline body text** as a fallback (sent as text).
+
+The WO source file (PDF, or the `.eml` if there's no attachment) is what Synergix stage D attaches.
+You can test ingestion + extraction in isolation, no Synergix needed:
+
+```bash
+python -m src.email_ingestor path/to/wo.eml     # show what was parsed out (no LLM)
+python -m src.extractor path/to/wo.eml           # run Haiku extraction on it (needs ANTHROPIC_API_KEY)
+python -m src.extractor path/to/wo.pdf           # or on a PDF directly
+```
 
 To go live (only after explicit approval): set `DRY_RUN=false` in `.env`.
 
 ## Running the unit tests
 
-The pure-logic modules (`models`, `validator` incl. remarks builder) have no external dependencies
-and are unit-testable on their own:
+The pure-logic modules (`models`, `validator` incl. remarks builder, and the `.eml` ingestor) have no
+external dependencies and are unit-testable on their own:
 
 ```bash
 pytest tests/ -v
@@ -118,8 +143,9 @@ Search the codebase for `TODO(human)` — every real-world unknown is marked the
 | [config/selectors.py](config/selectors.py) | ALL DOM selectors as `TODO_SELECTOR` placeholders |
 | [src/models.py](src/models.py) | `WOPayload`, `WOStatus`, project-code mapping |
 | [src/db.py](src/db.py) | SQLite schema + CRUD for WO state (resumable, auditable) |
+| [src/email_ingestor.py](src/email_ingestor.py) | Parse `.eml`: extract PDF attachment + body text |
 | [src/tcms_scraper.py](src/tcms_scraper.py) | Playwright: login, list un-invoiced WOs, download PDFs |
-| [src/extractor.py](src/extractor.py) | Claude Haiku: PDF → structured JSON + confidence |
+| [src/extractor.py](src/extractor.py) | Claude Haiku: PDF *or* email text → structured JSON + confidence |
 | [src/validator.py](src/validator.py) | Validation rules + project-code resolution + remarks builder |
 | [src/synergix_driver.py](src/synergix_driver.py) | Playwright: dedup check + create/fulfil (DRY_RUN aware) |
 | [src/telegram_gate.py](src/telegram_gate.py) | Bot, inline approve/reject buttons, callback → execute |
