@@ -1,0 +1,19 @@
+# --- Core ---
+pydantic>=2.6,<3
+python-dotenv>=1.0
+
+# --- Browser automation ---
+playwright>=1.42
+
+# --- LLM extraction ---
+anthropic>=0.40
+
+# --- Telegram (async) ---
+python-telegram-bot>=21.0,<22
+
+# --- Async SQLite ---
+aiosqlite>=0.20
+
+# --- Dev / test ---
+pytest>=8.0
+pytest-asyncio>=0.23

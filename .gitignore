@@ -1,0 +1,19 @@
+# Secrets
+.env
+
+# Local data / artifacts
+data/pdfs/
+data/state.db
+data/*.db
+logs/
+
+# Playwright
+.playwright/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
