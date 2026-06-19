@@ -44,6 +44,17 @@ def _dry_guard(action: str) -> bool:
     return False
 
 
+def synergix_configured() -> bool:
+    """True once the client's Synergix env is available (base URL set).
+
+    Until the sandbox is procured this is False, and the driver runs in STUB mode: no browser is
+    launched, the duplicate check returns False, and write() reports PROCESSED with a stub note so
+    the full ingest -> extract -> validate -> approve loop can be exercised end to end. Filling in
+    SYNERGIX_* in .env switches every step to the real browser automation with no code change.
+    """
+    return bool(settings.SYNERGIX_BASE_URL.strip())
+
+
 class SynergixDriver:
     def __init__(self) -> None:
         self._pw = None
@@ -52,7 +63,18 @@ class SynergixDriver:
         self.page: Page | None = None
         self._logged_in = False
 
+    @property
+    def stubbed(self) -> bool:
+        """True when Synergix is not configured yet — driver runs without a browser."""
+        return not synergix_configured()
+
     async def start(self) -> None:
+        if self.stubbed:
+            logger.warning(
+                "Synergix not configured (SYNERGIX_BASE_URL empty) — running in STUB mode: "
+                "no browser, dedup skipped, writes are simulated. Fill SYNERGIX_* in .env to go live."
+            )
+            return
         self._pw = await async_playwright().start()
         self._browser = await self._pw.chromium.launch(headless=settings.HEADLESS)
         self._context = await self._browser.new_context(accept_downloads=True)
@@ -61,6 +83,8 @@ class SynergixDriver:
         logger.info("Synergix browser launched (headless=%s)", settings.HEADLESS)
 
     async def close(self) -> None:
+        if self.stubbed:
+            return
         for obj in (self._context, self._browser):
             if obj:
                 await obj.close()
@@ -94,6 +118,10 @@ class SynergixDriver:
 
         # TODO(human): confirm the correct Synergix search screen + that WO-PO is the right search key.
         """
+        if self.stubbed:
+            logger.info("[STUB] dedup check for %s skipped (Synergix not configured) -> not duplicate",
+                        wo_po_number)
+            return False
         await self.login()
         assert self.page is not None
         await self.page.click(S.require("SYNERGIX_DEDUP_NAV", S.SYNERGIX_DEDUP_NAV))
@@ -113,6 +141,18 @@ class SynergixDriver:
     # ------------------------------------------------------------------ write path
     async def write(self, payload: WOPayload) -> WriteResult:
         """Run stages B, C, D for one WO. Returns a WriteResult; never raises for a WO-level error."""
+        if self.stubbed:
+            project_code = resolve_project_code(payload.job_sheet_number)
+            remarks = build_remarks(payload)
+            logger.info(
+                "[STUB] would write %s to Synergix: project_code=%s\n  remarks=%s",
+                payload.wo_po_number, project_code, remarks,
+            )
+            return WriteResult(
+                WOStatus.PROCESSED,
+                "Synergix stubbed — no write performed (SYNERGIX_* not configured). "
+                f"project_code={project_code}",
+            )
         try:
             await self.login()
             project_code = resolve_project_code(payload.job_sheet_number)

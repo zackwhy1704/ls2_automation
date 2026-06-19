@@ -132,23 +132,50 @@ def _parse_msg(path: Path) -> tuple[str, str, list[tuple[str, bytes]]]:
 
 
 # ---------------------------------------------------------------------------- public API
+# Suffixes the funnel knows how to ingest: Outlook/MIME emails, and bare WO PDFs.
+SUPPORTED_SUFFIXES = {".msg", ".eml", ".pdf"}
+
+
+def _ingest_pdf(src: Path, raw: bytes) -> list[IngestedWO]:
+    """A bare WO PDF (from a zip / shared folder) -> one IngestedWO whose source IS the PDF."""
+    dest = settings.PDF_DIR / f"{_safe_stem(src.stem)}.pdf"
+    dest.write_bytes(raw)
+    logger.info("Ingested bare WO PDF: %s", dest)
+    return [
+        IngestedWO(
+            source_email_path=str(dest),  # no email; the PDF is both source and attachment
+            pdf_path=str(dest),
+            body_text="",
+            subject=src.stem,
+            attachment_name=src.name,
+        )
+    ]
+
+
 def ingest_file(path_str: str) -> list[IngestedWO]:
-    """Parse one email file (.msg or .eml) into a list of WOs — one per PDF attachment.
+    """Parse one WO source file (.msg, .eml, or a bare .pdf) into a list of WOs — one per PDF.
 
     Returns a list because a single email may carry multiple Work Orders. A body-only email yields a
-    single body-source WO. Raises FileNotFoundError if the file is missing; unsupported suffixes raise
-    ValueError.
+    single body-source WO; a bare .pdf yields exactly one. Raises FileNotFoundError if the file is
+    missing, ValueError for an unsupported suffix or an empty file.
     """
     src = Path(path_str)
     raw = src.read_bytes()
     suffix = src.suffix.lower()
 
+    if not raw:
+        raise ValueError(f"file is empty: {src.name}")
+
+    if suffix == ".pdf":
+        return _ingest_pdf(src, raw)
     if suffix == ".msg":
         subject, body_text, pdf_attachments = _parse_msg(src)
     elif suffix == ".eml":
         subject, body_text, pdf_attachments = _parse_eml(raw)
     else:
-        raise ValueError(f"unsupported email format {suffix!r} (expected .msg or .eml): {src.name}")
+        raise ValueError(
+            f"unsupported format {suffix!r} (expected .msg, .eml or .pdf): {src.name}"
+        )
 
     stem = _safe_stem(subject or src.stem)
     # Preserve the original extension on the saved copy so it can be re-opened if needed.
@@ -187,26 +214,36 @@ def ingest_file(path_str: str) -> list[IngestedWO]:
     return wos
 
 
-def ingest_dir(dir_path: str) -> list[IngestedWO]:
-    """Ingest every .msg/.eml in a directory (non-recursive). Per-file errors are logged, not fatal."""
+def ingest_dir(dir_path: str, *, recursive: bool = True) -> list[IngestedWO]:
+    """Ingest every supported file (.msg/.eml/.pdf) in a directory. Per-file errors are non-fatal.
+
+    Recurses into sub-directories by default (e.g. a samples/ dir holding JBTC/ and SKTC/ folders).
+    Skips empty files and hidden files. Each file's own errors are logged and skipped so one bad WO
+    never aborts the batch.
+    """
+    root = Path(dir_path)
+    walker = root.rglob("*") if recursive else root.iterdir()
+    paths = sorted(
+        p for p in walker
+        if p.is_file() and not p.name.startswith(".") and p.suffix.lower() in SUPPORTED_SUFFIXES
+    )
     results: list[IngestedWO] = []
-    paths = sorted(p for p in Path(dir_path).iterdir() if p.suffix.lower() in {".msg", ".eml"})
     for p in paths:
         try:
             results.extend(ingest_file(str(p)))
         except Exception:
             logger.exception("Failed to ingest %s — skipping", p)
-    logger.info("Ingested %d WO unit(s) from %d email(s) in %s", len(results), len(paths), dir_path)
+    logger.info("Ingested %d WO unit(s) from %d source file(s) in %s", len(results), len(paths), dir_path)
     return results
 
 
 if __name__ == "__main__":
-    # Standalone test: `python -m src.email_ingestor <file.msg|.eml | dir>`  (no LLM, no network)
+    # Standalone test: `python -m src.email_ingestor <file.msg|.eml|.pdf | dir>`  (no LLM, no network)
     import sys
 
     settings.configure_logging()
     if len(sys.argv) < 2:
-        print("usage: python -m src.email_ingestor <file.msg|.eml | dir>")
+        print("usage: python -m src.email_ingestor <file.msg|.eml|.pdf | dir>")
         raise SystemExit(2)
     target = Path(sys.argv[1])
     items = ingest_dir(str(target)) if target.is_dir() else ingest_file(str(target))

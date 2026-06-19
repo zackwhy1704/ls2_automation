@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS launchd agent to run the email poll job every 15 minutes.
+
+  Install:
+    1. Edit the paths below to match your machine (REPO_ROOT).
+    2. Copy to ~/Library/LaunchAgents/com.ls2.pollemails.plist
+    3. launchctl load ~/Library/LaunchAgents/com.ls2.pollemails.plist
+    4. launchctl start com.ls2.pollemails    # run once now to test
+
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/com.ls2.pollemails.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ls2.pollemails</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/zackwhye/ls2_automation/scripts/poll_emails.sh</string>
+    </array>
+
+    <!-- Run every 900 seconds (15 minutes). -->
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/zackwhye/ls2_automation</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/zackwhye/ls2_automation/logs/poll_launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/zackwhye/ls2_automation/logs/poll_launchd.log</string>
+
+    <!-- Don't run at load; wait for the first interval. -->
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

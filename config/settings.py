@@ -1,95 +1,188 @@
-"""Central configuration. Loads `.env` and exposes typed constants.
+"""Central configuration. Loads `.env` into a typed `Settings` class.
 
 Nothing else in the codebase should read environment variables directly — import from here.
+
+A single instance is created as `settings` (alias of `get_settings()`), and the most-used
+fields are re-exported as module-level constants so existing `settings.ATTR` access keeps
+working. New code may prefer `from config.settings import settings` and `settings.field`.
 """
 from __future__ import annotations
 
 import logging
-import os
+from functools import lru_cache
 from pathlib import Path
 
-from dotenv import load_dotenv
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# --- Paths ---
+# --- Paths (static; not env-driven) ---
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 PDF_DIR = DATA_DIR / "pdfs"
+INCOMING_EMAIL_DIR = DATA_DIR / "incoming_emails"  # .eml files pulled from the IMAP mailbox
 LOGS_DIR = PROJECT_ROOT / "logs"
 DB_PATH = DATA_DIR / "state.db"
 
 # Ensure runtime dirs exist (safe to call repeatedly).
-for _d in (PDF_DIR, LOGS_DIR):
+for _d in (PDF_DIR, INCOMING_EMAIL_DIR, LOGS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
-# Load .env from project root (no-op if missing; values may also come from real env).
-load_dotenv(PROJECT_ROOT / ".env")
 
+class Settings(BaseSettings):
+    """Typed application settings loaded from environment / `.env`."""
 
-def _get_bool(key: str, default: bool) -> bool:
-    raw = os.getenv(key)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    model_config = SettingsConfigDict(
+        env_file=PROJECT_ROOT / ".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=True,
+    )
 
+    # --- Anthropic ---
+    ANTHROPIC_API_KEY: str = ""
+    EXTRACTION_MODEL: str = "claude-haiku-4-5"
+    # Extractions below this confidence (0..1) are flagged for manual verification.
+    EXTRACTION_CONFIDENCE_THRESHOLD: float = Field(default=0.75, ge=0.0, le=1.0)
 
-def _get_float(key: str, default: float) -> float:
-    raw = os.getenv(key)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        logging.getLogger(__name__).warning(
-            "Invalid float for %s=%r; using default %s", key, raw, default
+    # --- Telegram ---
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_CHAT_ID: str = ""
+
+    # --- Email intake (IMAP) ---
+    # A dedicated mailbox WE control. The client auto-forwards Work Order emails here; we poll it,
+    # save each new message as .eml into data/incoming_emails/, and feed it into the ingest funnel.
+    IMAP_HOST: str = ""                 # e.g. "imap.gmail.com" / "outlook.office365.com"
+    IMAP_PORT: int = 993               # 993 = IMAP over SSL (the normal case)
+    IMAP_USERNAME: str = ""            # the mailbox login (often the full email address)
+    IMAP_PASSWORD: str = ""            # an APP PASSWORD, not the main account password (Gmail/M365)
+    IMAP_MAILBOX: str = "INBOX"        # folder to read (e.g. "INBOX" or a label/sub-folder)
+    # Optional server-side filters (IMAP SEARCH). Leave blank to take every unseen message.
+    IMAP_FROM_FILTER: str = ""         # only fetch mail FROM this address/substring, e.g. "@sktc.sg"
+    IMAP_SUBJECT_FILTER: str = ""      # only fetch mail whose SUBJECT contains this, e.g. "Work Order"
+    # If true, mark fetched messages \Seen so they aren't pulled again. If false, dedup is by Message-ID.
+    IMAP_MARK_SEEN: bool = True
+
+    # --- JBTC TCMS portal ---
+    TCMS_BASE_URL: str = ""
+    TCMS_USERNAME: str = ""
+    TCMS_PASSWORD: str = ""
+
+    # --- Synergix ERP ---
+    SYNERGIX_BASE_URL: str = ""
+    SYNERGIX_USERNAME: str = ""
+    SYNERGIX_PASSWORD: str = ""
+    SYNERGIX_TEMPLATE_QUO_ID: str = ""
+
+    # --- Behaviour ---
+    DRY_RUN: bool = True          # defaults to True — never default to live
+    HEADLESS: bool = False
+    TIMEZONE: str = "Asia/Singapore"
+    # Default timeout (ms) for Playwright waits. D365/Synergix can be slow to render.
+    PLAYWRIGHT_TIMEOUT_MS: int = 30000
+
+    # --- Paths (exposed on the instance for convenience) ---
+    @property
+    def PROJECT_ROOT(self) -> Path:
+        return PROJECT_ROOT
+
+    @property
+    def DATA_DIR(self) -> Path:
+        return DATA_DIR
+
+    @property
+    def PDF_DIR(self) -> Path:
+        return PDF_DIR
+
+    @property
+    def INCOMING_EMAIL_DIR(self) -> Path:
+        return INCOMING_EMAIL_DIR
+
+    @property
+    def LOGS_DIR(self) -> Path:
+        return LOGS_DIR
+
+    @property
+    def DB_PATH(self) -> Path:
+        return DB_PATH
+
+    @field_validator("EXTRACTION_CONFIDENCE_THRESHOLD", mode="before")
+    @classmethod
+    def _empty_threshold_to_default(cls, v: object) -> object:
+        # Treat an empty/blank env value as "unset" so the default applies.
+        if isinstance(v, str) and v.strip() == "":
+            return 0.75
+        return v
+
+    def configure_logging(self) -> None:
+        """Configure stdlib logging: console + a per-process file in logs/."""
+        log_file = LOGS_DIR / "run.log"
+        fmt = "%(asctime)s %(levelname)-7s %(name)s :: %(message)s"
+        handlers: list[logging.Handler] = [logging.StreamHandler()]
+        try:
+            handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+        except OSError:
+            pass  # console-only if file handler can't open
+        logging.basicConfig(level=logging.INFO, format=fmt, handlers=handlers)
+
+    def summary(self) -> str:
+        """Human-readable config summary for startup logs (no secrets)."""
+        return (
+            f"DRY_RUN={self.DRY_RUN} HEADLESS={self.HEADLESS} TZ={self.TIMEZONE} "
+            f"model={self.EXTRACTION_MODEL} "
+            f"conf_threshold={self.EXTRACTION_CONFIDENCE_THRESHOLD} "
+            f"db={DB_PATH}"
         )
-        return default
 
 
-# --- Anthropic ---
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-EXTRACTION_MODEL = os.getenv("EXTRACTION_MODEL", "claude-haiku-4-5")
-EXTRACTION_CONFIDENCE_THRESHOLD = _get_float("EXTRACTION_CONFIDENCE_THRESHOLD", 0.75)
+@lru_cache
+def get_settings() -> Settings:
+    """Return the process-wide Settings singleton."""
+    return Settings()
 
-# --- Telegram ---
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# --- JBTC TCMS portal ---
-TCMS_BASE_URL = os.getenv("TCMS_BASE_URL", "")
-TCMS_USERNAME = os.getenv("TCMS_USERNAME", "")
-TCMS_PASSWORD = os.getenv("TCMS_PASSWORD", "")
+# Process-wide instance. Import this for the class-based API: `settings.DRY_RUN`.
+settings = get_settings()
 
-# --- Synergix ERP ---
-SYNERGIX_BASE_URL = os.getenv("SYNERGIX_BASE_URL", "")
-SYNERGIX_USERNAME = os.getenv("SYNERGIX_USERNAME", "")
-SYNERGIX_PASSWORD = os.getenv("SYNERGIX_PASSWORD", "")
-SYNERGIX_TEMPLATE_QUO_ID = os.getenv("SYNERGIX_TEMPLATE_QUO_ID", "")
+# --- Backwards-compatible module-level constants ---
+# Existing code does `from config import settings; settings.ANTHROPIC_API_KEY`.
+# Those resolve to the instance below via the module's `settings` name, but several
+# modules also expect these as plain module attributes, so we mirror them here.
+ANTHROPIC_API_KEY = settings.ANTHROPIC_API_KEY
+EXTRACTION_MODEL = settings.EXTRACTION_MODEL
+EXTRACTION_CONFIDENCE_THRESHOLD = settings.EXTRACTION_CONFIDENCE_THRESHOLD
 
-# --- Behaviour ---
-DRY_RUN = _get_bool("DRY_RUN", True)          # defaults to True — never default to live
-HEADLESS = _get_bool("HEADLESS", False)
-TIMEZONE = os.getenv("TIMEZONE", "Asia/Singapore")
+TELEGRAM_BOT_TOKEN = settings.TELEGRAM_BOT_TOKEN
+TELEGRAM_CHAT_ID = settings.TELEGRAM_CHAT_ID
 
-# Default timeout (ms) for Playwright waits. D365/Synergix can be slow to render.
-PLAYWRIGHT_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_TIMEOUT_MS", "30000"))
+IMAP_HOST = settings.IMAP_HOST
+IMAP_PORT = settings.IMAP_PORT
+IMAP_USERNAME = settings.IMAP_USERNAME
+IMAP_PASSWORD = settings.IMAP_PASSWORD
+IMAP_MAILBOX = settings.IMAP_MAILBOX
+IMAP_FROM_FILTER = settings.IMAP_FROM_FILTER
+IMAP_SUBJECT_FILTER = settings.IMAP_SUBJECT_FILTER
+IMAP_MARK_SEEN = settings.IMAP_MARK_SEEN
+
+TCMS_BASE_URL = settings.TCMS_BASE_URL
+TCMS_USERNAME = settings.TCMS_USERNAME
+TCMS_PASSWORD = settings.TCMS_PASSWORD
+
+SYNERGIX_BASE_URL = settings.SYNERGIX_BASE_URL
+SYNERGIX_USERNAME = settings.SYNERGIX_USERNAME
+SYNERGIX_PASSWORD = settings.SYNERGIX_PASSWORD
+SYNERGIX_TEMPLATE_QUO_ID = settings.SYNERGIX_TEMPLATE_QUO_ID
+
+DRY_RUN = settings.DRY_RUN
+HEADLESS = settings.HEADLESS
+TIMEZONE = settings.TIMEZONE
+PLAYWRIGHT_TIMEOUT_MS = settings.PLAYWRIGHT_TIMEOUT_MS
 
 
 def configure_logging() -> None:
-    """Configure stdlib logging: console + a per-process file in logs/."""
-    log_file = LOGS_DIR / "run.log"
-    fmt = "%(asctime)s %(levelname)-7s %(name)s :: %(message)s"
-    handlers: list[logging.Handler] = [logging.StreamHandler()]
-    try:
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
-    except OSError:
-        pass  # console-only if file handler can't open
-    logging.basicConfig(level=logging.INFO, format=fmt, handlers=handlers)
+    """Module-level shim delegating to the Settings instance."""
+    settings.configure_logging()
 
 
 def summary() -> str:
-    """Human-readable config summary for startup logs (no secrets)."""
-    return (
-        f"DRY_RUN={DRY_RUN} HEADLESS={HEADLESS} TZ={TIMEZONE} "
-        f"model={EXTRACTION_MODEL} conf_threshold={EXTRACTION_CONFIDENCE_THRESHOLD} "
-        f"db={DB_PATH}"
-    )
+    """Module-level shim delegating to the Settings instance."""
+    return settings.summary()

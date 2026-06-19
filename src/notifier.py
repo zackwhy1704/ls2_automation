@@ -12,8 +12,18 @@ from telegram import Bot
 from config import settings
 from src import db
 from src.models import WOStatus
+from src.synergix_driver import synergix_configured
 
 logger = logging.getLogger(__name__)
+
+
+def _mode_suffix() -> str:
+    """Annotate result/summary lines with the active run mode (stub vs dry-run vs live)."""
+    if not synergix_configured():
+        return " (STUB — Synergix not configured, nothing written)"
+    if settings.DRY_RUN:
+        return " (DRY_RUN — not submitted)"
+    return ""
 
 
 async def send_text(bot: Bot, text: str) -> None:
@@ -36,8 +46,7 @@ async def send_wo_result(bot: Bot, wo_po_number: str, status: WOStatus, detail: 
         WOStatus.DUPLICATE: "♻️",
         WOStatus.INVALID: "⛔",
     }.get(status, "•")
-    mode = " (DRY_RUN — not submitted)" if settings.DRY_RUN else ""
-    msg = f"{icon} {wo_po_number}: {status.value}{mode}"
+    msg = f"{icon} {wo_po_number}: {status.value}{_mode_suffix()}"
     if detail:
         msg += f"\n{detail}"
     await send_text(bot, msg)
@@ -52,6 +61,8 @@ async def send_batch_summary(bot: Bot) -> None:
     lines = ["📊 Batch summary:"]
     for status, n in sorted(counts.items()):
         lines.append(f"  • {status}: {n}")
-    if settings.DRY_RUN:
+    if not synergix_configured():
+        lines.append("\n(STUB mode — Synergix not configured; no submissions were executed.)")
+    elif settings.DRY_RUN:
         lines.append("\n(DRY_RUN active — no Synergix submissions were executed.)")
     await send_text(bot, "\n".join(lines))

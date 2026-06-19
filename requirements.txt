@@ -1,5 +1,6 @@
 # --- Core ---
 pydantic>=2.6,<3
+pydantic-settings>=2.0
 python-dotenv>=1.0
 
 # --- Browser automation ---

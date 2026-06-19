@@ -25,6 +25,7 @@ from pathlib import Path
 from config import selectors as S
 from config import settings
 from src import db, notifier
+from src.console_gate import ConsoleGate
 from src.email_ingestor import ingest_dir, ingest_file
 from src.extractor import (
     ExtractionError,
@@ -163,23 +164,65 @@ async def run_ingest_emails(gate: TelegramGate, eml_source: str) -> int:
     return queued
 
 
-async def main(eml_source: str | None = None) -> None:
+def _build_gate(force_console: bool):
+    """Pick the approval gate: real Telegram when configured, else a console stand-in.
+
+    Falls back to ConsoleGate (auto-approving through the stubbed Synergix driver) when
+    TELEGRAM_BOT_TOKEN is unset or --no-telegram is passed, so the pipeline is runnable today.
+    """
+    if force_console or not settings.TELEGRAM_BOT_TOKEN.strip():
+        if not force_console:
+            logger.warning("TELEGRAM_BOT_TOKEN not set — using console approval gate (auto-approve).")
+        return ConsoleGate(auto_approve=True)
+    return TelegramGate()
+
+
+async def _poll_mailbox(gate) -> str:
+    """Pull new WO emails from the IMAP mailbox into INCOMING_EMAIL_DIR; return that dir to ingest.
+
+    Always returns the incoming dir so a `--poll` run stays in the email flow (and ingests any
+    already-downloaded .eml left there) rather than falling through to the TCMS scrape. Runs the
+    blocking imaplib poll in a thread; an unconfigured mailbox or a connection/auth error is reported
+    but never aborts the batch.
+    """
+    from src import mail_poller
+
+    if not mail_poller.imap_configured():
+        await notifier.send_text(gate.bot, "⚠️ Poll requested but IMAP is not configured in .env.")
+    else:
+        try:
+            saved = await asyncio.to_thread(mail_poller.poll_once)
+            logger.info("Mailbox poll downloaded %d new email(s)", len(saved))
+        except Exception as exc:
+            logger.exception("Mailbox poll failed")
+            await notifier.send_text(gate.bot, f"❌ Mailbox poll failed: {exc}")
+    return str(settings.INCOMING_EMAIL_DIR)
+
+
+async def main(
+    eml_source: str | None = None, *, no_telegram: bool = False, poll: bool = False
+) -> None:
     """Entry point.
 
-    eml_source given -> email flow (ingest .eml file/dir). Otherwise -> TCMS scrape flow.
+    poll=True       -> pull emails from the IMAP mailbox, then run the email flow on them.
+    eml_source given -> email flow (ingest .msg/.eml file/dir). Otherwise -> TCMS scrape flow.
     """
     settings.configure_logging()
     logger.info("Starting JBTC billing MVP — %s", settings.summary())
     await db.init_db()
 
-    gate = TelegramGate()
+    gate = _build_gate(no_telegram)
     # Start the bot (polling for callbacks) without blocking, so we can run the source job too.
     await gate.app.initialize()
     await gate.app.start()
     await gate.app.updater.start_polling()
-    logger.info("Telegram bot polling for approvals")
+    logger.info("Approval gate ready (%s)", type(gate).__name__)
 
     try:
+        # poll pulls new emails from the IMAP mailbox into INCOMING_EMAIL_DIR, then ingests that dir.
+        if poll and not eml_source:
+            eml_source = await _poll_mailbox(gate)
+
         if eml_source:
             logger.info("Email flow: ingesting from %s", eml_source)
             queued = await run_ingest_emails(gate, eml_source)
@@ -189,8 +232,10 @@ async def main(eml_source: str | None = None) -> None:
             logger.info("Scrape complete: %d WO(s) queued for approval", queued)
         await notifier.send_batch_summary(gate.bot)
 
-        if queued == 0:
-            logger.info("Nothing pending approval; shutting down.")
+        # The console gate approves synchronously above, so only the Telegram gate needs to stay
+        # alive waiting on async human callbacks.
+        if queued == 0 or not isinstance(gate, TelegramGate):
+            logger.info("No pending async approvals; shutting down.")
         else:
             logger.info("Waiting for approvals via Telegram. Ctrl-C to stop.")
             # Keep the process alive so callbacks can be handled. The admin may approve hours later.
@@ -209,11 +254,19 @@ async def main(eml_source: str | None = None) -> None:
 
 if __name__ == "__main__":
     # Usage:
-    #   python -m src.main                       # TCMS scrape flow
-    #   python -m src.main --emails path/to/dir  # email flow (dir of .eml or a single .eml)
+    #   python -m src.main                              # TCMS scrape flow
+    #   python -m src.main --poll                       # pull emails from the IMAP mailbox, then ingest
+    #   python -m src.main --emails path/to/dir         # email flow (dir of .msg/.eml or one file)
+    #   python -m src.main --emails DIR --no-telegram   # console approval gate (no bot token needed)
+    #   (--no-telegram and --poll can be combined with the others)
+    argv = sys.argv[1:]
+    _no_tg = "--no-telegram" in argv
+    _poll = "--poll" in argv
+    argv = [a for a in argv if a not in ("--no-telegram", "--poll")]
+
     _eml: str | None = None
-    if len(sys.argv) >= 3 and sys.argv[1] == "--emails":
-        _eml = sys.argv[2]
-    elif len(sys.argv) == 2 and sys.argv[1].endswith((".eml",)):
-        _eml = sys.argv[1]
-    asyncio.run(main(_eml))
+    if len(argv) >= 2 and argv[0] == "--emails":
+        _eml = argv[1]
+    elif len(argv) == 1 and argv[0].endswith((".eml", ".msg")):
+        _eml = argv[0]
+    asyncio.run(main(_eml, no_telegram=_no_tg, poll=_poll))

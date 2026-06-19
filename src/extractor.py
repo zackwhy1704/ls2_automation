@@ -32,32 +32,71 @@ Layout cues from these WOs (use them, but rely on the actual document):
 - A "G/L <code>" appears near the top, e.g. "731-AN-ANVZLRes-Contractor". There may ALSO be a long
   numeric account "No. 541330-1-721010-0000". The gl_number we want is the ALPHANUMERIC code that
   starts with digits then a hyphen and letters (e.g. "731-AN-ANVZLRes-..."), NOT the long numeric.
+  On some councils (e.g. Jalan Besar) the G/L line is printed as ONE continuous string that glues the
+  alphanumeric code directly onto the numeric account, e.g. "431-WH-WHR1P1-320121-0-721010-0000" —
+  here the code is "431-WH-WHR1P1-" and "320121-0-721010-0000" is the account to DROP (see GL rule).
 - "Remarks:" holds the location + nature of work, e.g.
   "Blk 330A Anchorvale Street - Inspection for beehive activities at Level 15 - No bees found".
-- A line like "Job Sheet: <number> A <qty> $<rate> $<gross> $<jobcost>" holds the job sheet number,
+- A line like "Job Sheet: <ref> A <qty> $<rate> $<gross> $<jobcost>" holds the job sheet reference,
   quantity, and the gross Rate (unit_price). There is usually a "Discount %", "Discount Amt",
   "9% GST", and "Grand Total".
 - "SR" / "Schedule" reference may appear in the email subject/body, e.g. "(SR: 25955)".
+
+Three fields are easy to confuse — read these rules carefully:
+
+- GL CODE (gl_number): the project/cost G/L code. It begins with digits, a hyphen, then a segment
+  that CONTAINS LETTERS (e.g. "731-AN-ANVZKRes-", "431-WH-WHR1P1-", "431-KK-KKR9P1-").
+  Capture from the start UP TO AND INCLUDING the hyphen that ends the last letter-bearing segment.
+  Rules:
+    * Keep every part that has letters, plus the trailing hyphen. Examples of the FULL code to return:
+      "731-AN-ANVZKRes-", "731-AN-ANVZLRes-Contractor", "431-WH-WHR1P1-", "431-KK-KKR9P1-".
+    * STOP before the purely-numeric account tail. Many WOs append a numeric account like
+      "320121-0-721010-0000" or a separate "No. 541330-1-721010-0000" — that tail is NOT part of
+      gl_number. So "431-WH-WHR1P1-320121-0-721010-0000" -> gl_number "431-WH-WHR1P1-".
+    * Do NOT stop at the FIRST hyphen, and do NOT trim a meaningful trailing hyphen.
+  This field is CRITICAL. If you cannot find a code with a letter-bearing segment, return "" and add
+  "gl_number" to low_confidence_fields. Never return the purely-numeric account as gl_number.
+
+- JOB SHEET (job_sheet_number): the WO's job/schedule sheet reference. Find it in this order:
+    1. A value explicitly labelled "Job Sheet:", e.g. "Job Sheet: 25958" -> "25958". It may be
+       alphanumeric (e.g. "A027"); copy it exactly, preserving letters, hyphens and leading zeros.
+    2. If there is NO "Job Sheet:" label, some WOs instead use a line-item table with columns
+       "Sect." and "Schd." (Schedule). In that case use the "Schd." column value of the line item
+       (e.g. Sect.="B", Schd.="002" -> job_sheet_number "002"). Preserve leading zeros.
+  This is its OWN field. It is NOT the "Schedule Type" code (e.g. "SN-001556") and NOT the
+  "Contractor Code" (e.g. "SN-000004") — never use an "SN-..." value here. Never move it into
+  sr_number. Only return "" if you can find neither a "Job Sheet:" label nor a "Schd." column.
+
+- SR NUMBER (sr_number): ONLY a value explicitly labelled "SR" or "SR:" — this is the Service Request
+  reference and it almost always appears in the email subject/body, e.g. "(SR: 25955)". It is normally
+  a plain number like "25955".
+  It is NONE of the following — do NOT put any of these in sr_number:
+    * a "Job Sheet:" value (e.g. "25958", "SN-001556");
+    * a "Schedule Type" column value (e.g. "SN-001556", "SN-000004") — "Schedule Type" is a service
+      classification on the WO, NOT the SR;
+    * the WO-PO number.
+  If there is no value explicitly labelled "SR", return "" for sr_number. Match on the literal label
+  "SR", not merely on the word "Schedule".
 
 Return ONLY a JSON object — no prose, no markdown code fences, no explanation. Use exactly these keys:
 
 {
   "wo_po_number": string,        // "WO-PO/" + digits, preserve leading zeros, e.g. "WO-PO/000060068"
   "town_council": string,        // the town council name from the header, e.g. "Sengkang Town Council"
-  "job_sheet_number": string,    // the "Job Sheet:" value, e.g. "25955"; preserve its leading char
+  "job_sheet_number": string,    // "Job Sheet:" value EXACTLY; may be alphanumeric e.g. "SN-001556" or "25955"
   "service_location": string,    // block/street from Remarks, e.g. "Blk 330A Anchorvale Street"
   "nature_of_work": string,      // the work description from Remarks, e.g. "Inspection for beehive activities..."
   "job_date": string,            // the WO Date as ISO "YYYY-MM-DD"
   "prepared_by": string,         // the "Prepared By" person, e.g. "JENNY ANG"
-  "gl_number": string,           // the alphanumeric G/L code (e.g. "731-AN-ANVZLRes-..."); CRITICAL — "" if truly absent
+  "gl_number": string,           // FULL alphanumeric G/L code incl. trailing hyphen, e.g. "731-AN-ANVZKRes-"; CRITICAL
   "quantity": number,            // the line quantity, e.g. 1.0
   "unit_price": number,          // the gross Rate per unit before discount, e.g. 30.00
   "discount_percent": number,    // e.g. 10.0 (0 if none)
   "discount_amount": number,     // e.g. 3.00 (0 if none)
-  "net_amount": number,          // gross less discount, before GST, e.g. 27.00
+  "net_amount": number,          // = (quantity*unit_price) MINUS discount_amount, before GST. NOT the gross. e.g. 30.00-3.00=27.00
   "gst_percent": number,         // e.g. 9.0 (0 if none)
   "grand_total": number,         // net + GST, e.g. 29.43
-  "sr_number": string,           // the SR/Schedule reference if present, else ""
+  "sr_number": string,           // ONLY a value labelled "SR"/"Schedule" (e.g. "25955"); else "". NOT the job sheet
   "confidence": number,          // your overall confidence 0..1
   "low_confidence_fields": [string]  // fields you are unsure about (especially gl_number)
 }
@@ -184,6 +223,25 @@ def _finalize(raw: str, *, source_path: str) -> WOPayload:
 
     sr = str(data.get("sr_number", "") or "").strip()
 
+    # net_amount is the one figure the model gets arithmetically wrong run-to-run (it sometimes
+    # returns the gross). Compute it deterministically from the fields it DOES read reliably:
+    # net = quantity*unit_price - discount. Fall back to discount_percent, then the model's value.
+    quantity = float(data.get("quantity", 0) or 0)
+    unit_price = float(data.get("unit_price", 0) or 0)
+    disc_amt = _opt_float("discount_amount")
+    disc_pct = _opt_float("discount_percent")
+    gross = quantity * unit_price
+    net_amount: float | None
+    if gross > 0:
+        if disc_amt is not None:
+            net_amount = round(gross - disc_amt, 2)
+        elif disc_pct is not None:
+            net_amount = round(gross * (1 - disc_pct / 100), 2)
+        else:
+            net_amount = round(gross, 2)
+    else:
+        net_amount = _opt_float("net_amount")  # no usable line figures — trust the model
+
     try:
         payload = WOPayload(
             wo_po_number=str(data.get("wo_po_number", "")),
@@ -194,11 +252,11 @@ def _finalize(raw: str, *, source_path: str) -> WOPayload:
             job_date=str(data.get("job_date", "")),          # pydantic parses ISO date string
             prepared_by=str(data.get("prepared_by", "")),
             gl_number=str(data.get("gl_number", "")),
-            quantity=float(data.get("quantity", 0) or 0),
-            unit_price=float(data.get("unit_price", 0) or 0),
-            discount_percent=_opt_float("discount_percent"),
-            discount_amount=_opt_float("discount_amount"),
-            net_amount=_opt_float("net_amount"),
+            quantity=quantity,
+            unit_price=unit_price,
+            discount_percent=disc_pct,
+            discount_amount=disc_amt,
+            net_amount=net_amount,
             gst_percent=_opt_float("gst_percent"),
             grand_total=_opt_float("grand_total"),
             sr_number=sr or None,

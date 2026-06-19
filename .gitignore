@@ -3,12 +3,20 @@
 
 # Local data / artifacts
 data/pdfs/
+data/incoming_emails/
 data/state.db
 data/*.db
 logs/
 
+# Real client Work Order PDFs (samples) — contain live town-council/contractor data; keep local only.
+# The golden extraction fixtures (tests/golden/) are committed; the source PDFs are NOT.
+data/samples/
+
 # Playwright
 .playwright/
+
+# Claude Code local settings (machine-specific permission allowlist)
+.claude/
 
 # Python
 __pycache__/

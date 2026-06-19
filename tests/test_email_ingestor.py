@@ -97,12 +97,45 @@ def test_unsupported_suffix_raises(tmp_path):
         email_ingestor.ingest_file(str(p))
 
 
-def test_ingest_dir_only_picks_email_files(tmp_path):
+def test_ingest_dir_picks_supported_skips_others(tmp_path, _isolate_pdf_dir):
     msg = EmailMessage()
     msg["Subject"] = "good"
     msg.set_content("ok")
     _write_eml(tmp_path, msg, "good.eml")
-    (tmp_path / "ignore.txt").write_text("not an email")
+    (tmp_path / "wo.pdf").write_bytes(b"%PDF-1.4 fake")       # bare PDF -> ingested
+    (tmp_path / "ignore.txt").write_text("not a WO")          # skipped
+    (tmp_path / ".hidden.pdf").write_bytes(b"%PDF-1.4 fake")  # hidden -> skipped
 
     results = email_ingestor.ingest_dir(str(tmp_path))
-    assert len(results) == 1
+    # one .eml + one .pdf = 2 units; .txt and the hidden file are ignored.
+    assert len(results) == 2
+
+
+def test_bare_pdf_is_ingested_as_one_wo(tmp_path, _isolate_pdf_dir):
+    p = tmp_path / "000076624.pdf"
+    p.write_bytes(b"%PDF-1.4 fake")
+    wos = email_ingestor.ingest_file(str(p))
+    assert len(wos) == 1
+    wo = wos[0]
+    assert wo.has_pdf and wo.primary_source_path == wo.pdf_path
+    assert wo.attachment_name == "000076624.pdf"
+    assert Path(wo.pdf_path).read_bytes().startswith(b"%PDF")
+
+
+def test_ingest_dir_recurses_into_subdirs(tmp_path, _isolate_pdf_dir):
+    (tmp_path / "JBTC").mkdir()
+    (tmp_path / "SKTC").mkdir()
+    (tmp_path / "JBTC" / "76624.pdf").write_bytes(b"%PDF-1.4 fake")
+    (tmp_path / "SKTC" / "000059174.pdf").write_bytes(b"%PDF-1.4 fake")
+
+    results = email_ingestor.ingest_dir(str(tmp_path))
+    assert len(results) == 2
+    # non-recursive sees nothing at the top level
+    assert email_ingestor.ingest_dir(str(tmp_path), recursive=False) == []
+
+
+def test_empty_file_raises(tmp_path):
+    p = tmp_path / "empty.pdf"
+    p.write_bytes(b"")
+    with pytest.raises(ValueError):
+        email_ingestor.ingest_file(str(p))
