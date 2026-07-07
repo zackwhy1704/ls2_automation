@@ -20,6 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 PDF_DIR = DATA_DIR / "pdfs"
 INCOMING_EMAIL_DIR = DATA_DIR / "incoming_emails"  # .eml files pulled from the IMAP mailbox
+TCMS_SESSION_DIR = PROJECT_ROOT / ".tcms_session"  # persisted D365 browser session (login cookies)
 LOGS_DIR = PROJECT_ROOT / "logs"
 DB_PATH = DATA_DIR / "state.db"
 
@@ -96,6 +97,10 @@ class Settings(BaseSettings):
     @property
     def INCOMING_EMAIL_DIR(self) -> Path:
         return INCOMING_EMAIL_DIR
+
+    @property
+    def TCMS_SESSION_DIR(self) -> Path:
+        return TCMS_SESSION_DIR
 
     @property
     def LOGS_DIR(self) -> Path:

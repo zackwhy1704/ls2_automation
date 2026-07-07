@@ -38,21 +38,34 @@ def require(name: str, selector: str) -> str:
 # JBTC TCMS portal (Dynamics 365 based)
 # ======================================================================================
 
-# Login page
-TCMS_USERNAME_INPUT = TODO_SELECTOR   # TODO(human): inspect portal — username/email input on TCMS login
-TCMS_PASSWORD_INPUT = TODO_SELECTOR   # TODO(human): inspect portal — password input on TCMS login
-TCMS_LOGIN_BUTTON = TODO_SELECTOR     # TODO(human): inspect portal — submit/sign-in button on TCMS login
-TCMS_LOGIN_SUCCESS_MARKER = TODO_SELECTOR  # TODO(human): an element that only appears AFTER successful login (to confirm auth)
+# Login page — DONE. Login is the Microsoft Entra flow (login.microsoftonline.com), handled directly
+# in TCMSScraper.login() with Microsoft's stable field ids (#i0116 email, #i0118 password,
+# #idSIButton9 submit) plus the "Use your password instead" fallback (the account has MFA, but the
+# password path bypasses the Authenticator push). Success is confirmed by landing on the D365 domain,
+# so these constants are unused. Left here for reference.
+TCMS_USERNAME_INPUT = "#i0116"
+TCMS_PASSWORD_INPUT = "#i0118"
+TCMS_LOGIN_BUTTON = "#idSIButton9"
+TCMS_LOGIN_SUCCESS_MARKER = "[data-dyn-controlname=\"NavigationBar\"]"  # D365 top nav (present only post-login)
 
 # Un-invoiced Work Order list
-TCMS_UNINVOICED_NAV = TODO_SELECTOR   # TODO(human): nav link/menu item that opens the un-invoiced WO list/view
-TCMS_WO_ROW = TODO_SELECTOR           # TODO(human): selector matching EACH WO row in the list (used with .all())
-TCMS_WO_ROW_ID_ATTR = TODO_SELECTOR   # TODO(human): attribute on the row holding the WO id, OR a child selector for the WO-PO text
-TCMS_WO_OPEN_LINK = TODO_SELECTOR     # TODO(human): within a row, the clickable element that opens the WO detail
+# Discovered on the live D365 portal (2026-07). The un-invoiced WO flow is:
+#   Work order workspace tile -> "Un-Invoiced WO" tile -> grid -> click WO/PO cell -> detail ->
+#   Preview/Print -> Original preview -> SSRS PDF viewer -> Export -> PDF download.
+TCMS_WORKSPACE_TILE = '[data-dyn-controlname="VendVendorPortalWorkspace"]'  # dashboard -> Work order workspace
+TCMS_UNINVOICED_NAV = '[data-dyn-controlname="NewUnInvoiceWO"]'   # workspace tile: "NNN Un-Invoiced WO"
+# The WO/PO id lives in a grid-cell text input (D365 FixedDataTable is virtualized: only rendered
+# rows are in the DOM). We read the input .value and click it to open the WO detail.
+TCMS_WO_ROW = 'input[name="PurchTableAllVersions_PurchOrderId"]'  # each rendered WO/PO id cell
+TCMS_WO_ROW_ID_ATTR = TODO_SELECTOR   # unused for D365 (id is the input value, read directly)
+TCMS_WO_OPEN_LINK = 'input[name="PurchTableAllVersions_PurchOrderId"]'  # click the id cell to open detail
 
-# Work Order detail / PDF download
-TCMS_WO_PDF_DOWNLOAD_BUTTON = TODO_SELECTOR  # TODO(human): the button/link that triggers the WO PDF download
-TCMS_WO_BACK_TO_LIST = TODO_SELECTOR  # TODO(human): control to return from a WO detail back to the list (known state)
+# Work Order detail / PDF download (SSRS report viewer path)
+TCMS_WO_PREVIEW_PRINT = '[data-dyn-controlname="PurchPurchaseOrderShow"]'      # "Preview/Print" split button
+TCMS_WO_ORIGINAL_PREVIEW = '[data-dyn-controlname="PurchPurchaseOrderOriginal"]'  # "Original preview" -> opens PDF viewer
+TCMS_WO_PDF_EXPORT = '[data-dyn-controlname="PdfViewerExportMenuButton"]'      # "Export" in the SSRS PDF viewer -> downloads
+TCMS_WO_PDF_DOWNLOAD_BUTTON = '[data-dyn-controlname="PdfViewerExportMenuButton"]'  # alias kept for the old name
+TCMS_WO_BACK_TO_LIST = TODO_SELECTOR  # not needed: we re-navigate to the workspace between WOs for a known state
 
 
 # ======================================================================================
