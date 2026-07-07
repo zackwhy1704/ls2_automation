@@ -29,12 +29,10 @@ an email.
 
 Layout cues from these WOs (use them, but rely on the actual document):
 - Header line: "WO Date <DD-Mon-YYYY>  No. WO-PO/<digits>".
-- A "G/L <code>" appears near the top, e.g. "731-AN-ANVZLRes-Contractor". There may ALSO be a long
-  numeric account "No. 541330-1-721010-0000". The gl_number we want is the ALPHANUMERIC code that
-  starts with digits then a hyphen and letters (e.g. "731-AN-ANVZLRes-..."), NOT the long numeric.
-  On some councils (e.g. Jalan Besar) the G/L line is printed as ONE continuous string that glues the
-  alphanumeric code directly onto the numeric account, e.g. "431-WH-WHR1P1-320121-0-721010-0000" —
-  here the code is "431-WH-WHR1P1-" and "320121-0-721010-0000" is the account to DROP (see GL rule).
+- A "G/L No." appears near the top. It has two parts: an alphanumeric cost code that ENDS IN A HYPHEN
+  (e.g. "731-AN-ANVZCRes-") immediately followed by a numeric account (e.g. "542353-9-721010-0000").
+  On some WOs these print on two separate lines; join them into ONE value, keeping the code's trailing
+  hyphen as the join, e.g. -> "731-AN-ANVZCRes-542353-9-721010-0000". We want the ENTIRE joined string.
 - "Remarks:" holds the location + nature of work, e.g.
   "Blk 330A Anchorvale Street - Inspection for beehive activities at Level 15 - No bees found".
 - A line like "Job Sheet: <ref> A <qty> $<rate> $<gross> $<jobcost>" holds the job sheet reference,
@@ -44,18 +42,15 @@ Layout cues from these WOs (use them, but rely on the actual document):
 
 Three fields are easy to confuse — read these rules carefully:
 
-- GL CODE (gl_number): the project/cost G/L code. It begins with digits, a hyphen, then a segment
-  that CONTAINS LETTERS (e.g. "731-AN-ANVZKRes-", "431-WH-WHR1P1-", "431-KK-KKR9P1-").
-  Capture from the start UP TO AND INCLUDING the hyphen that ends the last letter-bearing segment.
-  Rules:
-    * Keep every part that has letters, plus the trailing hyphen. Examples of the FULL code to return:
-      "731-AN-ANVZKRes-", "731-AN-ANVZLRes-Contractor", "431-WH-WHR1P1-", "431-KK-KKR9P1-".
-    * STOP before the purely-numeric account tail. Many WOs append a numeric account like
-      "320121-0-721010-0000" or a separate "No. 541330-1-721010-0000" — that tail is NOT part of
-      gl_number. So "431-WH-WHR1P1-320121-0-721010-0000" -> gl_number "431-WH-WHR1P1-".
-    * Do NOT stop at the FIRST hyphen, and do NOT trim a meaningful trailing hyphen.
-  This field is CRITICAL. If you cannot find a code with a letter-bearing segment, return "" and add
-  "gl_number" to low_confidence_fields. Never return the purely-numeric account as gl_number.
+- GL CODE (gl_number): the COMPLETE "G/L No." string — the alphanumeric cost code AND the numeric
+  account that follows it, captured as one value exactly as printed. It begins with digits, a hyphen,
+  then a segment containing LETTERS, then a numeric account tail. Return the whole thing:
+    * "731-AN-ANVZCRes-542353-9-721010-0000"  (NOT just "731-AN-ANVZCRes-")
+    * "431-WH-WHR1P1-320121-0-721010-0000"    (NOT just "431-WH-WHR1P1-")
+    * "731-CP-SCPMAST-541216-9-721010-0000"
+  Do NOT stop at the letter segment and do NOT drop the numeric account tail — Synergix needs the full
+  string. This field is CRITICAL. If no such G/L string is present, return "" and add "gl_number" to
+  low_confidence_fields.
 
 - JOB SHEET (job_sheet_number): the WO's job/schedule sheet reference. Find it in this order:
     1. A value explicitly labelled "Job Sheet:", e.g. "Job Sheet: 25958" -> "25958". It may be
@@ -88,7 +83,7 @@ Return ONLY a JSON object — no prose, no markdown code fences, no explanation.
   "nature_of_work": string,      // the work description from Remarks, e.g. "Inspection for beehive activities..."
   "job_date": string,            // the WO Date as ISO "YYYY-MM-DD"
   "prepared_by": string,         // the "Prepared By" person, e.g. "JENNY ANG"
-  "gl_number": string,           // FULL alphanumeric G/L code incl. trailing hyphen, e.g. "731-AN-ANVZKRes-"; CRITICAL
+  "gl_number": string,           // FULL G/L No. string incl. numeric account, e.g. "731-AN-ANVZCRes-542353-9-721010-0000"; CRITICAL
   "quantity": number,            // the line quantity, e.g. 1.0
   "unit_price": number,          // the gross Rate per unit before discount, e.g. 30.00
   "discount_percent": number,    // e.g. 10.0 (0 if none)
