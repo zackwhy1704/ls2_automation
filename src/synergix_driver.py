@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from enum import Enum
 
 from playwright.async_api import Page, async_playwright
 
@@ -30,6 +31,24 @@ logger = logging.getLogger(__name__)
 class WriteResult:
     status: WOStatus            # PROCESSED, PARTIAL, or FAILED
     detail: str = ""
+
+
+class DedupResult(str, Enum):
+    """Three-state duplicate check. UNCERTAIN is fail-safe: never auto-bill, flag for a human.
+
+    Needed because the JBTC "Un-Invoiced WO" list is maintained by hand, so a WO can still appear
+    there after it has actually been invoiced in Synergix. Synergix — not JBTC — is the source of
+    truth for whether a WO is already billed. A boolean can't distinguish "confirmed not billed" from
+    "couldn't tell" (search error/timeout/ambiguous result); conflating them risks double-billing.
+    """
+
+    NOT_DUPLICATE = "not_duplicate"   # confirmed: no existing invoice found in Synergix
+    DUPLICATE = "duplicate"           # confirmed: an existing invoice matches -> do NOT bill again
+    UNCERTAIN = "uncertain"           # search errored/ambiguous -> human must verify before billing
+
+    @property
+    def safe_to_bill(self) -> bool:
+        return self is DedupResult.NOT_DUPLICATE
 
 
 def _dry_guard(action: str) -> bool:
@@ -113,30 +132,66 @@ class SynergixDriver:
         logger.info("Synergix login successful")
 
     # ------------------------------------------------------------------ duplicate check
-    async def is_duplicate(self, wo_po_number: str) -> bool:
-        """Search Synergix for an existing record matching the WO-PO. True => already exists.
+    def _dedup_search_value(self, payload: WOPayload) -> str:
+        """The WO field to search Synergix on, per SYNERGIX_DEDUP_KEY config."""
+        if settings.SYNERGIX_DEDUP_KEY == "job_sheet":
+            return payload.job_sheet_number
+        return payload.wo_po_number
 
-        # TODO(human): confirm the correct Synergix search screen + that WO-PO is the right search key.
+    async def check_duplicate(self, payload: WOPayload) -> DedupResult:
+        """Is this WO already invoiced in Synergix? Returns a three-state, fail-safe result.
+
+        The JBTC "Un-Invoiced WO" list is hand-maintained and can be stale, so Synergix is the source
+        of truth. Any error, timeout, or ambiguous page yields UNCERTAIN (not NOT_DUPLICATE), so a WO
+        is NEVER silently billed when we can't confirm it is unbilled — avoiding double invoicing.
+
+        A confirmed NOT_DUPLICATE requires positive evidence of "no records" (the no-result marker),
+        not merely the absence of result rows — otherwise a layout change would read as "safe to bill".
         """
-        if self.stubbed:
-            logger.info("[STUB] dedup check for %s skipped (Synergix not configured) -> not duplicate",
-                        wo_po_number)
-            return False
-        await self.login()
-        assert self.page is not None
-        await self.page.click(S.require("SYNERGIX_DEDUP_NAV", S.SYNERGIX_DEDUP_NAV))
-        await self.page.wait_for_load_state("networkidle")
-        await self.page.fill(
-            S.require("SYNERGIX_DEDUP_SEARCH_INPUT", S.SYNERGIX_DEDUP_SEARCH_INPUT), wo_po_number
-        )
-        await self.page.click(S.require("SYNERGIX_DEDUP_SEARCH_SUBMIT", S.SYNERGIX_DEDUP_SEARCH_SUBMIT))
-        await self.page.wait_for_load_state("networkidle")
+        search_value = self._dedup_search_value(payload)
 
-        result_row = self.page.locator(S.require("SYNERGIX_DEDUP_RESULT_ROW", S.SYNERGIX_DEDUP_RESULT_ROW))
-        count = await result_row.count()
-        dup = count > 0
-        logger.info("Duplicate check for %s: %s (matches=%d)", wo_po_number, dup, count)
-        return dup
+        if self.stubbed:
+            if settings.DEDUP_STUB_ASSUME_SAFE:
+                logger.warning("[STUB] DEDUP_STUB_ASSUME_SAFE=true — assuming %s NOT invoiced "
+                               "(DEV ONLY; never use with real billing)", search_value)
+                return DedupResult.NOT_DUPLICATE
+            # No Synergix yet: we CANNOT verify invoiced status, so this is genuinely uncertain.
+            logger.warning("[STUB] cannot verify invoiced status for %s (Synergix not configured) "
+                           "-> UNCERTAIN (needs human review)", search_value)
+            return DedupResult.UNCERTAIN
+
+        try:
+            await self.login()
+            assert self.page is not None
+            await self.page.click(S.require("SYNERGIX_DEDUP_NAV", S.SYNERGIX_DEDUP_NAV))
+            await self.page.wait_for_load_state("networkidle")
+            await self.page.fill(
+                S.require("SYNERGIX_DEDUP_SEARCH_INPUT", S.SYNERGIX_DEDUP_SEARCH_INPUT), search_value
+            )
+            await self.page.click(
+                S.require("SYNERGIX_DEDUP_SEARCH_SUBMIT", S.SYNERGIX_DEDUP_SEARCH_SUBMIT)
+            )
+            await self.page.wait_for_load_state("networkidle")
+
+            match_count = await self.page.locator(
+                S.require("SYNERGIX_DEDUP_RESULT_ROW", S.SYNERGIX_DEDUP_RESULT_ROW)
+            ).count()
+            no_result = await self.page.locator(
+                S.require("SYNERGIX_DEDUP_NO_RESULT_MARKER", S.SYNERGIX_DEDUP_NO_RESULT_MARKER)
+            ).count()
+
+            if match_count > 0:
+                logger.info("Dedup %s: DUPLICATE (%d match(es) in Synergix)", search_value, match_count)
+                return DedupResult.DUPLICATE
+            if no_result > 0:
+                logger.info("Dedup %s: NOT_DUPLICATE (Synergix reports no records)", search_value)
+                return DedupResult.NOT_DUPLICATE
+            # Neither a match nor an explicit "no records" marker — can't be sure. Fail safe.
+            logger.warning("Dedup %s: UNCERTAIN (no result rows and no no-result marker)", search_value)
+            return DedupResult.UNCERTAIN
+        except Exception:
+            logger.exception("Dedup check for %s errored — returning UNCERTAIN (fail-safe)", search_value)
+            return DedupResult.UNCERTAIN
 
     # ------------------------------------------------------------------ write path
     async def write(self, payload: WOPayload) -> WriteResult:

@@ -22,7 +22,7 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 from config import settings
 from src import db, notifier
 from src.models import WOPayload, WOStatus
-from src.synergix_driver import SynergixDriver
+from src.synergix_driver import DedupResult, SynergixDriver
 from src.validator import build_remarks, resolve_project_code
 
 logger = logging.getLogger(__name__)
@@ -173,6 +173,22 @@ class TelegramGate:
 
         driver = await self._ensure_driver()
         async with self._driver_lock:  # serialise browser writes
+            # Checkpoint 2 of 2: time passed between queuing and this approval, during which the WO
+            # may have been invoiced manually. Re-verify right before writing so a stale approval
+            # can't create a duplicate invoice. Only a confirmed NOT_DUPLICATE proceeds.
+            dedup = await driver.check_duplicate(payload)
+            if not dedup.safe_to_bill:
+                if dedup is DedupResult.DUPLICATE:
+                    await db.set_status(wo_po_number, WOStatus.DUPLICATE,
+                                        error="already invoiced in Synergix at approval time")
+                    await notifier.send_wo_result(self.bot, wo_po_number, WOStatus.DUPLICATE,
+                                                  "already invoiced in Synergix — write aborted")
+                else:  # UNCERTAIN
+                    await db.set_status(wo_po_number, WOStatus.NEEDS_REVIEW,
+                                        error="dedup inconclusive at approval time — write aborted")
+                    await notifier.send_wo_result(self.bot, wo_po_number, WOStatus.NEEDS_REVIEW,
+                                                  "could not confirm it is un-invoiced — write aborted, verify manually")
+                return
             result = await driver.write(payload)
 
         await db.set_status(wo_po_number, result.status, error=result.detail or None)

@@ -44,6 +44,7 @@ async def send_wo_result(bot: Bot, wo_po_number: str, status: WOStatus, detail: 
         WOStatus.FAILED: "❌",
         WOStatus.REJECTED: "🚫",
         WOStatus.DUPLICATE: "♻️",
+        WOStatus.NEEDS_REVIEW: "🔍",
         WOStatus.INVALID: "⛔",
     }.get(status, "•")
     msg = f"{icon} {wo_po_number}: {status.value}{_mode_suffix()}"

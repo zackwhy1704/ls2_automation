@@ -34,7 +34,7 @@ from src.extractor import (
     extract_from_text,
 )
 from src.models import WOStatus
-from src.synergix_driver import SynergixDriver
+from src.synergix_driver import DedupResult, SynergixDriver
 from src.tcms_scraper import TCMSScraper
 from src.telegram_gate import TelegramGate
 from src.validator import build_remarks, resolve_project_code, validate
@@ -110,8 +110,25 @@ async def _validate_dedup_queue(
     project_code = resolve_project_code(payload.job_sheet_number)
     remarks = build_remarks(payload)
 
-    if await synergix.is_duplicate(payload.wo_po_number):
+    # Checkpoint 1 of 2: is this WO already invoiced in Synergix? (JBTC's un-invoiced list is
+    # hand-maintained and can be stale.) Fail-safe: an uncertain check is flagged for a human, never
+    # auto-queued for billing. The write path re-checks again just before creating the invoice.
+    dedup = await synergix.check_duplicate(payload)
+    if dedup is DedupResult.DUPLICATE:
+        logger.info("WO %s already invoiced in Synergix — skipping", payload.wo_po_number)
         await db.upsert_payload(payload, WOStatus.DUPLICATE, project_code=project_code, remarks=remarks)
+        return
+    if dedup is DedupResult.UNCERTAIN:
+        logger.warning("WO %s: could not verify invoiced status — flagging for review", payload.wo_po_number)
+        await db.upsert_payload(
+            payload, WOStatus.NEEDS_REVIEW, project_code=project_code, remarks=remarks,
+            error="Synergix duplicate check inconclusive — verify manually it is NOT already invoiced",
+        )
+        await notifier.send_text(
+            gate.bot,
+            f"⚠️ {payload.wo_po_number}: could NOT confirm whether it's already invoiced in Synergix. "
+            "Left as NEEDS_REVIEW — verify manually before billing to avoid a double invoice.",
+        )
         return
 
     await db.upsert_payload(

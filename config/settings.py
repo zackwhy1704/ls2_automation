@@ -73,9 +73,18 @@ class Settings(BaseSettings):
     SYNERGIX_USERNAME: str = ""
     SYNERGIX_PASSWORD: str = ""
     SYNERGIX_TEMPLATE_QUO_ID: str = ""
+    # Which WO field to search Synergix on when checking "already invoiced?". The JBTC un-invoiced
+    # list is maintained by hand and can be stale, so this check is what actually prevents double
+    # billing. "wo_po" | "job_sheet" — confirm against the real Synergix records.
+    SYNERGIX_DEDUP_KEY: str = "wo_po"
 
     # --- Behaviour ---
     DRY_RUN: bool = True          # defaults to True — never default to live
+    # DEV ONLY. When Synergix is not configured, the dedup check can't verify invoiced status, so it
+    # returns UNCERTAIN (fail-safe) and WOs land in NEEDS_REVIEW. Set true to instead assume
+    # NOT_DUPLICATE in stub mode, so the approval flow can be demoed locally. NEVER true with real
+    # billing — it defeats the double-invoice guard.
+    DEDUP_STUB_ASSUME_SAFE: bool = False
     HEADLESS: bool = False
     TIMEZONE: str = "Asia/Singapore"
     # Default timeout (ms) for Playwright waits. D365/Synergix can be slow to render.
@@ -176,8 +185,10 @@ SYNERGIX_BASE_URL = settings.SYNERGIX_BASE_URL
 SYNERGIX_USERNAME = settings.SYNERGIX_USERNAME
 SYNERGIX_PASSWORD = settings.SYNERGIX_PASSWORD
 SYNERGIX_TEMPLATE_QUO_ID = settings.SYNERGIX_TEMPLATE_QUO_ID
+SYNERGIX_DEDUP_KEY = settings.SYNERGIX_DEDUP_KEY
 
 DRY_RUN = settings.DRY_RUN
+DEDUP_STUB_ASSUME_SAFE = settings.DEDUP_STUB_ASSUME_SAFE
 HEADLESS = settings.HEADLESS
 TIMEZONE = settings.TIMEZONE
 PLAYWRIGHT_TIMEOUT_MS = settings.PLAYWRIGHT_TIMEOUT_MS

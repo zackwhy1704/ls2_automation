@@ -13,7 +13,8 @@ class WOStatus(str, Enum):
     INGESTED = "ingested"            # alias used by the email flow; same meaning as SCRAPED
     EXTRACTED = "extracted"
     INVALID = "invalid"              # failed validation
-    DUPLICATE = "duplicate"          # already in Synergix
+    DUPLICATE = "duplicate"          # already invoiced in Synergix — must NOT be billed again
+    NEEDS_REVIEW = "needs_review"    # dedup check was inconclusive/errored — a human must verify before billing
     PENDING_APPROVAL = "pending_approval"
     APPROVED = "approved"
     REJECTED = "rejected"
