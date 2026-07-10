@@ -14,8 +14,9 @@ data/samples/
 
 # Playwright
 .playwright/
-# Persisted TCMS browser session (login cookies) — never commit
+# Persisted browser sessions (login cookies) — never commit
 .tcms_session/
+.synergix_session/
 
 # Claude Code local settings (machine-specific permission allowlist)
 .claude/

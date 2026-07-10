@@ -72,12 +72,12 @@ TCMS_WO_BACK_TO_LIST = TODO_SELECTOR  # not needed: we re-navigate to the worksp
 # Synergix ERP
 # ======================================================================================
 
-# Login page
-SYNERGIX_USERNAME_INPUT = TODO_SELECTOR   # TODO(human): username input on Synergix login
-SYNERGIX_PASSWORD_INPUT = TODO_SELECTOR   # TODO(human): password input on Synergix login
-SYNERGIX_LOGIN_BUTTON = TODO_SELECTOR     # TODO(human): submit button on Synergix login
-SYNERGIX_LOGIN_SUCCESS_MARKER = TODO_SELECTOR  # TODO(human): element only present after successful Synergix login
-SYNERGIX_HOME_MARKER = TODO_SELECTOR      # TODO(human): element identifying the Synergix home/known state (navigate-back target)
+# Login page — DONE (Synergix Taskhub TH6, a PrimeFaces/JSF app; ids are stable "formId:componentId").
+SYNERGIX_USERNAME_INPUT = "#loginForm\\:username"
+SYNERGIX_PASSWORD_INPUT = "#loginForm\\:password"
+SYNERGIX_LOGIN_BUTTON = "#loginForm\\:loginButton"
+SYNERGIX_LOGIN_SUCCESS_MARKER = "text=Operations"   # main menu item, present only after login
+SYNERGIX_HOME_MARKER = "text=Operations"            # home/known-state marker
 
 # --- Duplicate check (Service Order Performance or equivalent search) ---
 SYNERGIX_DEDUP_NAV = TODO_SELECTOR        # TODO(human): nav to the search screen used to check if a WO already exists

@@ -116,8 +116,11 @@ class SynergixDriver:
         if not settings.SYNERGIX_BASE_URL:
             raise RuntimeError("SYNERGIX_BASE_URL is not set in .env")
         assert self.page is not None
-        await self.page.goto(settings.SYNERGIX_BASE_URL)
-        await self.page.wait_for_load_state("networkidle")
+        # JSF/PrimeFaces app keeps connections open, so wait on the login form, not networkidle.
+        await self.page.goto(settings.SYNERGIX_BASE_URL, wait_until="domcontentloaded")
+        await self.page.wait_for_selector(
+            S.require("SYNERGIX_USERNAME_INPUT", S.SYNERGIX_USERNAME_INPUT)
+        )
         await self.page.fill(
             S.require("SYNERGIX_USERNAME_INPUT", S.SYNERGIX_USERNAME_INPUT), settings.SYNERGIX_USERNAME
         )
