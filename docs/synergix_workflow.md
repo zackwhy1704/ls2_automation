@@ -38,6 +38,29 @@ only in WO intake (JBTC = TCMS scrape, SKTC = email).
 - **Attach the work order** PDF; use the WO number as the reference for the folder and pdf.
 - **Submit the service order for billing.**
 
-## Notes
-- The remarks format was given as a screenshot in the doc (not captured here) — confirm exact text.
+## Concrete field values (from JBTC_Adhoc_Pest_Control_Billing_Workflow.docx)
+- **Nav path**: post-login → **General Service** (text link) → **Servicing** icon → the modules
+  **Service Order Performance - LS2**, **Service Quotation - LS2**, **Schedule Board - LS2**.
+- **Dedup (Stage B step 3)**: Service Order Performance - LS2 → search the **Enquiry/Subject** column
+  by WO-PO number → confirm no existing record before proceeding.
+- **Item code (adhoc pest control)**: `SE-400212A`, Type **S**, Qty **1.00 SVC**
+  (SE-400212A = "Adhoc-Provision of Pest Control Services").
+- **Subject**: `WO-PO/XXXXXXXXX – Jalan Besar Town Council (Type of Service)`.
+- **Reference No.** = the GL number (full string).
+- **Project Site**: alphabetic Job Sheet → Infigo (2000069); numeric only → Ecocare (2000050).
+- **Remarks format**:
+  `[TC name – address]. Remarks: [location details]. Job done on [date]. [Description of Work].
+   Job Sheet: [number]. [Scope description]. WO-PO/[number].`
+- **Payment Info panel**: Billing Party = the Town Council; Payment Method = Cheque; Tenor Term = 30 days.
+- **Shipment Info panel**: Required Shipment Date = today.
+- **Stage D tabs**: **Billables** tab (confirm Quoted/Actual Qty, Unit Price, Total) then **Attachments**
+  tab (paperclip) → upload WO PDF, folder+file named by WO-PO number → **Fulfill**.
+- **Outputs**: Service Quotation (e.g. QUO0006010) + Service Report (e.g. SV00008631), both PDF.
+
+## Automation scope (agreed)
+- **In scope now: Stage B only** — dedup check + create quotation (Copy From) + fill all header/line/
+  remarks fields + verify Payment/Shipment info. Does NOT auto-submit.
+- **Left to the human approver**: final Submit + Variation Order confirm (end of B), Stage C schedule
+  board (most fragile), and Stage D fulfil/attach/bill.
 - DRY_RUN performs every step EXCEPT the final Submit/Confirm/Fulfill clicks.
+- Copy-From source quotation: TBD (decide during codegen recording).
