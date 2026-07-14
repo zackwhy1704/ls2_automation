@@ -57,6 +57,32 @@ only in WO intake (JBTC = TCMS scrape, SKTC = email).
   tab (paperclip) → upload WO PDF, folder+file named by WO-PO number → **Fulfill**.
 - **Outputs**: Service Quotation (e.g. QUO0006010) + Service Report (e.g. SV00008631), both PDF.
 
+## Field source mapping (agreed with client)
+Corrected nav: post-login → **General Service** → under **Enquiry Call & Order** →
+**Service Quotation - LS2**. Dedup is done INSIDE this module via its **History** view (not a separate
+Service Order Performance module): check History's Enquiry/Subject for the WO-PO; if it exists, SKIP
+this WO. Once confirmed unique, go back to **Draft** and click **+**, then **Copy From** a template.
+
+Inherited FROM the Copy From template (driver does NOT set these):
+- **Customer / Billing Party** (one template per town council carries the right customer).
+- **Item code** (varies by service type; the template already has the correct one).
+- Payment/Shipment defaults (Cheque, 30-day tenor) unless they need per-WO change.
+
+Set/overridden by the driver FROM extracted WO data:
+- **Subject** = `WO-PO/<num> – <Town Council> (<type of service>)`
+- **Reference No.** = `gl_number` (full string)
+- **Date** / delivery / required shipment date = today
+- **Project Site** = `resolve_project_code(job_sheet_number)` (alphabetic→Infigo 2000069, numeric→Ecocare 2000050)
+- **Customer Contact** = `prepared_by`
+- **Qty** = `quantity`, **Unit price** = `unit_price`
+- **Remarks** = built per the remarks format above
+
+Verification (step 6): after filling, open the quotation **PDF preview** to eyeball the end product
+against the JBTC billing workflow BEFORE the human submits. Use existing History records as the
+formatting reference (they hold correct real data).
+
+Template quotation ids (one per council) + copy-from source: TBD during codegen recording.
+
 ## Automation scope (agreed)
 - **In scope now: Stage B only** — dedup check + create quotation (Copy From) + fill all header/line/
   remarks fields + verify Payment/Shipment info. Does NOT auto-submit.
