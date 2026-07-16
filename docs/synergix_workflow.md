@@ -83,6 +83,29 @@ formatting reference (they hold correct real data).
 
 Template quotation ids (one per council) + copy-from source: TBD during codegen recording.
 
+## Observed from the JBTC WO Synergix.mp4 walkthrough (WO-PO/000080291, QUO0006213)
+The **Service Quotation - LS2** edit form fields (confirmed against a real filled quotation):
+- Left column: Customer Type (Existing Customer), **Customer** + **Customer Contact** (inherited from
+  template — e.g. JALAN BESAR TOWN COUNCIL / Iswaran s/o Regunath), Contact No.,
+  **Enquiry/Subject** = `WO-PO/000080291 - Jalan Besar Town Council (Rodent Treatment)`.
+  ⚠️ Enquiry/Subject has a **50-character max** (validation toast fires past 50) — the subject string
+  must be truncated/abbreviated to fit.
+- Middle: **Enquiry Date** + **Quotation Date** = today; Validity Term/Date.
+- Details grid (line item, mostly inherited from template): Qty/UOM `1.00 SVC`, Options `Regular`,
+  **Unit Price** (from WO job cost, e.g. 44.00), Total Amount, per-line **Remarks**
+  (e.g. `Jalan Besar Town Council - 4C ST. GEORGE'S LANE`). Totals auto-calc: Before Tax, 9% GST,
+  After Tax (44.00 → 47.96, matches the WO Grand Total).
+- Right panel "General": Location, Salesperson*, SBU, Currency (SGD), Sales Tax (GST Std Rt 9%),
+  **Reference No.** = GL number, Customer PO No.
+- Right panel "Segment" (required *): **Project Site** (e.g. `2000069-(Potong…)` = Infigo since job
+  sheet A25-01086 is alphabetic), Project In-Charge (`2SC-Infigo`), Project Portfolio (`Towncouncil`),
+  Project BU (`Pest Control`).
+- The list/dedup view (**Service Quotation - LS2** grid) has an **Enquiry/Subject** column with a
+  per-column filter box — filtering it by the WO-PO is the dedup check.
+
+Stage C (Schedule Board) and the Fulfil view (Service Order Performance) were also shown but are OUT
+of the current Stage-B automation scope.
+
 ## Automation scope (agreed)
 - **In scope now: Stage B only** — dedup check + create quotation (Copy From) + fill all header/line/
   remarks fields + verify Payment/Shipment info. Does NOT auto-submit.
