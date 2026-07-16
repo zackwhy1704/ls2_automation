@@ -106,6 +106,27 @@ The **Service Quotation - LS2** edit form fields (confirmed against a real fille
 Stage C (Schedule Board) and the Fulfil view (Service Order Performance) were also shown but are OUT
 of the current Stage-B automation scope.
 
+## ⚠️ Selector strategy: label-based, NOT id-based
+Synergix TH6 is JSF/PrimeFaces. Element ids are AUTO-GENERATED and unstable, e.g.
+`syn:j_id-803968509_59bfea21:summaryTabs:j_id695566453_56c810d0:...:serviceQuotationTable:j_id-207568224_1ce7fad8:filter`
+— the `j_id...` fragments regenerate across view changes/sessions, so hard-coding them is brittle.
+
+What IS stable: the visible **column header labels** ("Enquiry/Subject", "Quotation No.", "Reference
+No.", …) and structural class/role names (`ui-column-title`, `serviceQuotationTable`, `:filter`,
+`ui-inputfield`). So the driver must locate fields RELATIONALLY: find the column/label by its text,
+then target the input/filter within it (Playwright get_by_role / has-text / xpath-by-label), rather
+than by absolute id. Login ids (`loginForm:*`) are the exception — those are stable.
+
+### Fields the driver actually SETS (everything else inherited from the Copy From template)
+Per client decisions: Customer, Customer Contact, item code, and all four Segment fields
+(Project Site/In-Charge/Portfolio/BU) are INHERITED from the template. The driver only overrides:
+- **Enquiry/Subject** = `WO-PO/<num> - <Town Council>` (DROP the service-type suffix), truncated to
+  the **50-char** max.
+- **Enquiry Date** + **Quotation Date** = today.
+- **Reference No.** = `gl_number` (full string).
+- **Unit Price** = `unit_price`; line **Remarks** = built remarks.
+(Qty is 1.00 SVC from the template; totals auto-calc.)
+
 ## Automation scope (agreed)
 - **In scope now: Stage B only** — dedup check + create quotation (Copy From) + fill all header/line/
   remarks fields + verify Payment/Shipment info. Does NOT auto-submit.
