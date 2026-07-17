@@ -95,18 +95,30 @@ class SynergixDriver:
             )
             return
         self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(headless=settings.HEADLESS)
-        self._context = await self._browser.new_context(accept_downloads=True)
-        self.page = await self._context.new_page()
+        # Synergix (taskhub.ls2.sg) sits behind Cloudflare bot protection: headless Chromium gets
+        # blocked. Run a persistent, non-headless context with a realistic UA and the automation flag
+        # disabled so we look like a normal browser. Persisting the profile also reuses the login
+        # cookie across runs (Synergix sessions are short-lived).
+        settings.SYNERGIX_SESSION_DIR.mkdir(parents=True, exist_ok=True)
+        self._context = await self._pw.chromium.launch_persistent_context(
+            str(settings.SYNERGIX_SESSION_DIR),
+            headless=settings.SYNERGIX_HEADLESS,
+            accept_downloads=True,
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        self.page = self._context.pages[0] if self._context.pages else await self._context.new_page()
         self.page.set_default_timeout(settings.PLAYWRIGHT_TIMEOUT_MS)
-        logger.info("Synergix browser launched (headless=%s)", settings.HEADLESS)
+        logger.info("Synergix browser launched (headless=%s, persistent)", settings.SYNERGIX_HEADLESS)
 
     async def close(self) -> None:
         if self.stubbed:
             return
-        for obj in (self._context, self._browser):
-            if obj:
-                await obj.close()
+        if self._context:
+            await self._context.close()
         if self._pw:
             await self._pw.stop()
 

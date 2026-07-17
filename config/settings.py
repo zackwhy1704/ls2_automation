@@ -21,6 +21,7 @@ DATA_DIR = PROJECT_ROOT / "data"
 PDF_DIR = DATA_DIR / "pdfs"
 INCOMING_EMAIL_DIR = DATA_DIR / "incoming_emails"  # .eml files pulled from the IMAP mailbox
 TCMS_SESSION_DIR = PROJECT_ROOT / ".tcms_session"  # persisted D365 browser session (login cookies)
+SYNERGIX_SESSION_DIR = PROJECT_ROOT / ".synergix_session"  # persisted Synergix session (Cloudflare/login)
 LOGS_DIR = PROJECT_ROOT / "logs"
 DB_PATH = DATA_DIR / "state.db"
 
@@ -77,6 +78,9 @@ class Settings(BaseSettings):
     # list is maintained by hand and can be stale, so this check is what actually prevents double
     # billing. "wo_po" | "job_sheet" — confirm against the real Synergix records.
     SYNERGIX_DEDUP_KEY: str = "wo_po"
+    # Synergix sits behind Cloudflare bot protection that blocks headless browsers. Default to a
+    # visible (non-headless) browser for Synergix specifically, independent of the global HEADLESS.
+    SYNERGIX_HEADLESS: bool = False
 
     # --- Behaviour ---
     DRY_RUN: bool = True          # defaults to True — never default to live
@@ -110,6 +114,10 @@ class Settings(BaseSettings):
     @property
     def TCMS_SESSION_DIR(self) -> Path:
         return TCMS_SESSION_DIR
+
+    @property
+    def SYNERGIX_SESSION_DIR(self) -> Path:
+        return SYNERGIX_SESSION_DIR
 
     @property
     def LOGS_DIR(self) -> Path:
@@ -186,6 +194,7 @@ SYNERGIX_USERNAME = settings.SYNERGIX_USERNAME
 SYNERGIX_PASSWORD = settings.SYNERGIX_PASSWORD
 SYNERGIX_TEMPLATE_QUO_ID = settings.SYNERGIX_TEMPLATE_QUO_ID
 SYNERGIX_DEDUP_KEY = settings.SYNERGIX_DEDUP_KEY
+SYNERGIX_HEADLESS = settings.SYNERGIX_HEADLESS
 
 DRY_RUN = settings.DRY_RUN
 DEDUP_STUB_ASSUME_SAFE = settings.DEDUP_STUB_ASSUME_SAFE

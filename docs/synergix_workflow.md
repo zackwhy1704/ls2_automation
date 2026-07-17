@@ -106,6 +106,17 @@ The **Service Quotation - LS2** edit form fields (confirmed against a real fille
 Stage C (Schedule Board) and the Fulfil view (Service Order Performance) were also shown but are OUT
 of the current Stage-B automation scope.
 
+## ⚠️ Cloudflare bot protection
+`taskhub.ls2.sg` sits behind **Cloudflare bot protection**. HEADLESS Chromium gets blocked
+("Sorry, you have been blocked"), and rapid repeated automated hits trigger an **IP-level block**
+that persists for a while (minutes–hours) even for a visible browser. Mitigations in the driver:
+- Run **non-headless** (`SYNERGIX_HEADLESS=false`, the default) with a realistic user-agent and
+  `--disable-blink-features=AutomationControlled`.
+- **Persistent context** (`.synergix_session/`) to reuse the login cookie and minimise hits.
+- Avoid tight retry loops against the server.
+For reliable production automation, the best fix is to have the client/vendor **allowlist the runner
+IP** or relax Cloudflare bot protection for this app.
+
 ## ⚠️ Selector strategy: label-based, NOT id-based
 Synergix TH6 is JSF/PrimeFaces. Element ids are AUTO-GENERATED and unstable, e.g.
 `syn:j_id-803968509_59bfea21:summaryTabs:j_id695566453_56c810d0:...:serviceQuotationTable:j_id-207568224_1ce7fad8:filter`
