@@ -128,21 +128,24 @@ class SynergixDriver:
         if not settings.SYNERGIX_BASE_URL:
             raise RuntimeError("SYNERGIX_BASE_URL is not set in .env")
         assert self.page is not None
-        # JSF/PrimeFaces app keeps connections open, so wait on the login form, not networkidle.
+        # JSF/PrimeFaces app keeps connections open, so wait on DOM content, not networkidle.
         await self.page.goto(settings.SYNERGIX_BASE_URL, wait_until="domcontentloaded")
-        await self.page.wait_for_selector(
-            S.require("SYNERGIX_USERNAME_INPUT", S.SYNERGIX_USERNAME_INPUT)
-        )
-        await self.page.fill(
-            S.require("SYNERGIX_USERNAME_INPUT", S.SYNERGIX_USERNAME_INPUT), settings.SYNERGIX_USERNAME
-        )
-        await self.page.fill(
-            S.require("SYNERGIX_PASSWORD_INPUT", S.SYNERGIX_PASSWORD_INPUT), settings.SYNERGIX_PASSWORD
-        )
-        await self.page.click(S.require("SYNERGIX_LOGIN_BUTTON", S.SYNERGIX_LOGIN_BUTTON))
-        await self.page.wait_for_selector(
-            S.require("SYNERGIX_LOGIN_SUCCESS_MARKER", S.SYNERGIX_LOGIN_SUCCESS_MARKER)
-        )
+        await self.page.wait_for_timeout(3000)
+
+        login_field = self.page.locator(S.require("SYNERGIX_USERNAME_INPUT", S.SYNERGIX_USERNAME_INPUT))
+        if await login_field.count():
+            # Login form is present -> authenticate.
+            await login_field.fill(settings.SYNERGIX_USERNAME)
+            await self.page.fill(
+                S.require("SYNERGIX_PASSWORD_INPUT", S.SYNERGIX_PASSWORD_INPUT), settings.SYNERGIX_PASSWORD
+            )
+            await self.page.click(S.require("SYNERGIX_LOGIN_BUTTON", S.SYNERGIX_LOGIN_BUTTON))
+        else:
+            # Persisted session already logged in — we landed straight on the app.
+            logger.info("Synergix session reused (no login form present)")
+
+        # Confirm we're on the app: the header home button is always present once authenticated.
+        await self.page.wait_for_selector("#headerToolbarFormLeft\\:homeButton", timeout=30000)
         self._logged_in = True
         logger.info("Synergix login successful")
 
@@ -251,19 +254,14 @@ class SynergixDriver:
             )
         try:
             await self.login()
-            project_code = resolve_project_code(payload.job_sheet_number)
-            remarks = build_remarks(payload)
-
-            await self._stage_b_create_quotation(payload, project_code, remarks)
-            schedule_ok = await self._stage_c_schedule_board(payload)
-            await self._stage_d_attach_and_fulfil(payload)
-
-            if not schedule_ok:
-                return WriteResult(
-                    WOStatus.PARTIAL,
-                    "schedule board needs manual action (stage C was best-effort and did not complete)",
-                )
-            return WriteResult(WOStatus.PROCESSED, "all stages completed")
+            await self._stage_b_create_quotation(payload)
+            # Scope: Stage B only. Schedule Board (C) and Fulfil (D) stay manual for the human approver.
+            # The draft is filled and left un-submitted for a human to review + Submit.
+            return WriteResult(
+                WOStatus.PARTIAL,
+                "Stage B draft quotation created and filled — NOT submitted. "
+                "Human to review, submit, then do schedule board + fulfil.",
+            )
         except S.MissingSelectorError as exc:
             logger.error("MISSING SELECTOR: %s — fill it in config/selectors.py", exc)
             return WriteResult(WOStatus.FAILED, f"missing selector: {exc}")
@@ -274,96 +272,122 @@ class SynergixDriver:
         finally:
             await self._back_to_home()
 
-    async def _stage_b_create_quotation(
-        self, payload: WOPayload, project_code: str, remarks: str
-    ) -> None:
-        assert self.page is not None
-        logger.info("Stage B: create quotation for %s", payload.wo_po_number)
-        await self.page.click(S.require("SYNERGIX_NEW_QUOTATION_NAV", S.SYNERGIX_NEW_QUOTATION_NAV))
-        await self.page.wait_for_load_state("networkidle")
+    def _subject(self, payload: WOPayload) -> str:
+        """Enquiry/Subject string, capped at Synergix's 50-char limit.
 
-        # Copy From a fixed template quotation.
-        if not settings.SYNERGIX_TEMPLATE_QUO_ID:
-            raise RuntimeError("SYNERGIX_TEMPLATE_QUO_ID is not set in .env")
-        await self.page.click(S.require("SYNERGIX_COPY_FROM_BUTTON", S.SYNERGIX_COPY_FROM_BUTTON))
-        await self.page.fill(
-            S.require("SYNERGIX_COPY_FROM_ID_INPUT", S.SYNERGIX_COPY_FROM_ID_INPUT),
-            settings.SYNERGIX_TEMPLATE_QUO_ID,
-        )
-        await self.page.click(S.require("SYNERGIX_COPY_FROM_CONFIRM", S.SYNERGIX_COPY_FROM_CONFIRM))
-        await self.page.wait_for_load_state("networkidle")
+        Format `WO-PO/<num> - <Town Council>` (service-type suffix dropped per client, to fit 50).
+        """
+        council = payload.town_council.strip().title() or "Town Council"
+        subject = f"{payload.wo_po_number} - {council}"
+        return subject[:50]
 
-        # Fill the ~8 fields.
-        await self.page.fill(
-            S.require("SYNERGIX_FIELD_SERVICE_LOCATION", S.SYNERGIX_FIELD_SERVICE_LOCATION),
-            payload.service_location,
-        )
-        await self.page.fill(
-            S.require("SYNERGIX_FIELD_CUSTOMER_CONTACT", S.SYNERGIX_FIELD_CUSTOMER_CONTACT),
-            payload.prepared_by,
-        )
-        await self.page.fill(
-            S.require("SYNERGIX_FIELD_REFERENCE_NO", S.SYNERGIX_FIELD_REFERENCE_NO), payload.gl_number
-        )
-        await self.page.fill(
-            S.require("SYNERGIX_FIELD_PROJECT_CODE", S.SYNERGIX_FIELD_PROJECT_CODE), project_code
-        )
-        await self.page.fill(
-            S.require("SYNERGIX_FIELD_JOB_DATE", S.SYNERGIX_FIELD_JOB_DATE),
-            payload.job_date.strftime("%d/%m/%Y"),
-        )
-        await self.page.fill(
-            S.require("SYNERGIX_FIELD_QUANTITY", S.SYNERGIX_FIELD_QUANTITY), str(payload.quantity)
-        )
-        await self.page.fill(
-            S.require("SYNERGIX_FIELD_UNIT_PRICE", S.SYNERGIX_FIELD_UNIT_PRICE), str(payload.unit_price)
-        )
-        await self.page.fill(S.require("SYNERGIX_FIELD_REMARKS", S.SYNERGIX_FIELD_REMARKS), remarks)
+    async def _fill_labeled_input(self, label: str, value: str) -> None:
+        """Fill the input/textarea belonging to a form field identified by its on-screen label.
 
-        # Final submit — gated by DRY_RUN.
-        submit_sel = S.require("SYNERGIX_QUOTATION_SUBMIT", S.SYNERGIX_QUOTATION_SUBMIT)
-        if not _dry_guard(f"submit quotation for {payload.wo_po_number}"):
-            await self.page.click(submit_sel)
-            await self.page.wait_for_load_state("networkidle")
-
-    async def _stage_c_schedule_board(self, payload: WOPayload) -> bool:
-        """MOST FRAGILE step. Best-effort: return False (don't raise) if it can't complete.
-
-        # TODO(human): the schedule board is likely drag/drop in D365 — confirm the real interaction.
+        Synergix's JSF ids are auto-generated, so we anchor on the (stable) label text and take the
+        input in the same table row. Raises if the field can't be found — the caller marks FAILED.
         """
         assert self.page is not None
-        logger.info("Stage C: schedule board update for %s (best-effort)", payload.wo_po_number)
-        try:
-            await self.page.click(S.require("SYNERGIX_SCHEDULE_BOARD_NAV", S.SYNERGIX_SCHEDULE_BOARD_NAV))
-            await self.page.wait_for_load_state("networkidle")
-            await self.page.click(
-                S.require("SYNERGIX_SCHEDULE_BOARD_ENTRY", S.SYNERGIX_SCHEDULE_BOARD_ENTRY)
-            )
-            save_sel = S.require("SYNERGIX_SCHEDULE_BOARD_SAVE", S.SYNERGIX_SCHEDULE_BOARD_SAVE)
-            if not _dry_guard(f"save schedule board entry for {payload.wo_po_number}"):
-                await self.page.click(save_sel)
-                await self.page.wait_for_load_state("networkidle")
-            return True
-        except Exception as exc:
-            logger.warning(
-                "Stage C (schedule board) did not complete for %s: %s — marking PARTIAL",
-                payload.wo_po_number, exc,
-            )
-            return False
-
-    async def _stage_d_attach_and_fulfil(self, payload: WOPayload) -> None:
-        assert self.page is not None
-        logger.info("Stage D: attach PDF + fulfil SO for %s", payload.wo_po_number)
-        await self.page.click(S.require("SYNERGIX_ATTACH_PDF_BUTTON", S.SYNERGIX_ATTACH_PDF_BUTTON))
-        await self.page.set_input_files(
-            S.require("SYNERGIX_ATTACH_PDF_INPUT", S.SYNERGIX_ATTACH_PDF_INPUT), payload.source_path
+        handle = await self.page.evaluate_handle(
+            """(label) => {
+                const norm = s => (s||'').replace(/\\s+/g,' ').trim();
+                const host = [...document.querySelectorAll('td,div,span,label')]
+                  .find(e => e.children.length === 0 && norm(e.textContent) === label);
+                if (!host) return null;
+                const tr = host.closest('tr');
+                return (tr && tr.querySelector('input:not([type=hidden]):not([readonly]), textarea')) || null;
+            }""",
+            label,
         )
-        await self.page.wait_for_load_state("networkidle")
+        element = handle.as_element()
+        if element is None:
+            raise RuntimeError(f"could not locate the input for field {label!r}")
+        await element.click()
+        await element.fill(value)
 
-        fulfil_sel = S.require("SYNERGIX_FULFIL_SO_BUTTON", S.SYNERGIX_FULFIL_SO_BUTTON)
-        if not _dry_guard(f"fulfil service order for {payload.wo_po_number}"):
-            await self.page.click(fulfil_sel)
-            await self.page.wait_for_load_state("networkidle")
+    async def _stage_b_create_quotation(self, payload: WOPayload) -> None:
+        """Create a draft Service Quotation by Copy From, fill the WO-specific fields, DON'T submit.
+
+        Everything not set here (customer, contact, item code, project segment) is inherited from the
+        copied template. Leaves the draft filled and un-submitted for a human to review + Submit.
+        """
+        assert self.page is not None
+        page = self.page
+        logger.info("Stage B: create quotation draft for %s", payload.wo_po_number)
+
+        await self._open_service_quotation_list()
+
+        # New draft, then Copy From the most recent quotation for this town council.
+        await page.locator("button:has(span.fa-plus)").first.click()
+        await page.wait_for_timeout(8000)
+        await page.get_by_role("button", name="Copy From").first.click()
+        await page.wait_for_timeout(7000)
+
+        cust_filter = page.locator("th:has-text('Customer') input.ui-column-filter").first
+        await cust_filter.click()
+        await cust_filter.fill(payload.town_council.strip())
+        await cust_filter.press("Enter")
+        await page.wait_for_timeout(6000)
+
+        # The Copy From modal lists matching quotations newest-first; copy the top one.
+        top_link = page.locator(".ui-dialog:visible [id$='_data'] tr a, [id$='_data'] tr a").first
+        if not await top_link.count():
+            raise RuntimeError(f"no template quotation found for customer {payload.town_council!r}")
+        await top_link.click()
+        await page.wait_for_timeout(2500)
+        # Confirm the "override current data" dialog.
+        await page.get_by_role("button", name="Yes").first.click()
+        await page.wait_for_timeout(12000)
+
+        # Overwrite the WO-specific fields (label-anchored; ids are unstable).
+        await self._fill_labeled_input("Enquiry/Subject", self._subject(payload))
+        await self._fill_labeled_input("Reference No.", payload.gl_number)
+        logger.info("Stage B: filled Subject + Reference No. for %s", payload.wo_po_number)
+
+        # Line item: unit price + remarks live in the Details grid. Set them if present.
+        await self._fill_line_item(payload)
+
+        # Preview so a human can eyeball the result; NEVER auto-submit (Stage B leaves it for review).
+        _dry_guard(f"submit quotation for {payload.wo_po_number} (Stage B never submits)")
+        logger.info("Stage B complete for %s — draft left un-submitted for human review",
+                    payload.wo_po_number)
+
+    async def _fill_line_item(self, payload: WOPayload) -> None:
+        """Set the line Unit Price and Remarks in the Details grid (best-effort, logged if absent)."""
+        assert self.page is not None
+        remarks = build_remarks(payload)
+        try:
+            # The Details grid has a "Remarks" column cell (editable) and a Unit Price input.
+            filled = await self.page.evaluate(
+                """([price, remarks]) => {
+                    const setVal = (el, v) => {
+                      if (!el) return false;
+                      el.focus(); el.value = v;
+                      el.dispatchEvent(new Event('input', {bubbles:true}));
+                      el.dispatchEvent(new Event('change', {bubbles:true}));
+                      return true;
+                    };
+                    // Unit Price: an input in the details row whose column header is 'Unit Price'
+                    let priceOk = false, remarkOk = false;
+                    const grids = [...document.querySelectorAll('.ui-datatable')];
+                    for (const g of grids) {
+                      const heads = [...g.querySelectorAll('th')].map(t => (t.innerText||'').trim());
+                      const pIdx = heads.findIndex(h => /unit price/i.test(h));
+                      const rIdx = heads.findIndex(h => /remarks/i.test(h));
+                      const row = g.querySelector('[id$="_data"] tr');
+                      if (!row) continue;
+                      const cells = [...row.querySelectorAll('td')];
+                      if (pIdx >= 0 && cells[pIdx]) priceOk = setVal(cells[pIdx].querySelector('input'), price) || priceOk;
+                      if (rIdx >= 0 && cells[rIdx]) remarkOk = setVal(cells[rIdx].querySelector('input,textarea'), remarks) || remarkOk;
+                    }
+                    return {priceOk, remarkOk};
+                }""",
+                [f"{payload.unit_price:.2f}", remarks],
+            )
+            logger.info("Stage B line item for %s: %s", payload.wo_po_number, filled)
+        except Exception as exc:
+            logger.warning("Stage B: could not set line item for %s: %s — leaving template values",
+                           payload.wo_po_number, exc)
 
     # ------------------------------------------------------------------ recovery helpers
     async def _back_to_home(self) -> None:

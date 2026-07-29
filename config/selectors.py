@@ -90,28 +90,35 @@ SYNERGIX_DEDUP_SEARCH_SUBMIT = TODO_SELECTOR # unused — filter applies on Ente
 SYNERGIX_DEDUP_RESULT_ROW = TODO_SELECTOR    # unused — read grid body for the WO-PO text
 SYNERGIX_DEDUP_NO_RESULT_MARKER = TODO_SELECTOR  # unused — "No records found." in the grid body
 
-# --- Stage B: Create quotation (Copy From template) ---
-SYNERGIX_NEW_QUOTATION_NAV = TODO_SELECTOR   # TODO(human): nav/button to start a new quotation
-SYNERGIX_COPY_FROM_BUTTON = TODO_SELECTOR    # TODO(human): the "Copy From" control
-SYNERGIX_COPY_FROM_ID_INPUT = TODO_SELECTOR  # TODO(human): field to enter the template quotation id (SYNERGIX_TEMPLATE_QUO_ID)
-SYNERGIX_COPY_FROM_CONFIRM = TODO_SELECTOR   # TODO(human): confirm the copy-from selection
+# --- Stage B: Create quotation — DONE (implemented in SynergixDriver._stage_b_create_quotation) ---
+# Flow (all located by icon class / label text, since JSF ids are auto-generated):
+#   + new draft   = button:has(span.fa-plus)
+#   Copy From     = role=button name "Copy From" (span.fa-copy)
+#   copy source   = filter the modal Customer column by town council -> click top quotation link
+#                   -> confirm "Yes" on the "override current data" dialog
+#   fields set    = Enquiry/Subject + Reference No. (label-anchored), line Unit Price + Remarks (grid)
+#   Submit        = NOT clicked — Stage B leaves the draft for a human to review + submit
+# These id-based constants are therefore unused; left for reference.
+SYNERGIX_NEW_QUOTATION_NAV = TODO_SELECTOR   # unused — button:has(span.fa-plus)
+SYNERGIX_COPY_FROM_BUTTON = TODO_SELECTOR    # unused — role=button "Copy From"
+SYNERGIX_COPY_FROM_ID_INPUT = TODO_SELECTOR  # unused — modal filters by customer, not by id
+SYNERGIX_COPY_FROM_CONFIRM = TODO_SELECTOR   # unused — "Yes" on the override dialog
 
-# The ~8 fields filled on the quotation. Confirm the real field set against Synergix.
-SYNERGIX_FIELD_SERVICE_LOCATION = TODO_SELECTOR  # TODO(human): service location field
-SYNERGIX_FIELD_CUSTOMER_CONTACT = TODO_SELECTOR  # TODO(human): customer contact field (maps from prepared_by)
-SYNERGIX_FIELD_REFERENCE_NO = TODO_SELECTOR      # TODO(human): Reference No. field (maps from gl_number)
-SYNERGIX_FIELD_PROJECT_CODE = TODO_SELECTOR      # TODO(human): project code field (2000069 / 2000050)
-SYNERGIX_FIELD_JOB_DATE = TODO_SELECTOR          # TODO(human): job date field
-SYNERGIX_FIELD_QUANTITY = TODO_SELECTOR          # TODO(human): line quantity field
-SYNERGIX_FIELD_UNIT_PRICE = TODO_SELECTOR        # TODO(human): line unit price field
-SYNERGIX_FIELD_REMARKS = TODO_SELECTOR           # TODO(human): remarks field (built remarks string)
+SYNERGIX_FIELD_SERVICE_LOCATION = TODO_SELECTOR  # unused — inherited from Copy From template
+SYNERGIX_FIELD_CUSTOMER_CONTACT = TODO_SELECTOR  # unused — inherited from template
+SYNERGIX_FIELD_REFERENCE_NO = TODO_SELECTOR      # unused — set via label "Reference No."
+SYNERGIX_FIELD_PROJECT_CODE = TODO_SELECTOR      # unused — inherited (Segment) from template
+SYNERGIX_FIELD_JOB_DATE = TODO_SELECTOR          # unused — dates come from template/today
+SYNERGIX_FIELD_QUANTITY = TODO_SELECTOR          # unused — 1.00 SVC from template
+SYNERGIX_FIELD_UNIT_PRICE = TODO_SELECTOR        # unused — set in the Details grid by column
+SYNERGIX_FIELD_REMARKS = TODO_SELECTOR           # unused — set in the Details grid Remarks column
 
-SYNERGIX_QUOTATION_SUBMIT = TODO_SELECTOR    # TODO(human): the FINAL submit/save/confirm button for the quotation (gated by DRY_RUN)
+SYNERGIX_QUOTATION_SUBMIT = TODO_SELECTOR    # intentionally NOT used — human submits (Stage B stops before submit)
 
-# --- Stage C: Schedule board update (MOST FRAGILE — best-effort) ---
-SYNERGIX_SCHEDULE_BOARD_NAV = TODO_SELECTOR   # TODO(human): nav to the schedule board
-SYNERGIX_SCHEDULE_BOARD_ENTRY = TODO_SELECTOR # TODO(human): where/how the scheduled entry is added (likely drag/drop — flag manual)
-SYNERGIX_SCHEDULE_BOARD_SAVE = TODO_SELECTOR  # TODO(human): save control for the schedule board (gated by DRY_RUN)
+# --- Stage C: Schedule board — OUT OF SCOPE (manual; the human approver does this) ---
+SYNERGIX_SCHEDULE_BOARD_NAV = TODO_SELECTOR   # out of scope
+SYNERGIX_SCHEDULE_BOARD_ENTRY = TODO_SELECTOR # out of scope
+SYNERGIX_SCHEDULE_BOARD_SAVE = TODO_SELECTOR  # out of scope
 
 # --- Stage D: Attach PDF + fulfil service order ---
 SYNERGIX_ATTACH_PDF_BUTTON = TODO_SELECTOR    # TODO(human): control to attach a file to the order
