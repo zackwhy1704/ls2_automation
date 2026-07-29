@@ -92,19 +92,60 @@ def build_html(result: BatchResult) -> str:
 
 
 def send_report(result: BatchResult) -> bool:
-    """Email the batch report. Returns True if sent; logs + returns False if SMTP isn't configured."""
+    """Send the batch report over the configured channel(s). Always logs it first.
+
+    REPORT_CHANNEL: "telegram" (default), "email", or "both". Returns True if at least one channel
+    delivered.
+    """
     text = build_text(result)
     logger.info("Batch report:\n%s", text)  # always log it
 
+    channel = settings.REPORT_CHANNEL.strip().lower()
+    sent = False
+    if channel in ("telegram", "both"):
+        sent = _send_telegram(text) or sent
+    if channel in ("email", "both"):
+        sent = _send_email(result) or sent
+    if channel not in ("telegram", "email", "both"):
+        logger.warning("Unknown REPORT_CHANNEL %r — report logged only.", settings.REPORT_CHANNEL)
+    return sent
+
+
+def _send_telegram(text: str) -> bool:
+    """Post the report to the configured Telegram chat (one-way; no bot polling). Never raises."""
+    if not (settings.TELEGRAM_BOT_TOKEN.strip() and settings.TELEGRAM_CHAT_ID.strip()):
+        logger.warning("Telegram not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) — "
+                       "report logged only, not sent to Telegram.")
+        return False
+    # Telegram caps messages at 4096 chars; trim defensively.
+    body = text if len(text) <= 3900 else text[:3900] + "\n… (truncated; see logs for full report)"
+    try:
+        import asyncio
+        from telegram import Bot
+
+        async def _post() -> None:
+            bot = Bot(settings.TELEGRAM_BOT_TOKEN)
+            await bot.send_message(chat_id=settings.TELEGRAM_CHAT_ID, text=body)
+
+        asyncio.run(_post())
+        logger.info("Batch report sent to Telegram chat %s", settings.TELEGRAM_CHAT_ID)
+        return True
+    except Exception:
+        logger.exception("Failed to send batch report to Telegram")
+        return False
+
+
+def _send_email(result: BatchResult) -> bool:
+    """Email the batch report over SMTP. Returns False (logs) if SMTP isn't configured."""
     if not (settings.SMTP_HOST.strip() and settings.REPORT_TO.strip()):
-        logger.warning("SMTP not configured (SMTP_HOST / REPORT_TO) — report logged only, not emailed.")
+        logger.warning("SMTP not configured (SMTP_HOST / REPORT_TO) — report not emailed.")
         return False
 
     msg = EmailMessage()
     msg["Subject"] = build_subject(result)
     msg["From"] = settings.REPORT_FROM.strip() or settings.SMTP_USERNAME
     msg["To"] = settings.REPORT_TO
-    msg.set_content(text)
+    msg.set_content(build_text(result))
     msg.add_alternative(f"<html><body>{build_html(result)}</body></html>", subtype="html")
 
     try:

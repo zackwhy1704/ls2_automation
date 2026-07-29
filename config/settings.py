@@ -64,9 +64,12 @@ class Settings(BaseSettings):
     # If true, mark fetched messages \Seen so they aren't pulled again. If false, dedup is by Message-ID.
     IMAP_MARK_SEEN: bool = True
 
-    # --- Batch report email (SMTP) ---
-    # After each batch run, a summary of every WO outcome is emailed to the team so they can spot-check
-    # and fix in Synergix. Leave SMTP_HOST blank to skip the email (the report still prints + logs).
+    # --- Batch report ---
+    # After each batch run, a summary of every WO outcome is sent so the team can spot-check and fix
+    # in Synergix. Channel: "telegram" (default), "email", or "both". The report always prints + logs.
+    REPORT_CHANNEL: str = "telegram"
+
+    # --- Batch report email (SMTP; used when REPORT_CHANNEL includes email) ---
     SMTP_HOST: str = ""                 # e.g. "smtp.gmail.com" / "smtp.office365.com"
     SMTP_PORT: int = 587               # 587 = STARTTLS (typical); 465 = SSL
     SMTP_USERNAME: str = ""            # login for the sending mailbox (often the full address)
@@ -198,6 +201,7 @@ IMAP_FROM_FILTER = settings.IMAP_FROM_FILTER
 IMAP_SUBJECT_FILTER = settings.IMAP_SUBJECT_FILTER
 IMAP_MARK_SEEN = settings.IMAP_MARK_SEEN
 
+REPORT_CHANNEL = settings.REPORT_CHANNEL
 SMTP_HOST = settings.SMTP_HOST
 SMTP_PORT = settings.SMTP_PORT
 SMTP_USERNAME = settings.SMTP_USERNAME
