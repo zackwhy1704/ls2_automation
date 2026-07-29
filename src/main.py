@@ -306,7 +306,7 @@ async def run_batch(source: str | None, *, poll: bool = False) -> None:
                     logger.exception("Failed to download WO %s — skipping", wo_id)
         result = await run_batch_from_pdfs(pdfs) if pdfs else BatchResult()
 
-    report_mod.send_report(result)
+    await report_mod.send_report(result)
     logger.info("Batch complete: %d WO(s) processed", len(result.outcomes))
 
 
