@@ -269,21 +269,69 @@ async def main(
         logger.info("Stopped.")
 
 
+async def run_batch(source: str | None, *, poll: bool = False) -> None:
+    """Telegram-free batch pipeline (the recommended path): intake -> auto-submit -> email report.
+
+    source: an emails file/dir to ingest, or None to scrape TCMS. `poll` pulls the IMAP mailbox first.
+    Every valid, non-duplicate WO is auto-submitted (gated by DRY_RUN); the outcome of every WO is
+    emailed as a batch report for the team to spot-check in Synergix.
+    """
+    from src.batch import run_batch_from_emails, run_batch_from_pdfs, BatchResult
+    from src import report as report_mod
+    from src.tcms_scraper import TCMSScraper
+
+    settings.configure_logging()
+    logger.info("Batch pipeline — %s", settings.summary())
+    await db.init_db()
+
+    if poll and not source:
+        from src import mail_poller
+        if mail_poller.imap_configured():
+            await asyncio.to_thread(mail_poller.poll_once)
+        source = str(settings.INCOMING_EMAIL_DIR)
+
+    if source:
+        logger.info("Batch: ingesting WOs from %s", source)
+        result = await run_batch_from_emails(source)
+    else:
+        # TCMS scrape: download the un-invoiced WO PDFs, then process them.
+        logger.info("Batch: scraping un-invoiced WOs from TCMS")
+        pdfs: list[str] = []
+        async with TCMSScraper() as scraper:
+            await scraper.login()
+            for wo_id in await scraper.list_uninvoiced():
+                try:
+                    pdfs.append(await scraper.download_pdf(wo_id))
+                except Exception:
+                    logger.exception("Failed to download WO %s — skipping", wo_id)
+        result = await run_batch_from_pdfs(pdfs) if pdfs else BatchResult()
+
+    report_mod.send_report(result)
+    logger.info("Batch complete: %d WO(s) processed", len(result.outcomes))
+
+
 if __name__ == "__main__":
     # Usage:
-    #   python -m src.main                              # TCMS scrape flow
-    #   python -m src.main --poll                       # pull emails from the IMAP mailbox, then ingest
-    #   python -m src.main --emails path/to/dir         # email flow (dir of .msg/.eml or one file)
-    #   python -m src.main --emails DIR --no-telegram   # console approval gate (no bot token needed)
-    #   (--no-telegram and --poll can be combined with the others)
+    #   python -m src.main --batch                       # RECOMMENDED: TCMS scrape -> auto-submit -> email report
+    #   python -m src.main --batch --poll                # pull IMAP emails, then batch-process
+    #   python -m src.main --batch --emails path/to/dir  # batch-process a dir/file of .msg/.eml/.pdf
+    #   --- legacy Telegram-approval flows: ---
+    #   python -m src.main                               # TCMS scrape -> Telegram approval
+    #   python -m src.main --emails path/to/dir          # email flow -> Telegram approval
+    #   python -m src.main --emails DIR --no-telegram    # console approval gate
     argv = sys.argv[1:]
+    _batch = "--batch" in argv
     _no_tg = "--no-telegram" in argv
     _poll = "--poll" in argv
-    argv = [a for a in argv if a not in ("--no-telegram", "--poll")]
+    argv = [a for a in argv if a not in ("--no-telegram", "--poll", "--batch")]
 
     _eml: str | None = None
     if len(argv) >= 2 and argv[0] == "--emails":
         _eml = argv[1]
     elif len(argv) == 1 and argv[0].endswith((".eml", ".msg")):
         _eml = argv[0]
-    asyncio.run(main(_eml, no_telegram=_no_tg, poll=_poll))
+
+    if _batch:
+        asyncio.run(run_batch(_eml, poll=_poll))
+    else:
+        asyncio.run(main(_eml, no_telegram=_no_tg, poll=_poll))

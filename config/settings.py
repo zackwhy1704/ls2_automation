@@ -64,6 +64,17 @@ class Settings(BaseSettings):
     # If true, mark fetched messages \Seen so they aren't pulled again. If false, dedup is by Message-ID.
     IMAP_MARK_SEEN: bool = True
 
+    # --- Batch report email (SMTP) ---
+    # After each batch run, a summary of every WO outcome is emailed to the team so they can spot-check
+    # and fix in Synergix. Leave SMTP_HOST blank to skip the email (the report still prints + logs).
+    SMTP_HOST: str = ""                 # e.g. "smtp.gmail.com" / "smtp.office365.com"
+    SMTP_PORT: int = 587               # 587 = STARTTLS (typical); 465 = SSL
+    SMTP_USERNAME: str = ""            # login for the sending mailbox (often the full address)
+    SMTP_PASSWORD: str = ""            # app password for the sending mailbox
+    SMTP_USE_TLS: bool = True          # STARTTLS on port 587
+    REPORT_FROM: str = ""             # From address; defaults to SMTP_USERNAME if blank
+    REPORT_TO: str = ""               # comma-separated recipient(s) for the batch report
+
     # --- JBTC TCMS portal ---
     TCMS_BASE_URL: str = ""
     TCMS_USERNAME: str = ""
@@ -186,6 +197,14 @@ IMAP_MAILBOX = settings.IMAP_MAILBOX
 IMAP_FROM_FILTER = settings.IMAP_FROM_FILTER
 IMAP_SUBJECT_FILTER = settings.IMAP_SUBJECT_FILTER
 IMAP_MARK_SEEN = settings.IMAP_MARK_SEEN
+
+SMTP_HOST = settings.SMTP_HOST
+SMTP_PORT = settings.SMTP_PORT
+SMTP_USERNAME = settings.SMTP_USERNAME
+SMTP_PASSWORD = settings.SMTP_PASSWORD
+SMTP_USE_TLS = settings.SMTP_USE_TLS
+REPORT_FROM = settings.REPORT_FROM
+REPORT_TO = settings.REPORT_TO
 
 TCMS_BASE_URL = settings.TCMS_BASE_URL
 TCMS_USERNAME = settings.TCMS_USERNAME

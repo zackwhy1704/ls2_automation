@@ -255,12 +255,17 @@ class SynergixDriver:
         try:
             await self.login()
             await self._stage_b_create_quotation(payload)
-            # Scope: Stage B only. Schedule Board (C) and Fulfil (D) stay manual for the human approver.
-            # The draft is filled and left un-submitted for a human to review + Submit.
+            quo_id = await self._submit_quotation(payload)
+            # Schedule Board (C) and Fulfil (D) remain manual — done by the team in Synergix.
+            if settings.DRY_RUN:
+                return WriteResult(
+                    WOStatus.PARTIAL,
+                    f"DRY_RUN: quotation draft {quo_id or '(id unread)'} created + filled, NOT submitted.",
+                )
             return WriteResult(
-                WOStatus.PARTIAL,
-                "Stage B draft quotation created and filled — NOT submitted. "
-                "Human to review, submit, then do schedule board + fulfil.",
+                WOStatus.PROCESSED,
+                f"Quotation {quo_id or '(id unread)'} created + submitted. "
+                "Schedule board + fulfil still manual.",
             )
         except S.MissingSelectorError as exc:
             logger.error("MISSING SELECTOR: %s — fill it in config/selectors.py", exc)
@@ -346,11 +351,43 @@ class SynergixDriver:
 
         # Line item: unit price + remarks live in the Details grid. Set them if present.
         await self._fill_line_item(payload)
+        logger.info("Stage B: draft filled for %s", payload.wo_po_number)
 
-        # Preview so a human can eyeball the result; NEVER auto-submit (Stage B leaves it for review).
-        _dry_guard(f"submit quotation for {payload.wo_po_number} (Stage B never submits)")
-        logger.info("Stage B complete for %s — draft left un-submitted for human review",
-                    payload.wo_po_number)
+    async def _submit_quotation(self, payload: WOPayload) -> str | None:
+        """Submit the filled draft (DRY_RUN-gated). Returns the quotation ID if it can be read.
+
+        In DRY_RUN the Submit click is skipped and logged. Otherwise it clicks Submit and confirms any
+        follow-up dialog. The quotation ID (QUO...) is read from the form title bar either way.
+        """
+        assert self.page is not None
+        page = self.page
+        quo_id = await self._current_quotation_id()
+
+        if _dry_guard(f"submit quotation for {payload.wo_po_number} (draft {quo_id})"):
+            return quo_id  # DRY_RUN: left as a draft
+
+        await page.locator("button:has(span.fa-vote-yea)").first.click()
+        await page.wait_for_timeout(3000)
+        # A confirm dialog may appear (Yes/OK) — click it if present.
+        for label in ("Yes", "OK", "Confirm"):
+            btn = page.get_by_role("button", name=label)
+            if await btn.count() and await btn.first.is_visible():
+                await btn.first.click()
+                break
+        await page.wait_for_timeout(8000)
+        logger.info("Submitted quotation %s for %s", quo_id, payload.wo_po_number)
+        return quo_id
+
+    async def _current_quotation_id(self) -> str | None:
+        """Read the QUO id from the form title bar (e.g. 'Service Quotation - LS2 [QUO0006225]')."""
+        assert self.page is not None
+        try:
+            text = await self.page.locator("text=/QUO[0-9]+/").first.inner_text()
+            import re
+            m = re.search(r"QUO\d+", text)
+            return m.group(0) if m else None
+        except Exception:
+            return None
 
     async def _fill_line_item(self, payload: WOPayload) -> None:
         """Set the line Unit Price and Remarks in the Details grid (best-effort, logged if absent)."""
