@@ -269,19 +269,19 @@ async def main(
         logger.info("Stopped.")
 
 
-async def run_batch(source: str | None, *, poll: bool = False) -> None:
-    """Telegram-free batch pipeline (the recommended path): intake -> auto-submit -> email report.
+async def run_batch(source: str | None, *, poll: bool = False, limit: int | None = None) -> None:
+    """Telegram-free batch pipeline (the recommended path): intake -> auto-submit -> report.
 
     source: an emails file/dir to ingest, or None to scrape TCMS. `poll` pulls the IMAP mailbox first.
-    Every valid, non-duplicate WO is auto-submitted (gated by DRY_RUN); the outcome of every WO is
-    emailed as a batch report for the team to spot-check in Synergix.
+    `limit` caps how many WOs are handled (TCMS path) for sampling. Every valid, non-duplicate WO is
+    auto-submitted (gated by DRY_RUN); the outcome of every WO is reported (Telegram/email) for the
+    team to spot-check in Synergix.
     """
-    from src.batch import run_batch_from_emails, run_batch_from_pdfs, BatchResult
+    from src.batch import run_batch_from_emails, run_batch_from_tcms
     from src import report as report_mod
-    from src.tcms_scraper import TCMSScraper
 
     settings.configure_logging()
-    logger.info("Batch pipeline — %s", settings.summary())
+    logger.info("Batch pipeline — %s%s", settings.summary(), f" (limit={limit})" if limit else "")
     await db.init_db()
 
     if poll and not source:
@@ -294,17 +294,8 @@ async def run_batch(source: str | None, *, poll: bool = False) -> None:
         logger.info("Batch: ingesting WOs from %s", source)
         result = await run_batch_from_emails(source)
     else:
-        # TCMS scrape: download the un-invoiced WO PDFs, then process them.
-        logger.info("Batch: scraping un-invoiced WOs from TCMS")
-        pdfs: list[str] = []
-        async with TCMSScraper() as scraper:
-            await scraper.login()
-            for wo_id in await scraper.list_uninvoiced():
-                try:
-                    pdfs.append(await scraper.download_pdf(wo_id))
-                except Exception:
-                    logger.exception("Failed to download WO %s — skipping", wo_id)
-        result = await run_batch_from_pdfs(pdfs) if pdfs else BatchResult()
+        logger.info("Batch: scraping + processing un-invoiced WOs from TCMS (streaming)")
+        result = await run_batch_from_tcms(limit=limit)
 
     await report_mod.send_report(result)
     logger.info("Batch complete: %d WO(s) processed", len(result.outcomes))
@@ -312,7 +303,8 @@ async def run_batch(source: str | None, *, poll: bool = False) -> None:
 
 if __name__ == "__main__":
     # Usage:
-    #   python -m src.main --batch                       # RECOMMENDED: TCMS scrape -> auto-submit -> email report
+    #   python -m src.main --batch                       # RECOMMENDED: TCMS scrape -> auto-submit -> report
+    #   python -m src.main --batch --limit 20            # cap to the first 20 WOs (sampling)
     #   python -m src.main --batch --poll                # pull IMAP emails, then batch-process
     #   python -m src.main --batch --emails path/to/dir  # batch-process a dir/file of .msg/.eml/.pdf
     #   --- legacy Telegram-approval flows: ---
@@ -323,6 +315,13 @@ if __name__ == "__main__":
     _batch = "--batch" in argv
     _no_tg = "--no-telegram" in argv
     _poll = "--poll" in argv
+
+    _limit: int | None = None
+    if "--limit" in argv:
+        i = argv.index("--limit")
+        if i + 1 < len(argv):
+            _limit = int(argv[i + 1])
+            del argv[i:i + 2]
     argv = [a for a in argv if a not in ("--no-telegram", "--poll", "--batch")]
 
     _eml: str | None = None
@@ -332,6 +331,6 @@ if __name__ == "__main__":
         _eml = argv[0]
 
     if _batch:
-        asyncio.run(run_batch(_eml, poll=_poll))
+        asyncio.run(run_batch(_eml, poll=_poll, limit=_limit))
     else:
         asyncio.run(main(_eml, no_telegram=_no_tg, poll=_poll))

@@ -110,6 +110,67 @@ async def run_batch_from_pdfs(pdf_paths: list[str]) -> BatchResult:
     return result
 
 
+async def run_batch_from_tcms(limit: int | None = None) -> BatchResult:
+    """Scrape TCMS and process each un-invoiced WO in a STREAMING pipeline.
+
+    For each WO id from the un-invoiced list we: (1) dedup on the WO-PO FIRST — a DUPLICATE is skipped
+    without the expensive PDF download; (2) otherwise download the PDF, extract, and process. Results
+    stream in one WO at a time, so a mid-run failure still leaves everything-so-far done and reported.
+    `limit` caps how many WOs are handled (for sampling); None = all.
+    """
+    from src.tcms_scraper import TCMSScraper
+
+    result = BatchResult()
+    synergix = SynergixDriver()
+    try:
+        await synergix.start()
+        async with TCMSScraper() as scraper:
+            await scraper.login()
+            wo_ids = await scraper.list_uninvoiced()
+            if limit is not None:
+                wo_ids = wo_ids[:limit]
+                logger.info("Batch capped to first %d of the un-invoiced WOs", len(wo_ids))
+
+            for wo_id in wo_ids:
+                try:
+                    # Cheap dedup on the WO-PO before downloading anything.
+                    probe = WOPayload(
+                        wo_po_number=wo_id, job_sheet_number="0", service_location="-",
+                        nature_of_work="-", job_date=_today(), prepared_by="-", gl_number="-",
+                        quantity=1.0, unit_price=1.0, source_path="-",
+                    )
+                    dedup = await synergix.check_duplicate(probe)
+                    if dedup is DedupResult.DUPLICATE:
+                        logger.info("WO %s DUPLICATE (pre-download) — skipping", wo_id)
+                        result.outcomes.append(
+                            WOOutcome(wo_id, WOStatus.DUPLICATE, "already invoiced in Synergix"))
+                        continue
+
+                    # Not a confirmed duplicate: download + extract + full process (which re-dedups).
+                    path = await scraper.download_pdf(wo_id)
+                    try:
+                        payload = extract_from_pdf(path)
+                        await db.upsert_scraped(payload.wo_po_number, payload.source_path)
+                    except ExtractionError as exc:
+                        logger.warning("Extraction failed for %s: %s", wo_id, exc)
+                        result.outcomes.append(
+                            WOOutcome(wo_id, WOStatus.INVALID, f"extraction failed: {exc}", source=path))
+                        continue
+                    result.outcomes.append(await process_payload(payload, synergix))
+                except Exception as exc:
+                    logger.exception("Failed handling WO %s — recording FAILED, continuing", wo_id)
+                    result.outcomes.append(WOOutcome(wo_id, WOStatus.FAILED, str(exc)))
+    finally:
+        await synergix.close()
+    return result
+
+
+def _today():
+    """Today's date (module-level so tests can monkeypatch if needed)."""
+    from datetime import date
+    return date.today()
+
+
 async def run_batch_from_emails(eml_source: str) -> BatchResult:
     """Ingest .msg/.eml/.pdf (file or dir) then process each WO unit end to end."""
     items = ingest_dir(eml_source) if Path(eml_source).is_dir() else ingest_file(eml_source)
