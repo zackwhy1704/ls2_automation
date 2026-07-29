@@ -79,12 +79,16 @@ SYNERGIX_LOGIN_BUTTON = "#loginForm\\:loginButton"
 SYNERGIX_LOGIN_SUCCESS_MARKER = "text=Operations"   # main menu item, present only after login
 SYNERGIX_HOME_MARKER = "text=Operations"            # home/known-state marker
 
-# --- Duplicate check (Service Order Performance or equivalent search) ---
-SYNERGIX_DEDUP_NAV = TODO_SELECTOR        # TODO(human): nav to the search screen used to check if a WO already exists
-SYNERGIX_DEDUP_SEARCH_INPUT = TODO_SELECTOR  # TODO(human): search field where WO-PO number is entered
-SYNERGIX_DEDUP_SEARCH_SUBMIT = TODO_SELECTOR # TODO(human): search/go button
-SYNERGIX_DEDUP_RESULT_ROW = TODO_SELECTOR    # TODO(human): a result row indicating a MATCH exists (presence => duplicate)
-SYNERGIX_DEDUP_NO_RESULT_MARKER = TODO_SELECTOR  # TODO(human): the "no records found" indicator (presence => NOT duplicate)
+# --- Duplicate check — DONE (implemented directly in SynergixDriver.check_duplicate) ---
+# The dedup runs in Service Quotation - LS2: filter the Enquiry/Subject column by WO-PO, then read the
+# grid for a WO match vs a "No records found" row. Because the JSF ids are auto-generated, the driver
+# locates the column by its header text + the stable `input.ui-column-filter` class rather than by id,
+# so these id-based constants are unused. Left for reference.
+SYNERGIX_DEDUP_NAV = TODO_SELECTOR        # unused — nav is "General Service" -> "Service Quotation - LS2" by text
+SYNERGIX_DEDUP_SEARCH_INPUT = TODO_SELECTOR  # unused — Enquiry/Subject column filter (input.ui-column-filter)
+SYNERGIX_DEDUP_SEARCH_SUBMIT = TODO_SELECTOR # unused — filter applies on Enter
+SYNERGIX_DEDUP_RESULT_ROW = TODO_SELECTOR    # unused — read grid body for the WO-PO text
+SYNERGIX_DEDUP_NO_RESULT_MARKER = TODO_SELECTOR  # unused — "No records found." in the grid body
 
 # --- Stage B: Create quotation (Copy From template) ---
 SYNERGIX_NEW_QUOTATION_NAV = TODO_SELECTOR   # TODO(human): nav/button to start a new quotation

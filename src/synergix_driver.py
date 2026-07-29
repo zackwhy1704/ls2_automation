@@ -153,6 +153,23 @@ class SynergixDriver:
             return payload.job_sheet_number
         return payload.wo_po_number
 
+    async def _open_service_quotation_list(self) -> None:
+        """Navigate (logged in) to General Service -> Service Quotation - LS2 list view.
+
+        Re-navigates from the base URL each time so the grid is a fresh, unfiltered instance — calling
+        this twice in one session without the reset can leave a stale/filtered datatable.
+        """
+        await self.login()
+        assert self.page is not None
+        await self.page.goto(settings.SYNERGIX_BASE_URL, wait_until="domcontentloaded")
+        await self.page.wait_for_timeout(4000)
+        await self.page.get_by_text("General Service", exact=False).first.click()
+        await self.page.wait_for_timeout(3000)
+        await self.page.get_by_text("Service Quotation - LS2", exact=False).first.click()
+        # The JSF datatable renders lazily; wait for the Enquiry/Subject column to exist.
+        await self.page.wait_for_selector("th:has-text('Enquiry/Subject')", timeout=30000)
+        await self.page.wait_for_timeout(4000)
+
     async def check_duplicate(self, payload: WOPayload) -> DedupResult:
         """Is this WO already invoiced in Synergix? Returns a three-state, fail-safe result.
 
@@ -176,33 +193,42 @@ class SynergixDriver:
             return DedupResult.UNCERTAIN
 
         try:
-            await self.login()
+            await self._open_service_quotation_list()
             assert self.page is not None
-            await self.page.click(S.require("SYNERGIX_DEDUP_NAV", S.SYNERGIX_DEDUP_NAV))
-            await self.page.wait_for_load_state("networkidle")
-            await self.page.fill(
-                S.require("SYNERGIX_DEDUP_SEARCH_INPUT", S.SYNERGIX_DEDUP_SEARCH_INPUT), search_value
-            )
-            await self.page.click(
-                S.require("SYNERGIX_DEDUP_SEARCH_SUBMIT", S.SYNERGIX_DEDUP_SEARCH_SUBMIT)
-            )
-            await self.page.wait_for_load_state("networkidle")
 
-            match_count = await self.page.locator(
-                S.require("SYNERGIX_DEDUP_RESULT_ROW", S.SYNERGIX_DEDUP_RESULT_ROW)
-            ).count()
-            no_result = await self.page.locator(
-                S.require("SYNERGIX_DEDUP_NO_RESULT_MARKER", S.SYNERGIX_DEDUP_NO_RESULT_MARKER)
-            ).count()
+            # Filter the Enquiry/Subject column by the WO-PO. This JSF grid's ids are auto-generated,
+            # so target the column by its header text, then the stable filter class within it. The
+            # PrimeFaces column filter applies on Enter.
+            header = self.page.locator("th", has_text="Enquiry/Subject").first
+            filter_input = header.locator("input.ui-column-filter").first
+            await filter_input.click()
+            await filter_input.fill("")
+            await filter_input.press("Enter")            # clear any prior filter first
+            await self.page.wait_for_timeout(2000)
+            await filter_input.fill(search_value)
+            await filter_input.press("Enter")
+            await self.page.wait_for_timeout(6000)        # PrimeFaces ajax re-filter + settle
 
-            if match_count > 0:
-                logger.info("Dedup %s: DUPLICATE (%d match(es) in Synergix)", search_value, match_count)
+            # Read the filtered grid body: does it contain the WO-PO, or the "No records found" row?
+            grid = await self.page.evaluate(
+                "(wo) => { const t = document.querySelector('[id$=\"serviceQuotationTable_data\"]');"
+                " const txt = t ? t.innerText : '';"
+                " return { present: !!t, empty: /no records found|no data/i.test(txt),"
+                " match: txt.includes(wo) }; }",
+                search_value,
+            )
+
+            if not grid["present"]:
+                logger.warning("Dedup %s: UNCERTAIN (quotation grid not found)", search_value)
+                return DedupResult.UNCERTAIN
+            if grid["match"]:
+                logger.info("Dedup %s: DUPLICATE (existing quotation found)", search_value)
                 return DedupResult.DUPLICATE
-            if no_result > 0:
-                logger.info("Dedup %s: NOT_DUPLICATE (Synergix reports no records)", search_value)
+            if grid["empty"]:
+                logger.info("Dedup %s: NOT_DUPLICATE (Synergix reports 'No records found')", search_value)
                 return DedupResult.NOT_DUPLICATE
-            # Neither a match nor an explicit "no records" marker — can't be sure. Fail safe.
-            logger.warning("Dedup %s: UNCERTAIN (no result rows and no no-result marker)", search_value)
+            # Filtered but neither a WO match nor the explicit empty marker — can't be sure. Fail safe.
+            logger.warning("Dedup %s: UNCERTAIN (no WO match and no 'no records' marker)", search_value)
             return DedupResult.UNCERTAIN
         except Exception:
             logger.exception("Dedup check for %s errored — returning UNCERTAIN (fail-safe)", search_value)

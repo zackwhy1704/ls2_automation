@@ -78,9 +78,11 @@ class Settings(BaseSettings):
     # list is maintained by hand and can be stale, so this check is what actually prevents double
     # billing. "wo_po" | "job_sheet" — confirm against the real Synergix records.
     SYNERGIX_DEDUP_KEY: str = "wo_po"
-    # Synergix sits behind Cloudflare bot protection that blocks headless browsers. Default to a
-    # visible (non-headless) browser for Synergix specifically, independent of the global HEADLESS.
-    SYNERGIX_HEADLESS: bool = False
+    # Synergix is fronted by Cloudflare that GEO-blocks overseas IPs (client policy) and rate-blocks
+    # rapid bursts — NOT headless detection. From a Singapore IP, headless works fine, so default true.
+    # (A persistent context + realistic UA are still used to minimise repeated hits.) Set false only if
+    # a future protection change starts challenging headless specifically.
+    SYNERGIX_HEADLESS: bool = True
 
     # --- Behaviour ---
     DRY_RUN: bool = True          # defaults to True — never default to live
