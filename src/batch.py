@@ -118,6 +118,7 @@ async def run_batch_from_tcms(limit: int | None = None) -> BatchResult:
     stream in one WO at a time, so a mid-run failure still leaves everything-so-far done and reported.
     `limit` caps how many WOs are handled (for sampling); None = all.
     """
+    import asyncio
     from src.tcms_scraper import TCMSScraper
 
     result = BatchResult()
@@ -131,38 +132,69 @@ async def run_batch_from_tcms(limit: int | None = None) -> BatchResult:
                 wo_ids = wo_ids[:limit]
                 logger.info("Batch capped to first %d of the un-invoiced WOs", len(wo_ids))
 
-            for wo_id in wo_ids:
-                try:
-                    # Cheap dedup on the WO-PO before downloading anything.
-                    probe = WOPayload(
-                        wo_po_number=wo_id, job_sheet_number="0", service_location="-",
-                        nature_of_work="-", job_date=_today(), prepared_by="-", gl_number="-",
-                        quantity=1.0, unit_price=1.0, source_path="-",
-                    )
-                    dedup = await synergix.check_duplicate(probe)
-                    if dedup is DedupResult.DUPLICATE:
-                        logger.info("WO %s DUPLICATE (pre-download) — skipping", wo_id)
-                        result.outcomes.append(
-                            WOOutcome(wo_id, WOStatus.DUPLICATE, "already invoiced in Synergix"))
-                        continue
-
-                    # Not a confirmed duplicate: download + extract + full process (which re-dedups).
-                    path = await scraper.download_pdf(wo_id)
+            for i, wo_id in enumerate(wo_ids):
+                # Guardrail: proactively start a fresh Synergix session every N WOs so we stay under
+                # the server session timeout that otherwise stalls the batch mid-run.
+                every = settings.SYNERGIX_RELOGIN_EVERY
+                if every and i > 0 and i % every == 0:
                     try:
-                        payload = extract_from_pdf(path)
-                        await db.upsert_scraped(payload.wo_po_number, payload.source_path)
-                    except ExtractionError as exc:
-                        logger.warning("Extraction failed for %s: %s", wo_id, exc)
-                        result.outcomes.append(
-                            WOOutcome(wo_id, WOStatus.INVALID, f"extraction failed: {exc}", source=path))
-                        continue
-                    result.outcomes.append(await process_payload(payload, synergix))
+                        await synergix.relogin()
+                    except Exception:
+                        logger.exception("Proactive re-login failed before WO %s — continuing", wo_id)
+
+                # Guardrail: cap each WO's wall-clock so a wedged/expired session can never hang the
+                # whole batch (previously a single WO stalled ~90 min on stacked click timeouts).
+                try:
+                    outcome = await asyncio.wait_for(
+                        self_process_one(wo_id, scraper, synergix, result),
+                        timeout=settings.SYNERGIX_WO_TIMEOUT_S,
+                    )
+                    if outcome is not None:
+                        result.outcomes.append(outcome)
+                except asyncio.TimeoutError:
+                    logger.error("WO %s exceeded %ss — marking FAILED, re-logging in, continuing",
+                                 wo_id, settings.SYNERGIX_WO_TIMEOUT_S)
+                    result.outcomes.append(
+                        WOOutcome(wo_id, WOStatus.FAILED, f"timed out after {settings.SYNERGIX_WO_TIMEOUT_S}s"))
+                    try:
+                        await synergix.relogin()  # a timeout usually means a wedged session; reset it
+                    except Exception:
+                        logger.exception("Re-login after timeout failed — continuing")
                 except Exception as exc:
                     logger.exception("Failed handling WO %s — recording FAILED, continuing", wo_id)
                     result.outcomes.append(WOOutcome(wo_id, WOStatus.FAILED, str(exc)))
     finally:
         await synergix.close()
     return result
+
+
+async def self_process_one(wo_id, scraper, synergix, result) -> WOOutcome | None:
+    """Handle one TCMS WO: dedup-before-download, else download+extract+process. Returns its outcome.
+
+    Returns None only for the extraction-failed case (which appends its own outcome). Raised
+    exceptions / timeouts are handled by the caller.
+    """
+    # Cheap dedup on the WO-PO before downloading anything.
+    probe = WOPayload(
+        wo_po_number=wo_id, job_sheet_number="0", service_location="-",
+        nature_of_work="-", job_date=_today(), prepared_by="-", gl_number="-",
+        quantity=1.0, unit_price=1.0, source_path="-",
+    )
+    dedup = await synergix.check_duplicate(probe)
+    if dedup is DedupResult.DUPLICATE:
+        logger.info("WO %s DUPLICATE (pre-download) — skipping", wo_id)
+        return WOOutcome(wo_id, WOStatus.DUPLICATE, "already invoiced in Synergix")
+
+    path = await scraper.download_pdf(wo_id)
+    try:
+        payload = extract_from_pdf(path)
+        await db.upsert_scraped(payload.wo_po_number, payload.source_path)
+    except ExtractionError as exc:
+        logger.warning("Extraction failed for %s: %s", wo_id, exc)
+        result.outcomes.append(
+            WOOutcome(wo_id, WOStatus.INVALID, f"extraction failed: {exc}", source=path))
+        return None
+    return await process_payload(payload, synergix)
 
 
 def _today():

@@ -149,6 +149,40 @@ class SynergixDriver:
         self._logged_in = True
         logger.info("Synergix login successful")
 
+    # ------------------------------------------------------------------ session guardrails
+    async def _is_session_expired(self) -> bool:
+        """True if the page shows Synergix's 'your page has expired' screen.
+
+        Synergix has a session timeout; after it fires, every action lands on this screen (with a
+        'Reload Page' button and no app chrome), which otherwise causes 30s-per-click timeouts that
+        stack for many minutes. Detecting it lets us re-login immediately instead.
+        """
+        if not self.page:
+            return False
+        try:
+            body = (await self.page.inner_text("body", timeout=3000)) or ""
+        except Exception:
+            return False
+        return "page has expired" in body.lower() or "idle for too long" in body.lower()
+
+    async def _ensure_session(self) -> None:
+        """Fail-fast session check + auto-recovery. Call at the start of each Synergix operation.
+
+        If the session has expired, drop the logged-in flag and re-login (fresh session), so a
+        mid-batch expiry self-heals instead of stalling. Cheap when the session is healthy.
+        """
+        assert self.page is not None
+        if await self._is_session_expired():
+            logger.warning("Synergix session expired — re-logging in")
+            self._logged_in = False
+            await self.login()
+
+    async def relogin(self) -> None:
+        """Force a fresh Synergix session (used proactively between WOs to stay under the timeout)."""
+        logger.info("Synergix proactive re-login")
+        self._logged_in = False
+        await self.login()
+
     # ------------------------------------------------------------------ duplicate check
     def _dedup_search_value(self, payload: WOPayload) -> str:
         """The WO field to search Synergix on, per SYNERGIX_DEDUP_KEY config."""
@@ -160,18 +194,27 @@ class SynergixDriver:
         """Navigate (logged in) to General Service -> Service Quotation - LS2 list view.
 
         Re-navigates from the base URL each time so the grid is a fresh, unfiltered instance — calling
-        this twice in one session without the reset can leave a stale/filtered datatable.
+        this twice in one session without the reset can leave a stale/filtered datatable. If the
+        session has expired, re-login and retry once (self-healing).
         """
         await self.login()
         assert self.page is not None
-        await self.page.goto(settings.SYNERGIX_BASE_URL, wait_until="domcontentloaded")
-        await self.page.wait_for_timeout(4000)
-        await self.page.get_by_text("General Service", exact=False).first.click()
-        await self.page.wait_for_timeout(3000)
-        await self.page.get_by_text("Service Quotation - LS2", exact=False).first.click()
-        # The JSF datatable renders lazily; wait for the Enquiry/Subject column to exist.
-        await self.page.wait_for_selector("th:has-text('Enquiry/Subject')", timeout=30000)
-        await self.page.wait_for_timeout(4000)
+        for attempt in (1, 2):
+            await self.page.goto(settings.SYNERGIX_BASE_URL, wait_until="domcontentloaded")
+            await self.page.wait_for_timeout(4000)
+            if await self._is_session_expired():
+                logger.warning("Session expired on nav (attempt %d) — re-logging in", attempt)
+                self._logged_in = False
+                await self.login()
+                continue
+            await self.page.get_by_text("General Service", exact=False).first.click()
+            await self.page.wait_for_timeout(3000)
+            await self.page.get_by_text("Service Quotation - LS2", exact=False).first.click()
+            # The JSF datatable renders lazily; wait for the Enquiry/Subject column to exist.
+            await self.page.wait_for_selector("th:has-text('Enquiry/Subject')", timeout=30000)
+            await self.page.wait_for_timeout(4000)
+            return
+        raise RuntimeError("could not open Service Quotation list after re-login")
 
     async def check_duplicate(self, payload: WOPayload) -> DedupResult:
         """Is this WO already invoiced in Synergix? Returns a three-state, fail-safe result.

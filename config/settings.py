@@ -97,6 +97,11 @@ class Settings(BaseSettings):
     # (A persistent context + realistic UA are still used to minimise repeated hits.) Set false only if
     # a future protection change starts challenging headless specifically.
     SYNERGIX_HEADLESS: bool = True
+    # Session guardrails for long batches (Synergix has a session timeout that stalls mid-run):
+    # proactively start a fresh Synergix session every N WOs, and cap each WO's wall-clock so a
+    # wedged session can never hang the batch. 0 disables proactive re-login.
+    SYNERGIX_RELOGIN_EVERY: int = 5
+    SYNERGIX_WO_TIMEOUT_S: int = 300   # hard ceiling per WO (seconds)
 
     # --- Behaviour ---
     DRY_RUN: bool = True          # defaults to True — never default to live
@@ -220,6 +225,8 @@ SYNERGIX_PASSWORD = settings.SYNERGIX_PASSWORD
 SYNERGIX_TEMPLATE_QUO_ID = settings.SYNERGIX_TEMPLATE_QUO_ID
 SYNERGIX_DEDUP_KEY = settings.SYNERGIX_DEDUP_KEY
 SYNERGIX_HEADLESS = settings.SYNERGIX_HEADLESS
+SYNERGIX_RELOGIN_EVERY = settings.SYNERGIX_RELOGIN_EVERY
+SYNERGIX_WO_TIMEOUT_S = settings.SYNERGIX_WO_TIMEOUT_S
 
 DRY_RUN = settings.DRY_RUN
 DEDUP_STUB_ASSUME_SAFE = settings.DEDUP_STUB_ASSUME_SAFE
