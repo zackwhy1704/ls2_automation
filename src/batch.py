@@ -194,6 +194,16 @@ async def self_process_one(wo_id, scraper, synergix, result) -> WOOutcome | None
         result.outcomes.append(
             WOOutcome(wo_id, WOStatus.INVALID, f"extraction failed: {exc}", source=path))
         return None
+
+    # CRITICAL content check: the downloaded PDF's extracted WO-PO MUST equal the WO we asked TCMS
+    # for. A mismatch means TCMS served a stale/wrong report — billing the wrong WO. Never draft it.
+    if payload.wo_po_number.strip() != wo_id.strip():
+        msg = (f"downloaded PDF content is for {payload.wo_po_number}, not {wo_id} "
+               "(TCMS served a stale/wrong report) — NOT drafting")
+        logger.error("WO %s: %s", wo_id, msg)
+        await db.set_status(wo_id, WOStatus.FAILED, error=msg)
+        return WOOutcome(wo_id, WOStatus.FAILED, msg, source=path)
+
     return await process_payload(payload, synergix)
 
 

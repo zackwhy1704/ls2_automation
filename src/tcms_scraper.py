@@ -193,6 +193,20 @@ class TCMSScraper:
                 raise RuntimeError(f"WO {wo_po_number} not found in the un-invoiced grid")
             await self.page.wait_for_timeout(8000)
 
+            # CRITICAL: confirm the opened detail actually shows THIS WO before exporting. The SSRS
+            # viewer can otherwise render a stale/previous WO's report, producing a correctly-named
+            # file with the WRONG content (would bill the wrong amounts). Wait for the WO-PO to appear
+            # on the detail; if it never does, fail this WO rather than export stale data.
+            try:
+                await self.page.wait_for_function(
+                    "(wo) => document.body.innerText.includes(wo)",
+                    arg=wo_po_number,
+                    timeout=20000,
+                )
+            except Exception:
+                raise RuntimeError(
+                    f"WO detail for {wo_po_number} did not load (stale/wrong WO shown) — aborting export")
+
             # Preview/Print -> Original preview -> SSRS PDF viewer -> Export (triggers the download).
             await self.page.click(S.require("TCMS_WO_PREVIEW_PRINT", S.TCMS_WO_PREVIEW_PRINT))
             await self.page.wait_for_timeout(3000)
