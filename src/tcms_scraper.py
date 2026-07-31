@@ -129,28 +129,50 @@ class TCMSScraper:
         "return out; }"
     )
 
+    # The FixedDataTable's own scrollbar widget (not the grid/viewport). Keyboard ArrowDown presses
+    # against this focused element are what actually advance the virtualization window — mouse.wheel
+    # and scrollTop manipulation on the grid do NOT (confirmed via a user codegen recording on
+    # 2026-07-31: clicking this element once then repeatedly pressing ArrowDown reached row 252/252,
+    # something ~30 prior scripted-scroll attempts using wheel/scrollTop never achieved).
+    _SCROLLBAR_FACE = ".ScrollbarLayout_main.ScrollbarLayout_mainVertical.public_Scrollbar_main"
+
+    async def _focus_scrollbar(self) -> bool:
+        """Click the WO grid's own vertical scrollbar to focus it for ArrowDown-driven scrolling.
+
+        The page can have more than one `.ScrollbarLayout_main.ScrollbarLayout_mainVertical` element
+        (e.g. a stale/hidden one from another panel) — `.first` isn't reliable. Pick the visible one.
+        """
+        assert self.page is not None
+        candidates = self.page.locator(self._SCROLLBAR_FACE)
+        count = await candidates.count()
+        for i in range(count):
+            candidate = candidates.nth(i)
+            if await candidate.is_visible():
+                await candidate.click(timeout=5000)
+                return True
+        return False
+
     async def list_uninvoiced(self) -> list[str]:
         """Return the WO/PO numbers of all un-invoiced work orders.
 
-        The D365 grid (FixedDataTable) is virtualized: only ~26 rows are in the DOM at a time and the
-        cell inputs aren't directly clickable. We mouse-wheel over the grid and read the WO/PO values
-        via JS after each scroll, accumulating until the whole list (grid aria-rowcount) is seen.
+        The D365 grid (FixedDataTable) is virtualized: only ~26-43 rows are in the DOM at a time.
+        We focus the grid's scrollbar widget and press ArrowDown repeatedly (not mouse.wheel — see
+        `_SCROLLBAR_FACE`), reading the WO/PO values via JS after each press, accumulating until the
+        whole list stops growing.
         """
         assert self.page is not None
         await self._open_uninvoiced_list()
 
         seen: set[str] = set(await self.page.evaluate(self._COLLECT_WO_IDS_JS))
-        rect = await self._wo_grid_rect()
-        if rect:
-            await self.page.mouse.move(rect["x"] + rect["w"] / 2, rect["y"] + rect["h"] / 2)
+        if await self._focus_scrollbar():
             stagnant = 0
-            for _ in range(200):  # generous cap; exits on stagnation
-                await self.page.mouse.wheel(0, 300)
-                await self.page.wait_for_timeout(300)
+            for _ in range(600):  # generous cap (verified reaching 252/252 rows); exits on stagnation
+                await self.page.keyboard.press("ArrowDown")
+                await self.page.wait_for_timeout(150)
                 before = len(seen)
                 seen.update(await self.page.evaluate(self._COLLECT_WO_IDS_JS))
                 stagnant = 0 if len(seen) > before else stagnant + 1
-                if stagnant >= 15:  # ~4.5s of no new rows -> reached the end
+                if stagnant >= 40:  # ~6s of no new rows -> reached the end
                     break
 
         ids = sorted(seen)
@@ -235,14 +257,16 @@ class TCMSScraper:
             await self._back_to_list()
 
     async def _scroll_to_wo(self, wo_po_number: str) -> None:
-        """Reopen the list and wheel-scroll the grid until the given WO/PO id is selectable.
+        """Reopen the list and scroll (via focused-scrollbar ArrowDown) until the given WO/PO id is
+        selectable.
 
         Idempotent starting point: always reopens the list so the grid is at the top, then scrolls
         until the target's accessible textbox (role=textbox, name="WO/PO", description=<value>)
         exists — the SAME check download_pdf uses to select it. Checking via the hidden input's raw
         `.value` (as this used to) is NOT equivalent: that attribute can be present while the
         accessible `description` used for selection lags behind, so download_pdf still finds nothing
-        even though this method reported the row as "rendered".
+        even though this method reported the row as "rendered". Uses ArrowDown on the focused
+        scrollbar widget, not mouse.wheel — see `_SCROLLBAR_FACE` for why.
         """
         assert self.page is not None
         await self._open_uninvoiced_list()
@@ -253,22 +277,20 @@ class TCMSScraper:
 
         if await rendered():
             return
-        rect = await self._wo_grid_rect()
-        if not rect:
+        if not await self._focus_scrollbar():
             return
-        await self.page.mouse.move(rect["x"] + rect["w"] / 2, rect["y"] + rect["h"] / 2)
         stagnant = 0
         prev_seen = 0
         seen: set[str] = set()
-        for _ in range(200):
-            await self.page.mouse.wheel(0, 300)
-            await self.page.wait_for_timeout(300)
+        for _ in range(600):
+            await self.page.keyboard.press("ArrowDown")
+            await self.page.wait_for_timeout(150)
             if await rendered():
                 return
             seen.update(await self.page.evaluate(self._COLLECT_WO_IDS_JS))
             stagnant = 0 if len(seen) > prev_seen else stagnant + 1
             prev_seen = len(seen)
-            if stagnant >= 15:
+            if stagnant >= 40:
                 return
 
     async def _back_to_list(self) -> None:
