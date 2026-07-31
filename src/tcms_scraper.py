@@ -197,9 +197,13 @@ class TCMSScraper:
             if not await selector.count():
                 raise RuntimeError(f"WO {wo_po_number} not found in the un-invoiced list")
             await selector.first.click(timeout=15000)
-            await self.page.wait_for_timeout(2000)
+            # Wait for the selection to actually settle (Preview/Print becoming clickable) rather than
+            # a fixed delay — under sustained batch load the page can take longer than 2s to react.
+            preview_print = S.require("TCMS_WO_PREVIEW_PRINT", S.TCMS_WO_PREVIEW_PRINT)
+            await self.page.wait_for_selector(preview_print, state="visible", timeout=20000)
+            await self.page.wait_for_timeout(1000)
 
-            await self.page.click(S.require("TCMS_WO_PREVIEW_PRINT", S.TCMS_WO_PREVIEW_PRINT))
+            await self.page.click(preview_print, timeout=20000)
             await self.page.wait_for_timeout(2000)
             await self.page.click(S.require("TCMS_WO_ORIGINAL_PREVIEW", S.TCMS_WO_ORIGINAL_PREVIEW))
 
@@ -231,17 +235,21 @@ class TCMSScraper:
             await self._back_to_list()
 
     async def _scroll_to_wo(self, wo_po_number: str) -> None:
-        """Reopen the list and wheel-scroll the grid until the given WO/PO id is rendered.
+        """Reopen the list and wheel-scroll the grid until the given WO/PO id is selectable.
 
         Idempotent starting point: always reopens the list so the grid is at the top, then scrolls
-        until the target id appears in the rendered set (or the grid ends).
+        until the target's accessible textbox (role=textbox, name="WO/PO", description=<value>)
+        exists — the SAME check download_pdf uses to select it. Checking via the hidden input's raw
+        `.value` (as this used to) is NOT equivalent: that attribute can be present while the
+        accessible `description` used for selection lags behind, so download_pdf still finds nothing
+        even though this method reported the row as "rendered".
         """
         assert self.page is not None
         await self._open_uninvoiced_list()
 
         async def rendered() -> bool:
-            ids = await self.page.evaluate(self._COLLECT_WO_IDS_JS)
-            return wo_po_number in ids
+            loc = self.page.get_by_role("textbox", name="WO/PO", description=wo_po_number, exact=True)
+            return await loc.count() > 0
 
         if await rendered():
             return
