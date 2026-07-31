@@ -169,54 +169,58 @@ class TCMSScraper:
         )
 
     async def download_pdf(self, wo_po_number: str) -> str:
-        """Open a WO by its WO/PO number and download its PDF via Preview/Print -> Original preview.
+        """Select a WO by its WO/PO number and download its PDF via Preview/Print -> Copy preview.
 
-        Returns the saved path. Re-navigates to the list afterwards so the next WO starts from a known
-        state. Caller handles per-WO error isolation.
+        Verified flow (2026-07-31, via a user codegen recording — see git history for the full
+        investigation): on the Un-Invoiced WO list, click the WO's `WO/PO` textbox (role=textbox,
+        accessible name "WO/PO", description=<the WO-PO value>) to select it, then Preview/Print ->
+        Copy preview. Copy preview triggers an async "Processing operation" that transitions the
+        CURRENT page in place (its title becomes the WO-PO and an Export button appears) — no
+        navigation needed. Critically, do NOT call page.goto() during this: an early goto() tears
+        down the in-flight async operation and strands the page on the workspace dashboard, which
+        earlier caused this method to silently export a stale/wrong WO's PDF (a billing-critical bug;
+        see the content-verification guard below and in batch.self_process_one).
+
+        Returns the saved path. Clicks "Back" afterwards so the next WO starts from a known state
+        (the list). Caller handles per-WO error isolation.
         """
         assert self.page is not None
         safe_name = wo_po_number.replace("/", "-")
         dest = settings.PDF_DIR / f"{safe_name}.pdf"
         try:
-            # Scroll the WO into the virtualized grid, then open it. The cell inputs aren't directly
-            # clickable (D365 layering), so we open via a JS-dispatched double click on the input.
-            await self._scroll_to_wo(wo_po_number)
-            opened = await self.page.evaluate(
-                "(wo) => { const inp = [...document.querySelectorAll('[role=\"grid\"] input')]"
-                ".find(i => (i.value||'').trim() === wo); if (!inp) return false; "
-                "inp.scrollIntoView({block:'center'}); "
-                "for (const t of ['mousedown','mouseup','click','dblclick']) "
-                "inp.dispatchEvent(new MouseEvent(t, {bubbles:true})); return true; }",
-                wo_po_number,
-            )
-            if not opened:
-                raise RuntimeError(f"WO {wo_po_number} not found in the un-invoiced grid")
-            await self.page.wait_for_timeout(8000)
-
-            # CRITICAL: confirm the opened detail actually shows THIS WO before exporting. The SSRS
-            # viewer can otherwise render a stale/previous WO's report, producing a correctly-named
-            # file with the WRONG content (would bill the wrong amounts). Wait for the WO-PO to appear
-            # on the detail; if it never does, fail this WO rather than export stale data.
-            try:
-                await self.page.wait_for_function(
-                    "(wo) => document.body.innerText.includes(wo)",
-                    arg=wo_po_number,
-                    timeout=20000,
+            selector = self.page.get_by_role("textbox", name="WO/PO", description=wo_po_number, exact=True)
+            if not await selector.count():
+                await self._scroll_to_wo(wo_po_number)
+                selector = self.page.get_by_role(
+                    "textbox", name="WO/PO", description=wo_po_number, exact=True
                 )
-            except Exception:
-                raise RuntimeError(
-                    f"WO detail for {wo_po_number} did not load (stale/wrong WO shown) — aborting export")
+            if not await selector.count():
+                raise RuntimeError(f"WO {wo_po_number} not found in the un-invoiced list")
+            await selector.first.click(timeout=15000)
+            await self.page.wait_for_timeout(2000)
 
-            # Preview/Print -> Original preview -> SSRS PDF viewer -> Export (triggers the download).
             await self.page.click(S.require("TCMS_WO_PREVIEW_PRINT", S.TCMS_WO_PREVIEW_PRINT))
-            await self.page.wait_for_timeout(3000)
+            await self.page.wait_for_timeout(2000)
             await self.page.click(S.require("TCMS_WO_ORIGINAL_PREVIEW", S.TCMS_WO_ORIGINAL_PREVIEW))
-            await self.page.wait_for_timeout(10000)  # SSRS report render
 
-            async with self.page.expect_download() as dl_info:
+            # Wait for the in-place transition to finish: the Export button appearing is the signal
+            # (title also becomes the WO-PO, but the button is what we click next).
+            await self.page.wait_for_selector('button:has-text("Export")', timeout=30000)
+            await self.page.wait_for_timeout(1500)
+
+            # CRITICAL content check: confirm the page title reflects THIS WO before exporting.
+            # A mismatch means the transition landed on the wrong record — abort rather than export
+            # stale data (billing-critical; re-verified again after download via extraction).
+            title = await self.page.title()
+            if wo_po_number not in title:
+                raise RuntimeError(
+                    f"page title {title!r} does not match {wo_po_number} — aborting export "
+                    "(would have exported the wrong WO's PDF)")
+
+            async with self.page.expect_download(timeout=20000) as dl_info:
                 await self.page.click(S.require("TCMS_WO_PDF_EXPORT", S.TCMS_WO_PDF_EXPORT))
                 await self.page.wait_for_timeout(2000)
-                pdf_item = self.page.get_by_text("PDF", exact=False)
+                pdf_item = self.page.get_by_role("menuitem", name="PDF")
                 if await pdf_item.count():
                     await pdf_item.first.click()
             download = await dl_info.value
@@ -260,12 +264,21 @@ class TCMSScraper:
                 return
 
     async def _back_to_list(self) -> None:
-        """Best-effort return to a known state — re-navigate to the base dashboard.
+        """Return to the Un-Invoiced WO list via the in-app "Back" button (known-state recovery).
 
-        The SSRS PDF viewer opens as a modal over the workspace; rather than depend on a fragile
-        close/back control, we just re-navigate. The next download_pdf() reopens the list as needed.
+        Prefer the "Back" button over page.goto(): a goto() mid-flow tears down D365's async
+        client-side state (this caused the stale-PDF bug — see download_pdf's docstring). Falls back
+        to goto() only if Back isn't available (e.g. nothing was ever opened this session).
         """
         assert self.page is not None
+        try:
+            back = self.page.get_by_role("button", name="Back")
+            if await back.count():
+                await back.first.click(timeout=10000)
+                await self.page.wait_for_timeout(3000)
+                return
+        except Exception:
+            logger.warning("'Back' button recovery failed — falling back to full navigation")
         try:
             await self.page.goto(settings.TCMS_BASE_URL, wait_until="domcontentloaded")
             await self.page.wait_for_timeout(3000)
