@@ -1,23 +1,27 @@
-# JBTC Adhoc Pest Control Billing MVP
+# LS2 Billing Automation
 
-Automates a manual billing workflow for Jalan Besar Town Council (JBTC) adhoc pest control jobs.
+Automates the manual billing workflow for two town councils' pest control jobs: JBTC/Jalan Besar
+(scraped from the TCMS web portal) and SKTC/Sengkang (ingested via email).
 
 ```
-Retrieve un-invoiced Work Orders from JBTC TCMS portal (web, no API)
+Retrieve un-invoiced Work Orders (JBTC: TCMS portal scrape | SKTC: email poll)
         ↓
 Extract fields from each WO PDF (Claude Haiku)
         ↓
 Validate + duplicate-check
         ↓
-Seek per-WO approval in Telegram (inline buttons)
+Every valid, non-duplicate WO is auto-submitted to Synergix ERP (gated by DRY_RUN)
         ↓
-On approval → input into Synergix ERP (web, no API)
-        ↓
-Report outcome back to Telegram
+Report every WO's outcome to Telegram (for spot-checking, not approval)
 ```
 
-**There is no web UI. Telegram inline buttons are the entire human interface.**
-This MVP runs locally for testing before any cloud deployment.
+**There is no web UI and no per-WO approval gate.** The recommended path (`--batch`) processes
+every un-invoiced WO automatically and reports outcomes to Telegram afterward for the team to
+spot-check in Synergix. An older Telegram inline-button approval flow also exists in the code
+(`python -m src.main` without `--batch`) but `--batch` is what actually runs in production.
+
+For deploying this to run unattended on a Windows machine, see
+[deploy/windows/README.md](deploy/windows/README.md).
 
 ---
 
@@ -50,22 +54,26 @@ cp .env.example .env
 
 ## Running
 
-There are two WO ingestion sources. DRY_RUN defaults to true — the Synergix driver does everything
-EXCEPT the final submit/confirm clicks.
+DRY_RUN defaults to true — the Synergix driver does everything EXCEPT the final submit/confirm
+clicks, so it's safe to run repeatedly while testing.
 
 ```bash
-# Email flow — ingest Work Orders from .msg (Outlook) or .eml files (single file or a directory):
-python -m src.main --emails path/to/email-dir
-python -m src.main path/to/one-wo.msg          # single .msg/.eml shorthand
+# RECOMMENDED — batch pipeline, no approval gate: scrape TCMS -> extract -> validate -> dedup ->
+# auto-submit every valid non-duplicate WO -> report to Telegram
+python -m src.main --batch
+python -m src.main --batch --limit 20             # cap to the first 20 WOs (sampling)
+python -m src.main --batch --poll                 # pull new SKTC emails first, then batch-process
+python -m src.main --batch --emails path/to/dir   # batch-process a dir/file of .msg/.eml/.pdf
 
-# TCMS scrape flow — pull un-invoiced WOs from the TCMS web portal:
+# Older flow: per-WO Telegram approval gate (Approve/Reject buttons), no auto-submit.
+# Kept in the code but --batch is what runs in production.
 python -m src.main
+python -m src.main --emails path/to/email-dir
 ```
 
-Either source feeds the same pipeline: extract fields (Claude Haiku) → validate → duplicate-check →
-send each surviving WO to Telegram for approval. The bot then stays alive listening for
-Approve/Reject button presses; approved WOs are written to Synergix (in DRY_RUN, the final submit is
-logged only).
+Either source feeds the same extraction/validation/dedup pipeline. In `--batch` mode every WO's
+outcome (PROCESSED, PARTIAL, FAILED, DUPLICATE, etc.) is reported to Telegram afterward for the
+team to spot-check in Synergix — there's no approve/reject step blocking the run.
 
 ### Email ingestion details
 
