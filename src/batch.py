@@ -21,7 +21,7 @@ from src.email_ingestor import ingest_dir, ingest_file
 from src.extractor import ExtractionError, extract_from_pdf, extract_from_text
 from src.models import WOPayload, WOStatus
 from src.synergix_driver import DedupResult, SynergixDriver
-from src.validator import build_remarks, resolve_project_code, validate
+from src.validator import build_remarks, check_extraction_trust, resolve_project_code, validate
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,18 @@ async def process_payload(payload: WOPayload, synergix: SynergixDriver) -> WOOut
             return WOOutcome(wo, WOStatus.DUPLICATE, "already invoiced in Synergix", source=payload.source_path)
         if dedup is DedupResult.UNCERTAIN:
             msg = "dedup inconclusive — verify manually it is NOT already invoiced before billing"
+            logger.warning("WO %s NEEDS_REVIEW: %s", wo, msg)
+            await db.upsert_payload(payload, WOStatus.NEEDS_REVIEW, project_code=project_code,
+                                    remarks=remarks, error=msg)
+            return WOOutcome(wo, WOStatus.NEEDS_REVIEW, msg, source=payload.source_path)
+
+        # Extraction trust gate (fail-safe). Not-a-duplicate is not enough to auto-bill: if we're not
+        # confident the figures/GL were read correctly, a human must eyeball it first. Concerns ->
+        # NEEDS_REVIEW (never auto-submitted) — this is the guard that stops a misread $30->$300 or a
+        # low-confidence GL number from being billed unattended.
+        trust_concerns = check_extraction_trust(payload)
+        if trust_concerns:
+            msg = "auto-submit withheld — verify before billing: " + "; ".join(trust_concerns)
             logger.warning("WO %s NEEDS_REVIEW: %s", wo, msg)
             await db.upsert_payload(payload, WOStatus.NEEDS_REVIEW, project_code=project_code,
                                     remarks=remarks, error=msg)

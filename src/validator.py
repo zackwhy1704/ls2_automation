@@ -78,62 +78,55 @@ def validate(payload: WOPayload) -> list[str]:
     except ValidationError as exc:
         errors.append(str(exc))
 
-    errors.extend(_check_money_consistency(payload))
-    errors.extend(_check_confidence(payload))
-
     return errors
 
 
-def _check_money_consistency(payload: WOPayload) -> list[str]:
-    """Cross-check the money fields against each other rather than trusting each in isolation.
+def check_extraction_trust(payload: WOPayload, *, min_confidence: float | None = None) -> list[str]:
+    """Return reasons this extraction should NOT be auto-billed. Empty list == safe to auto-submit.
 
-    net_amount is already deterministically recomputed by the extractor from quantity*unit_price
-    minus discount (see extractor._finalize), so it can't itself be wrong relative to those inputs.
-    What's still unchecked is grand_total and gst_percent, which come straight from the model — if
-    Haiku misreads a printed figure, nothing catches it before it reaches Synergix. This checks
-    grand_total ≈ net_amount * (1 + gst_percent/100), which transitively validates the whole
-    gross -> discount -> net -> GST -> grand_total chain since net_amount is itself trustworthy.
+    Distinct from validate(): validate() catches bad/missing data on the WO itself (-> INVALID,
+    dropped — the source document is malformed). This catches "the data looks well-formed but we're
+    not confident the extraction read it correctly" (-> NEEDS_REVIEW, the same fail-safe bucket as an
+    uncertain dedup — a human looks at it, it is not treated as a broken WO). A not-a-duplicate result
+    was never on its own enough to justify auto-billing; this is the gate that sits between a clean
+    dedup and the actual write.
+
+    Three checks:
+      1. money consistency — net_amount is already deterministically recomputed by the extractor from
+         quantity*unit_price minus discount, so it can't disagree with those inputs. grand_total and
+         gst_percent come straight from the model, though — if a line figure was misread (e.g. $30.00
+         as $300.00), grand_total will no longer match net_amount + GST. That mismatch is the signal.
+      2. a CRITICAL field (gl_number, wo_po_number, unit_price, quantity) the model itself flagged as
+         low-confidence, even if overall confidence looks fine.
+      3. overall extraction_confidence below the configured threshold.
     """
-    errors: list[str] = []
-    net = payload.net_amount
-    grand = payload.grand_total
-    gst_pct = payload.gst_percent or 0.0
-
-    if net is not None and grand is not None:
-        expected_grand = round(net * (1 + gst_pct / 100), 2)
-        if abs(expected_grand - grand) > _MONEY_TOLERANCE:
-            errors.append(
-                f"money mismatch: grand_total {grand:.2f} does not match net_amount {net:.2f} "
-                f"+ {gst_pct:g}% GST (expected {expected_grand:.2f})"
-            )
-
-    return errors
-
-
-def _check_confidence(payload: WOPayload) -> list[str]:
-    """Block auto-submit when the model itself flagged uncertainty on a billing-critical field, or
-    when its overall confidence is below the configured threshold.
-
-    Without this, EXTRACTION_CONFIDENCE_THRESHOLD and low_confidence_fields exist but do nothing —
-    a low-confidence gl_number (the field the extraction prompt calls CRITICAL) would otherwise flow
-    straight through to a live Synergix submit.
-    """
-    errors: list[str] = []
+    threshold = settings.EXTRACTION_CONFIDENCE_THRESHOLD if min_confidence is None else min_confidence
+    concerns: list[str] = []
 
     flagged_critical = _CRITICAL_LOW_CONFIDENCE_FIELDS.intersection(payload.low_confidence_fields)
     if flagged_critical:
-        errors.append(
+        concerns.append(
             f"model flagged low confidence on critical field(s): {', '.join(sorted(flagged_critical))}"
         )
 
-    threshold = settings.EXTRACTION_CONFIDENCE_THRESHOLD
     if payload.extraction_confidence is not None and payload.extraction_confidence < threshold:
-        errors.append(
+        concerns.append(
             f"extraction_confidence {payload.extraction_confidence:.2f} is below the "
             f"required threshold {threshold:.2f}"
         )
 
-    return errors
+    net = payload.net_amount
+    grand = payload.grand_total
+    gst_pct = payload.gst_percent or 0.0
+    if net is not None and grand is not None:
+        expected_grand = round(net * (1 + gst_pct / 100), 2)
+        if abs(expected_grand - grand) > _MONEY_TOLERANCE:
+            concerns.append(
+                f"money mismatch: grand_total {grand:.2f} does not match net_amount {net:.2f} "
+                f"+ {gst_pct:g}% GST (expected {expected_grand:.2f}) — a line figure was likely misread"
+            )
+
+    return concerns
 
 
 def _wo_po_suffix(wo_po_number: str) -> str:

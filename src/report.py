@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 # Report sections in priority order: things needing attention first.
 _SECTIONS: list[tuple[WOStatus, str]] = [
-    (WOStatus.NEEDS_REVIEW, "⚠️ Needs manual review (verify NOT already invoiced)"),
+    (WOStatus.NEEDS_REVIEW, "⚠️ Needs manual review (see reason per item)"),
     (WOStatus.FAILED, "❌ Failed"),
     (WOStatus.INVALID, "⛔ Invalid (bad/missing data)"),
     (WOStatus.DUPLICATE, "♻️ Skipped — already invoiced"),

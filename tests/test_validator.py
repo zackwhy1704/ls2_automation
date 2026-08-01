@@ -9,6 +9,7 @@ from src.models import PROJECT_CODE_ECOCARE, PROJECT_CODE_INFIGO, WOPayload
 from src.validator import (
     ValidationError,
     build_remarks,
+    check_extraction_trust,
     resolve_project_code,
     validate,
 )
@@ -89,60 +90,74 @@ def test_unresolvable_project_code_flagged():
     assert any("prefix" in e for e in errors)
 
 
-# --- money consistency ---
+# --- extraction trust gate (money consistency + confidence; NOT part of validate()) ---
 
-def test_consistent_money_has_no_errors():
-    errors = validate(make_payload(net_amount=27.00, gst_percent=9.0, grand_total=29.43))
-    assert not any("money mismatch" in e for e in errors)
+def test_consistent_money_has_no_concerns():
+    p = make_payload(net_amount=27.00, gst_percent=9.0, grand_total=29.43)
+    assert not any("money mismatch" in c for c in check_extraction_trust(p))
 
 
 def test_grand_total_mismatch_flagged():
     # net 27.00 + 9% GST should be 29.43, not 294.30 (e.g. a misread decimal point)
-    errors = validate(make_payload(net_amount=27.00, gst_percent=9.0, grand_total=294.30))
-    assert any("money mismatch" in e for e in errors)
+    p = make_payload(net_amount=27.00, gst_percent=9.0, grand_total=294.30)
+    assert any("money mismatch" in c for c in check_extraction_trust(p))
 
 
 def test_grand_total_within_rounding_tolerance_passes():
-    errors = validate(make_payload(net_amount=27.00, gst_percent=9.0, grand_total=29.44))
-    assert not any("money mismatch" in e for e in errors)
+    p = make_payload(net_amount=27.00, gst_percent=9.0, grand_total=29.44)
+    assert not any("money mismatch" in c for c in check_extraction_trust(p))
 
 
 def test_missing_money_fields_skips_check():
     # net_amount/grand_total absent entirely (e.g. no GST on the WO) -> nothing to cross-check
-    errors = validate(make_payload(net_amount=None, grand_total=None))
-    assert not any("money mismatch" in e for e in errors)
+    p = make_payload(net_amount=None, grand_total=None)
+    assert not any("money mismatch" in c for c in check_extraction_trust(p))
 
 
 def test_zero_gst_percent_checked_correctly():
-    errors = validate(make_payload(net_amount=100.0, gst_percent=0.0, grand_total=100.0))
-    assert not any("money mismatch" in e for e in errors)
+    p = make_payload(net_amount=100.0, gst_percent=0.0, grand_total=100.0)
+    assert not any("money mismatch" in c for c in check_extraction_trust(p))
 
-
-# --- confidence gate ---
 
 def test_low_confidence_on_critical_field_flagged():
-    errors = validate(make_payload(low_confidence_fields=["gl_number"]))
-    assert any("low confidence" in e and "gl_number" in e for e in errors)
+    p = make_payload(low_confidence_fields=["gl_number"])
+    concerns = check_extraction_trust(p)
+    assert any("low confidence" in c and "gl_number" in c for c in concerns)
 
 
 def test_low_confidence_on_noncritical_field_not_flagged():
-    errors = validate(make_payload(low_confidence_fields=["sr_number"]))
-    assert not any("low confidence" in e for e in errors)
+    p = make_payload(low_confidence_fields=["sr_number"])
+    assert not any("low confidence" in c for c in check_extraction_trust(p))
 
 
 def test_overall_confidence_below_threshold_flagged():
-    errors = validate(make_payload(extraction_confidence=0.5))
-    assert any("extraction_confidence" in e for e in errors)
+    p = make_payload(extraction_confidence=0.5)
+    assert any("extraction_confidence" in c for c in check_extraction_trust(p, min_confidence=0.75))
 
 
 def test_overall_confidence_above_threshold_passes():
-    errors = validate(make_payload(extraction_confidence=0.99))
-    assert not any("extraction_confidence" in e for e in errors)
+    p = make_payload(extraction_confidence=0.99)
+    assert not any("extraction_confidence" in c for c in check_extraction_trust(p, min_confidence=0.75))
 
 
 def test_no_confidence_reported_skips_threshold_check():
-    errors = validate(make_payload(extraction_confidence=None))
-    assert not any("extraction_confidence" in e for e in errors)
+    p = make_payload(extraction_confidence=None)
+    assert not any("extraction_confidence" in c for c in check_extraction_trust(p, min_confidence=0.75))
+
+
+def test_trust_gate_passes_clean_high_confidence_wo():
+    p = make_payload(extraction_confidence=0.98, quantity=1.0, unit_price=30.0,
+                      net_amount=27.0, gst_percent=9.0, grand_total=29.43)
+    assert check_extraction_trust(p, min_confidence=0.75) == []
+
+
+def test_validate_no_longer_includes_trust_concerns():
+    # validate() covers malformed/missing WO data only; trust concerns are a separate axis
+    # (NEEDS_REVIEW, not INVALID) — a WO with a money mismatch or low confidence must still pass
+    # validate() cleanly, since the trust gate is applied separately in the batch pipeline.
+    p = make_payload(net_amount=27.00, gst_percent=9.0, grand_total=294.30,
+                      extraction_confidence=0.1, low_confidence_fields=["gl_number"])
+    assert validate(p) == []
 
 
 # --- remarks builder ---
