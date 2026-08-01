@@ -18,6 +18,16 @@ import sys
 import urllib.request
 import urllib.parse
 
+# Substrings that, if present in the crash's tail output, get a distinct headline — so a login/MFA
+# failure (the scenario flagged in project review: TCMS Conditional Access MFA is assumed, not
+# confirmed, and would otherwise die silently once the persisted Entra session cookie expires) is
+# visible in the Telegram alert itself, not just buried in a log file on the host.
+_LOGIN_FAILURE_MARKERS = ("did not reach the dashboard", "login failed", "TCMS login", "Synergix login")
+
+# How many trailing lines of the child's stderr to include in the alert, so the failure is legible
+# without RDPing into the host. Telegram caps messages at 4096 chars; this stays well under that.
+_TAIL_LINES = 15
+
 
 def _send_telegram(token: str, chat_id: str, text: str) -> None:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -37,14 +47,27 @@ def main() -> None:
 
     from config import settings  # imported late: a broken .env shouldn't block --help etc.
 
-    result = subprocess.run([sys.executable, *child_args])
+    # Capture stderr so its tail can ride in the Telegram alert, but still stream it live to our own
+    # stderr (inherited by the caller's log redirect) so nothing is lost from the on-host log file.
+    result = subprocess.run(
+        [sys.executable, *child_args], stderr=subprocess.PIPE, text=True,
+    )
+    if result.stderr:
+        sys.stderr.write(result.stderr)
 
     if result.returncode != 0:
         token = settings.TELEGRAM_BOT_TOKEN
         chat_id = settings.TELEGRAM_CHAT_ID
+        tail_lines = (result.stderr or "").strip().splitlines()[-_TAIL_LINES:]
+        tail = "\n".join(tail_lines)
+        headline = (
+            "\U0001F510 ls2_automation LOGIN FAILURE"
+            if any(marker in tail for marker in _LOGIN_FAILURE_MARKERS)
+            else "\U0001F6A8 ls2_automation run CRASHED"
+        )
         message = (
-            "\U0001F6A8 ls2_automation run CRASHED (exit code "
-            f"{result.returncode}). Command: {' '.join(child_args)!r}. Check logs on the host."
+            f"{headline} (exit code {result.returncode}). "
+            f"Command: {' '.join(child_args)!r}.\n\n{tail or '(no stderr captured — check logs on host)'}"
         )
         if token and chat_id:
             _send_telegram(token, chat_id, message)

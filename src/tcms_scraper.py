@@ -52,11 +52,15 @@ class TCMSScraper:
             await self._pw.stop()
 
     async def login(self) -> None:
-        """Log into the D365 portal via Microsoft Entra, using the password (no-MFA) fallback path.
+        """Log into the D365 portal via Microsoft Entra, preferring the password (no-MFA) fallback path.
 
         Idempotent: if the persisted session is still valid we land straight on the dashboard and skip
-        the credential steps. The account uses password auth via the "Use your password instead" link,
-        so no Authenticator push is required.
+        the credential steps. As observed so far, this account can bypass an Authenticator push via
+        the "Use your password instead" link. That has NOT been confirmed as a guaranteed property of
+        JBTC's tenant Conditional Access policy — if the tenant ever enforces MFA with no fallback link
+        offered at all, _detect_mfa_dead_end below raises a specific, diagnosable error instead of the
+        generic dashboard-timeout below (which would otherwise look identical to any other login hiccup
+        and could mean the persisted Entra session cookie stops renewing until a human intervenes).
         """
         if not settings.TCMS_BASE_URL:
             raise RuntimeError("TCMS_BASE_URL is not set in .env")
@@ -83,6 +87,8 @@ class TCMSScraper:
             await pw_instead.first.click()
             await self.page.wait_for_timeout(4000)
             await self._enter_password_if_present()
+        else:
+            await self._detect_mfa_dead_end()
 
         # "Stay signed in?" -> Yes, to persist the session cookie.
         for _ in range(3):
@@ -96,6 +102,25 @@ class TCMSScraper:
         if not self._on_dashboard():
             raise RuntimeError(f"TCMS login did not reach the dashboard (at {self.page.url[:80]})")
         logger.info("TCMS login successful")
+
+    async def _detect_mfa_dead_end(self) -> None:
+        """Raise a specific, diagnosable error if Entra is asking for an Authenticator approval with
+        NO password-fallback link offered — i.e. Conditional Access MFA is mandatory for this account
+        and the automation genuinely cannot proceed unattended. Without this, that scenario falls
+        through to the generic "did not reach the dashboard" timeout ~15s later, which looks the same
+        as any other transient login hiccup and gives the person checking the alert no signal that this
+        needs a tenant policy change (a JBTC Conditional Access exemption or a dedicated non-MFA service
+        account), not a retry.
+        """
+        assert self.page is not None
+        awaiting_approval = self.page.get_by_text("Approve sign in", exact=False)
+        if await awaiting_approval.count():
+            raise RuntimeError(
+                "TCMS login is blocked on an Authenticator push approval with no password-fallback "
+                "link available — Conditional Access MFA appears mandatory for this account. This "
+                "cannot be automated unattended; ask JBTC for an MFA exemption on the service account "
+                "used here, or a dedicated non-MFA service account."
+            )
 
     def _on_dashboard(self) -> bool:
         """True when the current URL is the D365 app (not the login domain)."""
