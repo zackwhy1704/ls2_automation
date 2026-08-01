@@ -59,3 +59,4 @@ class WOPayload(BaseModel):
     # Optional[...] (not `float | None`) so the model also evaluates on Python 3.9 dev machines;
     # pydantic eagerly evaluates field annotations, unlike the deferred `from __future__ import annotations`.
     extraction_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)  # 0..1 from Haiku
+    low_confidence_fields: list[str] = Field(default_factory=list)  # field names Haiku itself flagged as unsure

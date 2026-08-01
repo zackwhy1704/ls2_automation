@@ -257,6 +257,7 @@ def _finalize(raw: str, *, source_path: str) -> WOPayload:
             sr_number=sr or None,
             source_path=source_path,
             extraction_confidence=float(confidence) if confidence is not None else None,
+            low_confidence_fields=[str(f) for f in low_conf],
         )
     except Exception as exc:  # pydantic ValidationError, ValueError, etc.
         raise ExtractionError(f"extracted fields failed model validation: {exc}\nraw: {raw}") from exc
