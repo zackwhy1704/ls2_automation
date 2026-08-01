@@ -29,6 +29,19 @@ PROJECT_CODE_INFIGO = "2000069"     # job_sheet_number starts with a letter
 PROJECT_CODE_ECOCARE = "2000050"    # job_sheet_number starts with a digit
 
 
+def is_jbtc(town_council: str) -> bool:
+    """True for a Jalan Besar Town Council WO, false otherwise (incl. Sengkang/SKTC).
+
+    Confirmed against 10 real labelled JBTC samples and 10 real SKTC samples (2026-08-01, via
+    scripts/measure_extraction.py): JBTC's printed "Job Cost" (the pre-GST base) is
+    Gross + |Discount Amt| — i.e. the WO's own discount COLUMN is added, not subtracted, from gross.
+    SKTC's is the intuitive Gross - Discount Amt. Both councils' WOs print "Discount Amt" identically,
+    so this council split is the only signal that distinguishes which arithmetic applies; get it
+    wrong and JBTC WOs bill low or SKTC WOs bill high. See project memory synergix-money-formula.
+    """
+    return "jalan besar" in (town_council or "").strip().lower()
+
+
 class WOPayload(BaseModel):
     wo_po_number: str                # format WO-PO/XXXXXXXXX
     town_council: str = ""           # e.g. "Sengkang Town Council" — from the WO header, drives remarks

@@ -93,7 +93,8 @@ def check_extraction_trust(payload: WOPayload, *, min_confidence: float | None =
 
     Three checks:
       1. money consistency — net_amount is already deterministically recomputed by the extractor from
-         quantity*unit_price minus discount, so it can't disagree with those inputs. grand_total and
+         quantity, unit_price, and discount (the exact sign of the discount adjustment is council-
+         specific — see models.is_jbtc), so it can't disagree with those inputs. grand_total and
          gst_percent come straight from the model, though — if a line figure was misread (e.g. $30.00
          as $300.00), grand_total will no longer match net_amount + GST. That mismatch is the signal.
       2. a CRITICAL field (gl_number, wo_po_number, unit_price, quantity) the model itself flagged as

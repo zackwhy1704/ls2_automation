@@ -17,7 +17,7 @@ import re
 from pathlib import Path
 
 from config import settings
-from src.models import WOPayload
+from src.models import WOPayload, is_jbtc
 
 logger = logging.getLogger(__name__)
 
@@ -87,10 +87,17 @@ Return ONLY a JSON object — no prose, no markdown code fences, no explanation.
   "quantity": number,            // the line quantity, e.g. 1.0
   "unit_price": number,          // the gross Rate per unit before discount, e.g. 30.00
   "discount_percent": number,    // e.g. 10.0 (0 if none)
-  "discount_amount": number,     // e.g. 3.00 (0 if none)
-  "net_amount": number,          // = (quantity*unit_price) MINUS discount_amount, before GST. NOT the gross. e.g. 30.00-3.00=27.00
+  "discount_amount": number,     // the printed "Discount Amt" figure, e.g. 3.00 (0 if none). Read the
+                                  // printed value; do NOT assume it is subtracted from Gross — some
+                                  // WO layouts print "Job Cost" as Gross PLUS this figure, others as
+                                  // Gross MINUS it. Just transcribe the number as printed.
+  "net_amount": number,          // the printed "Job Cost" / "Total" figure (pre-GST subtotal) EXACTLY
+                                  // as printed on the WO. Do NOT compute this yourself from Gross and
+                                  // Discount — different WO layouts combine them differently and
+                                  // guessing the direction will produce a wrong figure. Just read it.
   "gst_percent": number,         // e.g. 9.0 (0 if none)
-  "grand_total": number,         // net + GST, e.g. 29.43
+  "grand_total": number,         // the printed "Grand Total" figure EXACTLY as printed. Read it, do
+                                  // not compute it.
   "sr_number": string,           // ONLY a value labelled "SR"/"Schedule" (e.g. "25955"); else "". NOT the job sheet
   "confidence": number,          // your overall confidence 0..1
   "low_confidence_fields": [string]  // fields you are unsure about (especially gl_number)
@@ -217,10 +224,17 @@ def _finalize(raw: str, *, source_path: str) -> WOPayload:
             return None
 
     sr = str(data.get("sr_number", "") or "").strip()
+    town_council = str(data.get("town_council", "") or "")
 
     # net_amount is the one figure the model gets arithmetically wrong run-to-run (it sometimes
     # returns the gross). Compute it deterministically from the fields it DOES read reliably:
-    # net = quantity*unit_price - discount. Fall back to discount_percent, then the model's value.
+    # quantity, unit_price, discount. Fall back to discount_percent, then the model's value.
+    #
+    # The direction of the discount adjustment is COUNCIL-SPECIFIC — confirmed against all real
+    # labelled samples (2026-08-01, see models.is_jbtc's docstring): JBTC's printed pre-GST base
+    # ("Job Cost") is gross PLUS the discount amount; SKTC's is gross MINUS it, as you'd expect from
+    # a column literally labelled "Discount". Getting this backwards means every JBTC WO bills too
+    # low and/or fails the money-consistency trust gate; do not "simplify" this to gross-discount.
     quantity = float(data.get("quantity", 0) or 0)
     unit_price = float(data.get("unit_price", 0) or 0)
     disc_amt = _opt_float("discount_amount")
@@ -228,10 +242,11 @@ def _finalize(raw: str, *, source_path: str) -> WOPayload:
     gross = quantity * unit_price
     net_amount: float | None
     if gross > 0:
+        sign = 1 if is_jbtc(town_council) else -1
         if disc_amt is not None:
-            net_amount = round(gross - disc_amt, 2)
+            net_amount = round(gross + sign * disc_amt, 2)
         elif disc_pct is not None:
-            net_amount = round(gross * (1 - disc_pct / 100), 2)
+            net_amount = round(gross * (1 + sign * disc_pct / 100), 2)
         else:
             net_amount = round(gross, 2)
     else:
@@ -240,7 +255,7 @@ def _finalize(raw: str, *, source_path: str) -> WOPayload:
     try:
         payload = WOPayload(
             wo_po_number=str(data.get("wo_po_number", "")),
-            town_council=str(data.get("town_council", "") or ""),
+            town_council=town_council,
             job_sheet_number=str(data.get("job_sheet_number", "")),
             service_location=str(data.get("service_location", "")),
             nature_of_work=str(data.get("nature_of_work", "")),
