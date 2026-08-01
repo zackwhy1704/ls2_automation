@@ -380,7 +380,17 @@ class SynergixDriver:
         # The Copy From modal lists matching quotations newest-first; copy the top one.
         top_link = page.locator(".ui-dialog:visible [id$='_data'] tr a, [id$='_data'] tr a").first
         if not await top_link.count():
-            raise RuntimeError(f"no template quotation found for customer {payload.town_council!r}")
+            # KNOWN GAP as of 2026-08-01 (see project memory synergix-dedup-verified): the SKTC/
+            # Sengkang customer has no prior quotation to Copy From in this Synergix instance, so
+            # this fires on every SKTC WO, not just this one. Not a transient failure — needs a real
+            # Sengkang quotation created first (or the exact expected Customer name confirmed) before
+            # SKTC can go live. JBTC has a working template and is unaffected.
+            raise RuntimeError(
+                f"no Copy From template quotation found for customer {payload.town_council!r} — "
+                "if this is a Sengkang/SKTC WO, this is a KNOWN gap: no template quotation exists "
+                "for that customer in Synergix yet. Create one first, or confirm the exact Customer "
+                "name Synergix expects."
+            )
         await top_link.click()
         await page.wait_for_timeout(2500)
         # Confirm the "override current data" dialog.

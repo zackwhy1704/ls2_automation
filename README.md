@@ -136,6 +136,11 @@ Search the codebase for `TODO(human)` — every real-world unknown is marked the
 - **`SYNERGIX_TEMPLATE_QUO_ID`** — the stable template quotation to "Copy From" (set in `.env`).
 - **All DOM selectors** ([config/selectors.py](config/selectors.py)).
 
+Before relying on this for live billing, also read
+[docs/operational_expectations.md](docs/operational_expectations.md) — what breaks, how you'll find
+out, and the known current gaps (as of writing: SKTC has no Synergix template yet, TCMS MFA is
+unconfirmed, multi-line-item WOs aren't fully modeled).
+
 ## Production notes (out of scope for MVP, documented in code)
 
 - Decouple into (1) a scheduled scrape+notify job and (2) a separate approval-executor triggered by
