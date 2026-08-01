@@ -40,6 +40,12 @@ selector or click sequence in this codebase.
 - **SKTC has no Synergix "Copy From" template yet** — Stage B will fail for every Sengkang WO until a
   template quotation exists for that customer in Synergix (or the exact expected Customer name is
   confirmed). JBTC is unaffected. See project notes for the exact error and fix options.
+- **SKTC's real Synergix project codes are unknown and NOT what the current code assumes.** JBTC's
+  Ecocare (2000050) / Infigo (2000069) codes, computed from the job_sheet_number's alphabetic-vs-
+  numeric prefix, do not apply to Sengkang — Synergix's own Project Site picker shows Sengkang uses
+  entirely different codes (2000073 "Pest control", 2000130 "Mosquito"), apparently keyed by service
+  type rather than the job-sheet prefix. Needs client confirmation before any SKTC quotation logic can
+  be trusted. See `TODO(human)` in `src/models.py` and project memory `synergix-no-copyfrom-path`.
 - **Multi-line-item WOs are not fully modeled.** The billing payload holds one quantity/unit-price/
   discount line; a WO with several distinct line items (seen on at least one real SKTC sample) only
   captures the first line's figures. This does not cause a wrong bill (the money-consistency check

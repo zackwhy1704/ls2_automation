@@ -25,6 +25,14 @@ class WOStatus(str, Enum):
 
 # --- Project code mapping (resolved from job_sheet_number prefix) ---
 # TODO(human): confirm these two project codes + the prefix rule against real WO samples.
+#
+# TODO(human) 2026-08-01: these two codes are confirmed to be JBTC-ONLY. Poking Synergix's live
+# Project Site picker for SKTC (see project memory synergix-no-copyfrom-path) surfaced that Sengkang
+# has its OWN, completely different project codes — 2000073 (Pest control) and 2000130 (Mosquito) —
+# that don't fit this alphabetic/numeric job-sheet-prefix scheme at all; they look keyed by service
+# type instead. resolve_project_code() below is only verified correct for JBTC. Do NOT assume it
+# applies to SKTC WOs without confirming with the client which real SKTC WOs map to which of the two
+# codes, and whether the prefix rule means anything for SKTC at all.
 PROJECT_CODE_INFIGO = "2000069"     # job_sheet_number starts with a letter
 PROJECT_CODE_ECOCARE = "2000050"    # job_sheet_number starts with a digit
 
