@@ -59,3 +59,71 @@ def test_stub_assume_safe_flag_allows_local_demo(monkeypatch):
 def test_dedup_search_value_follows_config(monkeypatch, key, expected):
     monkeypatch.setattr(settings, "SYNERGIX_DEDUP_KEY", key)
     assert SynergixDriver()._dedup_search_value(_payload()) == expected
+
+
+# --- finding 7: WO-PO must survive the 50-char subject truncation (pure logic, always runs) ---
+
+def test_wo_po_survives_subject_truncation():
+    """dedup searches the Enquiry/Subject column for the WO-PO, so the WO-PO MUST remain intact in
+    the (<=50 char) subject even for a long council name. It's front-anchored, so [:50] only trims the
+    council tail — verified live 2026-08-01 (see project memory synergix-dedup-verified). This test
+    locks that in so a future reformat can't silently break dedup."""
+    p = _payload()
+    p.town_council = "Some Extremely Long Town Council Name That Exceeds Fifty Characters Easily"
+    subject = SynergixDriver()._subject(p)
+    assert len(subject) <= 50
+    assert p.wo_po_number in subject, "WO-PO was truncated out of the subject — dedup would miss it"
+
+
+# --- finding 6: live round-trip against the REAL Synergix grid (opt-in) ---
+# Exercises actual nav + column filter + grid read — the control that prevents double-billing.
+# Already verified once manually (see project memory synergix-dedup-verified). These make that
+# verification repeatable: run deliberately, with a Synergix login configured in .env and two known
+# WO-POs supplied:
+#     RUN_SYNERGIX_TESTS=1 \
+#     SYNERGIX_KNOWN_DUPLICATE_WO_PO=WO-PO/000060068 \
+#     SYNERGIX_KNOWN_ABSENT_WO_PO=WO-PO/000000000 \
+#     pytest tests/test_dedup.py -k roundtrip -v
+
+import os
+
+_LIVE = pytest.mark.skipif(
+    os.getenv("RUN_SYNERGIX_TESTS") != "1",
+    reason="live Synergix round-trip; set RUN_SYNERGIX_TESTS=1 (+ known WO-POs in env) to run",
+)
+
+
+def _live_check(wo_po: str) -> DedupResult:
+    async def _run() -> DedupResult:
+        drv = SynergixDriver()
+        await drv.start()
+        try:
+            p = _payload()
+            p.wo_po_number = wo_po
+            return await drv.check_duplicate(p)
+        finally:
+            await drv.close()
+    return asyncio.run(_run())
+
+
+@_LIVE
+def test_roundtrip_known_duplicate_reads_as_duplicate():
+    wo = os.getenv("SYNERGIX_KNOWN_DUPLICATE_WO_PO")
+    if not wo:
+        pytest.skip("set SYNERGIX_KNOWN_DUPLICATE_WO_PO to a WO-PO already invoiced in Synergix")
+    assert _live_check(wo) is DedupResult.DUPLICATE, (
+        f"{wo} is known-invoiced but the checker did not return DUPLICATE — double-billing risk"
+    )
+
+
+@_LIVE
+def test_roundtrip_known_absent_reads_as_not_duplicate():
+    wo = os.getenv("SYNERGIX_KNOWN_ABSENT_WO_PO", "WO-PO/000000000")
+    result = _live_check(wo)
+    # NOT_DUPLICATE is the pass. UNCERTAIN is a soft-fail worth surfacing (grid/marker changed), but
+    # it is fail-safe (won't auto-bill), so we assert it's specifically NOT a false DUPLICATE and
+    # flag UNCERTAIN loudly rather than passing silently.
+    assert result is not DedupResult.DUPLICATE, f"absent WO {wo} wrongly read as DUPLICATE"
+    if result is DedupResult.UNCERTAIN:
+        pytest.fail(f"absent WO {wo} read as UNCERTAIN — 'no records' marker likely changed; "
+                    "dedup can't positively confirm NOT_DUPLICATE, so everything will route to review")

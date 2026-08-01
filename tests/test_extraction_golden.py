@@ -78,6 +78,8 @@ def test_extraction_matches_golden(key: str):
     from src import extractor  # imported lazily so non-LLM runs never need anthropic
 
     golden = _load_golden()[key]
+    if golden.get("_verified") is False:
+        pytest.skip(f"{key} label is _verified:false — hand-check it, then set _verified:true")
     pdf = _SAMPLES / key
     if not pdf.exists():
         # Sample PDFs are real client data and gitignored; on a clean clone there is nothing to run.
