@@ -35,17 +35,20 @@ selector or click sequence in this codebase.
   [synergix_workflow.md](synergix_workflow.md). The tradeoff is throughput, not correctness: a broken
   selector means WOs pile up as NEEDS_REVIEW/FAILED until fixed, not that a wrong invoice goes out.
 
-## Known current gaps (as of 2026-08-01)
+## Known current gaps (as of 2026-08-03)
 
-- **SKTC has no Synergix "Copy From" template yet** — Stage B will fail for every Sengkang WO until a
-  template quotation exists for that customer in Synergix (or the exact expected Customer name is
-  confirmed). JBTC is unaffected. See project notes for the exact error and fix options.
-- **SKTC's real Synergix project codes are unknown and NOT what the current code assumes.** JBTC's
-  Ecocare (2000050) / Infigo (2000069) codes, computed from the job_sheet_number's alphabetic-vs-
-  numeric prefix, do not apply to Sengkang — Synergix's own Project Site picker shows Sengkang uses
-  entirely different codes (2000073 "Pest control", 2000130 "Mosquito"), apparently keyed by service
-  type rather than the job-sheet prefix. Needs client confirmation before any SKTC quotation logic can
-  be trusted. See `TODO(human)` in `src/models.py` and project memory `synergix-no-copyfrom-path`.
+- **Stage B builds every quotation from scratch (no "Copy From")**, verified live end-to-end for both
+  JBTC and SKTC. One remaining gap: the Details line item's Item Code doesn't auto-fill in the full
+  pipeline (it works in isolation) — the draft is still created correctly otherwise, with a clear
+  warning logged so a human finishes that one field before Submit. See project memory
+  `synergix-no-copyfrom-path`.
+- **SKTC's real Synergix project code is a reasonable assumption, not a confirmed fact.** Sengkang's
+  Project Site options are `2000073` ("Pest control") and `2000130` ("Mosquito") — a completely
+  different scheme from JBTC's Ecocare (2000050) / Infigo (2000069) split. Every SKTC WO seen so far
+  is generic pest control, so the code defaults to `2000073`, but this needs client confirmation:
+  whether any SKTC WOs should map to Mosquito instead, and whether the job-sheet alphabetic/numeric
+  prefix rule (which drives the JBTC split) means anything for SKTC at all. See `TODO(human)` in
+  `src/synergix_driver.py` and project memory `synergix-no-copyfrom-path`.
 - **Multi-line-item WOs are not fully modeled.** The billing payload holds one quantity/unit-price/
   discount line; a WO with several distinct line items (seen on at least one real SKTC sample) only
   captures the first line's figures. This does not cause a wrong bill (the money-consistency check

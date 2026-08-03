@@ -14,6 +14,7 @@ Browser access is serialised by the caller via an asyncio.Lock (writes run one a
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from enum import Enum
 
@@ -21,7 +22,7 @@ from playwright.async_api import Page, async_playwright
 
 from config import selectors as S
 from config import settings
-from src.models import WOPayload, WOStatus
+from src.models import WOPayload, WOStatus, is_jbtc
 from src.validator import build_remarks, resolve_project_code
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,32 @@ class DedupResult(str, Enum):
     @property
     def safe_to_bill(self) -> bool:
         return self is DedupResult.NOT_DUPLICATE
+
+
+# Item code for adhoc pest control quotation lines. Confirmed IDENTICAL for both councils: seen live
+# in a real JBTC Synergix session (screen-recording, 2026-08-03 review) as "SE-400212A / Adhoc-
+# Provision of Pest Control Services", and matches the SKTC workflow doc's documented item code
+# exactly. Type is always "S" (service).
+ITEM_CODE = "SE-400212A"
+ITEM_TYPE = "S"
+
+# Project Site search term per council, used to find the right autocomplete row when creating a
+# quotation from scratch (see _select_autocomplete_row). Searching by the bare numeric code is NOT
+# safe — confirmed live that the same code string can match a DIFFERENT council's project (e.g.
+# "2000050" matched a Jalan Besar project first, not Sengkang), so we search by council name instead
+# and let the resolve_project_code()-derived code disambiguate which of the matches to pick.
+_PROJECT_SITE_SEARCH_JBTC = "Jalan Besar"
+_PROJECT_SITE_SEARCH_SKTC = "Sengkang"
+
+# TODO(human): Sengkang's real Project Site options (confirmed live, 2026-08-03) are
+# "2000073-Sengkang Town Council (Pest control)" and "2000130-Sengkang Town Council (Mosquito)" —
+# NOT the 2000050/2000069 Ecocare/Infigo codes resolve_project_code() computes from the job-sheet
+# prefix (those are confirmed JBTC-only, per the same live session). Since every SKTC sample we have
+# is adhoc PEST CONTROL work (not mosquito-specific), this defaults every SKTC WO to the "Pest
+# control" project site (2000073) as the reasonable assumption — CONFIRM with the client whether any
+# SKTC WOs should instead map to "Mosquito" (2000130), and whether job_sheet_number's alphabetic/
+# numeric prefix means anything for SKTC at all or if it's purely service-type-based.
+SKTC_PROJECT_SITE_MATCH = "2000073"
 
 
 def _dry_guard(action: str) -> bool:
@@ -353,11 +380,159 @@ class SynergixDriver:
         await element.click()
         await element.fill(value)
 
-    async def _stage_b_create_quotation(self, payload: WOPayload) -> None:
-        """Create a draft Service Quotation by Copy From, fill the WO-specific fields, DON'T submit.
+    async def _select_autocomplete_row(
+        self, label: str, search_text: str, must_contain: str, *, timeout_ms: int = 8000
+    ) -> bool:
+        """Click a live-autocomplete field by its label, type search_text, and click the first
+        visible dropdown row whose text contains must_contain.
 
-        Everything not set here (customer, contact, item code, project segment) is inherited from the
-        copied template. Leaves the draft filled and un-submitted for a human to review + Submit.
+        Synergix's Customer/Salesperson/Project Site fields are all the same PrimeFaces pattern: a
+        plain input that, once focused and typed into, ajax-populates a floating panel of matching
+        rows (NOT a modal). Confirmed live (2026-08-01/03) that clicking via generic text-locator
+        matching is unreliable — with many near-identical rows, Playwright's own visibility check on
+        the matched text node intermittently reports it as hidden even though it's visibly on screen.
+        The robust approach: find the visible panel via JS, then click by the ROW's own computed
+        on-screen coordinates rather than asking Playwright to re-resolve a text locator.
+        """
+        assert self.page is not None
+        page = self.page
+        # Required fields render as "Label *" (the asterisk is part of the same text node, not a
+        # separate element), so a plain exact=True match on e.g. "Salesperson" misses "Salesperson *"
+        # and raises (confirmed live, 2026-08-03). But exact=False is NOT the fix — "Customer" with
+        # exact=False also matches "Customer Type" (a substring match), and .first then non-
+        # deterministically picks whichever comes first in DOM order, which broke every subsequent
+        # attempt to select the real Customer field (confirmed live, same session). Match precisely:
+        # the label text OR the label text followed by exactly " *", nothing looser.
+        field_label = page.get_by_text(re.compile(rf"^{re.escape(label)}(?: \*)?$")).first
+        box = await field_label.bounding_box()
+        if not box:
+            raise RuntimeError(f"could not locate the {label!r} field label")
+        await page.mouse.click(box["x"] + box["width"] + 80, box["y"] + 8)
+        await page.wait_for_timeout(500)
+        await page.keyboard.type(search_text)
+        await page.wait_for_timeout(2200)  # ajax panel populate
+
+        coords = await page.evaluate(
+            """([needle]) => {
+                const panels = [...document.querySelectorAll('.ui-datatable, [id$="_panel"]')]
+                    .filter(p => p.offsetParent !== null);
+                if (!panels.length) return null;
+                const panel = panels[panels.length - 1];
+                const rows = [...panel.querySelectorAll('tbody tr')];
+                const match = rows.find(r => r.innerText.includes(needle));
+                if (!match) return null;
+                match.scrollIntoView();
+                const rect = match.getBoundingClientRect();
+                return {x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, text: match.innerText.slice(0, 150)};
+            }""",
+            [must_contain],
+        )
+        if not coords:
+            return False
+        await page.mouse.click(coords["x"], coords["y"])
+        await page.wait_for_timeout(2000)
+        logger.info("Selected %s row: %s", label, coords["text"].replace("\t", " | "))
+        return True
+
+    async def _select_item_code(self, item_code: str) -> bool:
+        """Type into the Details row's Item Code/Desc cell (a table cell input, NOT a labeled form
+        field like Customer/Salesperson/Project Site — _select_autocomplete_row's label-based click
+        doesn't apply here) and click the matching autocomplete row, same panel-locate pattern.
+
+        KNOWN GAP (2026-08-03): this reliably finds and fills the Item Code input when tested in
+        isolation on a blank quotation, but returns False (cell_input is null) in the real pipeline
+        after Customer/Salesperson/Project Site have already been selected — those selections likely
+        trigger a partial-page AJAX re-render of the Details grid that this hasn't been traced through
+        yet. Fails safely: the draft is still created with every other field correct, and this is
+        logged as a clear warning so a human knows to fill in the item code/qty/price/remarks by hand
+        before Submit. Worth a fresh investigation pass, but not currently a blocker for using the
+        pipeline (see docs/operational_expectations.md).
+        """
+        assert self.page is not None
+        page = self.page
+        cell_input = await page.evaluate(
+            """() => {
+                const grids = [...document.querySelectorAll('.ui-datatable')];
+                for (const g of grids) {
+                    const heads = [...g.querySelectorAll('th')].map(t => (t.innerText || '').trim());
+                    const idx = heads.findIndex(h => /item code/i.test(h));
+                    if (idx < 0) continue;
+                    const row = g.querySelector('[id$="_data"] tr');
+                    if (!row) continue;
+                    const cell = [...row.querySelectorAll('td')][idx];
+                    const input = cell ? cell.querySelector('input') : null;
+                    if (!input) continue;
+                    const r = input.getBoundingClientRect();
+                    return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+                }
+                return null;
+            }"""
+        )
+        if not cell_input:
+            return False
+        await page.mouse.click(cell_input["x"], cell_input["y"])
+        await page.wait_for_timeout(500)
+        await page.keyboard.type(item_code)
+        await page.wait_for_timeout(2200)
+
+        # The Details grid itself is a .ui-datatable and stays visible throughout, so it can wrongly
+        # be picked as "the last visible panel" — exclude it explicitly (identify it by containing the
+        # "No records found." placeholder or the grid's own known static header) and only consider
+        # panels whose rows actually contain the searched item_code as an autocomplete match.
+        coords = await page.evaluate(
+            """([needle]) => {
+                const panels = [...document.querySelectorAll('.ui-datatable, [id$="_panel"]')]
+                    .filter(p => p.offsetParent !== null)
+                    .filter(p => !p.querySelector('th')); // exclude grids with column headers (the Details table)
+                for (const panel of panels.reverse()) {
+                    const rows = [...panel.querySelectorAll('tbody tr')];
+                    const match = rows.find(r => r.innerText.includes(needle));
+                    if (match) {
+                        match.scrollIntoView();
+                        const rect = match.getBoundingClientRect();
+                        return {x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, text: match.innerText.slice(0, 150)};
+                    }
+                }
+                return null;
+            }""",
+            [item_code],
+        )
+        if not coords:
+            return False
+        await page.mouse.click(coords["x"], coords["y"])
+        await page.wait_for_timeout(2000)
+        logger.info("Selected Item Code row: %s", coords["text"].replace("\t", " | "))
+        return True
+
+    async def _add_line_item(self) -> bool:
+        """Click the Details grid's 'Add Row' button to insert a blank editable line, needed when
+        building a quotation from scratch (there is no pre-existing row to edit, unlike the old Copy
+        From flow). Confirmed live (2026-08-03) via the real DOM: the button carries a stable,
+        semantically-named class "add-row-button" (distinct from "Add Item from Contract SOR" and
+        "Download Import Template", which sit in the same toolbar and were mis-clicked by an earlier,
+        purely icon-shape-based guess at this selector).
+        """
+        assert self.page is not None
+        page = self.page
+        button = page.locator("button.add-row-button").first
+        if not await button.count():
+            return False
+        await button.click()
+        await page.wait_for_timeout(3000)
+        return True
+
+    async def _stage_b_create_quotation(self, payload: WOPayload) -> None:
+        """Create a draft Service Quotation FROM SCRATCH (no Copy From), fill every field, DON'T submit.
+
+        Replaces the earlier Copy From-based flow: Copy From only lists quotations still in Synergix
+        "New" status, which made it fail whenever no draft happened to exist for a given council (this
+        blocked EVERY SKTC WO — see project memory synergix-dedup-verified). Building from scratch has
+        no such dependency: it works identically for JBTC and SKTC.
+
+        Confirmed live (2026-08-01/03) that Customer, Salesperson, and Project Site are all live
+        autocomplete fields, and selecting Customer/Project Site each cascade several dependent fields
+        automatically (Customer -> Address/Contact/Currency/Sales Tax/SBU; Project Site -> Project
+        In-Charge/Portfolio). Leaves the draft filled and un-submitted for a human to review + Submit.
         """
         assert self.page is not None
         page = self.page
@@ -365,45 +540,47 @@ class SynergixDriver:
 
         await self._open_service_quotation_list()
 
-        # New draft, then Copy From the most recent quotation for this town council.
         await page.locator("button:has(span.fa-plus)").first.click()
         await page.wait_for_timeout(8000)
-        await page.get_by_role("button", name="Copy From").first.click()
-        await page.wait_for_timeout(7000)
 
-        cust_filter = page.locator("th:has-text('Customer') input.ui-column-filter").first
-        await cust_filter.click()
-        await cust_filter.fill(payload.town_council.strip())
-        await cust_filter.press("Enter")
-        await page.wait_for_timeout(6000)
+        # --- Customer (cascades Address/Contact/Currency/Sales Tax/SBU) ---
+        council = payload.town_council.strip() or "Town Council"
+        if not await self._select_autocomplete_row("Customer", council, council.upper()):
+            raise RuntimeError(f"no Customer match found in Synergix for {council!r}")
 
-        # The Copy From modal lists matching quotations newest-first; copy the top one.
-        top_link = page.locator(".ui-dialog:visible [id$='_data'] tr a, [id$='_data'] tr a").first
-        if not await top_link.count():
-            # KNOWN GAP as of 2026-08-01 (see project memory synergix-dedup-verified): the SKTC/
-            # Sengkang customer has no prior quotation to Copy From in this Synergix instance, so
-            # this fires on every SKTC WO, not just this one. Not a transient failure — needs a real
-            # Sengkang quotation created first (or the exact expected Customer name confirmed) before
-            # SKTC can go live. JBTC has a working template and is unaffected.
-            raise RuntimeError(
-                f"no Copy From template quotation found for customer {payload.town_council!r} — "
-                "if this is a Sengkang/SKTC WO, this is a KNOWN gap: no template quotation exists "
-                "for that customer in Synergix yet. Create one first, or confirm the exact Customer "
-                "name Synergix expects."
-            )
-        await top_link.click()
-        await page.wait_for_timeout(2500)
-        # Confirm the "override current data" dialog.
-        await page.get_by_role("button", name="Yes").first.click()
-        await page.wait_for_timeout(12000)
+        # --- Salesperson ---
+        # TODO(human): "TAN WEI YING" is the salesperson seen on every real quotation observed so
+        # far (both councils), suggesting it's a fixed default rather than per-WO — confirm with the
+        # client whether this should ever vary.
+        salesperson_ok = await self._select_autocomplete_row("Salesperson", "Tan Wei", "TAN WEI YING")
+        if not salesperson_ok:
+            logger.warning("Stage B: could not select a Salesperson for %s — leaving blank",
+                            payload.wo_po_number)
 
-        # Overwrite the WO-specific fields (label-anchored; ids are unstable).
+        # --- Project Site (cascades Project In-Charge/Portfolio) ---
+        if is_jbtc(payload.town_council):
+            search_term = _PROJECT_SITE_SEARCH_JBTC
+            match_fragment = resolve_project_code(payload.job_sheet_number)
+        else:
+            search_term = _PROJECT_SITE_SEARCH_SKTC
+            match_fragment = SKTC_PROJECT_SITE_MATCH
+        project_site_ok = await self._select_autocomplete_row("Project Site", search_term, match_fragment)
+        if not project_site_ok:
+            logger.warning(
+                "Stage B: no Project Site match for %s (searched %r, expected %r) — leaving blank, "
+                "human must set it before Submit", payload.wo_po_number, search_term, match_fragment)
+
+        # --- Subject + Reference No. ---
         await self._fill_labeled_input("Enquiry/Subject", self._subject(payload))
         await self._fill_labeled_input("Reference No.", payload.gl_number)
         logger.info("Stage B: filled Subject + Reference No. for %s", payload.wo_po_number)
 
-        # Line item: unit price + remarks live in the Details grid. Set them if present.
-        await self._fill_line_item(payload)
+        # --- Line item: add a row, then set Item Code/Qty/Unit Price/Remarks ---
+        if not await self._add_line_item():
+            logger.warning("Stage B: could not add a Details line item for %s — draft left without "
+                            "one, human must add it before Submit", payload.wo_po_number)
+        else:
+            await self._fill_line_item(payload)
         logger.info("Stage B: draft filled for %s", payload.wo_po_number)
 
     async def _submit_quotation(self, payload: WOPayload) -> str | None:
@@ -436,20 +613,33 @@ class SynergixDriver:
         assert self.page is not None
         try:
             text = await self.page.locator("text=/QUO[0-9]+/").first.inner_text()
-            import re
             m = re.search(r"QUO\d+", text)
             return m.group(0) if m else None
         except Exception:
             return None
 
     async def _fill_line_item(self, payload: WOPayload) -> None:
-        """Set the line Unit Price and Remarks in the Details grid (best-effort, logged if absent)."""
+        """Fill the freshly-added Details row: Item Code (autocomplete), Qty, Unit Price, Remarks.
+
+        Unlike the old Copy From flow (where the copied row already had Item Code/Type/Qty from the
+        template, and only Unit Price/Remarks needed overwriting), a from-scratch row starts fully
+        blank — Item Code must be looked up via its own autocomplete (see _select_item_code; it's a
+        table-cell input, not a labeled form field, so the generic _select_autocomplete_row doesn't
+        apply) before Unit Price/Remarks can be set.
+        """
         assert self.page is not None
         remarks = build_remarks(payload)
+
+        item_ok = await self._select_item_code(ITEM_CODE)
+        if not item_ok:
+            logger.warning("Stage B: could not select Item Code %s for %s — leaving row's item blank",
+                            ITEM_CODE, payload.wo_po_number)
+
         try:
-            # The Details grid has a "Remarks" column cell (editable) and a Unit Price input.
+            # Unit Price + Remarks: inputs in the details row whose column headers say so. Qty is set
+            # explicitly too — a from-scratch row does not inherit "1.00" from any template.
             filled = await self.page.evaluate(
-                """([price, remarks]) => {
+                """([price, remarks, qty]) => {
                     const setVal = (el, v) => {
                       if (!el) return false;
                       el.focus(); el.value = v;
@@ -457,26 +647,27 @@ class SynergixDriver:
                       el.dispatchEvent(new Event('change', {bubbles:true}));
                       return true;
                     };
-                    // Unit Price: an input in the details row whose column header is 'Unit Price'
-                    let priceOk = false, remarkOk = false;
+                    let priceOk = false, remarkOk = false, qtyOk = false;
                     const grids = [...document.querySelectorAll('.ui-datatable')];
                     for (const g of grids) {
                       const heads = [...g.querySelectorAll('th')].map(t => (t.innerText||'').trim());
                       const pIdx = heads.findIndex(h => /unit price/i.test(h));
                       const rIdx = heads.findIndex(h => /remarks/i.test(h));
+                      const qIdx = heads.findIndex(h => /^qty/i.test(h));
                       const row = g.querySelector('[id$="_data"] tr');
                       if (!row) continue;
                       const cells = [...row.querySelectorAll('td')];
                       if (pIdx >= 0 && cells[pIdx]) priceOk = setVal(cells[pIdx].querySelector('input'), price) || priceOk;
                       if (rIdx >= 0 && cells[rIdx]) remarkOk = setVal(cells[rIdx].querySelector('input,textarea'), remarks) || remarkOk;
+                      if (qIdx >= 0 && cells[qIdx]) qtyOk = setVal(cells[qIdx].querySelector('input'), qty) || qtyOk;
                     }
-                    return {priceOk, remarkOk};
+                    return {priceOk, remarkOk, qtyOk};
                 }""",
-                [f"{payload.unit_price:.2f}", remarks],
+                [f"{payload.unit_price:.2f}", remarks, f"{payload.quantity:.2f}"],
             )
             logger.info("Stage B line item for %s: %s", payload.wo_po_number, filled)
         except Exception as exc:
-            logger.warning("Stage B: could not set line item for %s: %s — leaving template values",
+            logger.warning("Stage B: could not set line item for %s: %s — leaving row partially filled",
                            payload.wo_po_number, exc)
 
     # ------------------------------------------------------------------ recovery helpers
