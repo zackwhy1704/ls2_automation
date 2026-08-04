@@ -133,7 +133,8 @@ Search the codebase for `TODO(human)` — every real-world unknown is marked the
 - **MFA / IP whitelist** for the TCMS service account ([src/tcms_scraper.py](src/tcms_scraper.py)).
 - **Synergix duplicate-search screen** and that `WO-PO` is the correct search key
   ([src/synergix_driver.py](src/synergix_driver.py)).
-- **`SYNERGIX_TEMPLATE_QUO_ID`** — the stable template quotation to "Copy From" (set in `.env`).
+- **SKTC's real Synergix project code** — currently defaults to "Pest control" (`2000073`); confirm
+  whether any SKTC WOs should map elsewhere ([src/synergix_driver.py](src/synergix_driver.py)).
 - **All DOM selectors** ([config/selectors.py](config/selectors.py)).
 
 Before relying on this for live billing, also read

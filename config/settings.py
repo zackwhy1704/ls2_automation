@@ -87,7 +87,6 @@ class Settings(BaseSettings):
     SYNERGIX_BASE_URL: str = ""
     SYNERGIX_USERNAME: str = ""
     SYNERGIX_PASSWORD: str = ""
-    SYNERGIX_TEMPLATE_QUO_ID: str = ""
     # Which WO field to search Synergix on when checking "already invoiced?". The JBTC un-invoiced
     # list is maintained by hand and can be stale, so this check is what actually prevents double
     # billing. "wo_po" | "job_sheet" — confirm against the real Synergix records.
@@ -222,7 +221,6 @@ TCMS_PASSWORD = settings.TCMS_PASSWORD
 SYNERGIX_BASE_URL = settings.SYNERGIX_BASE_URL
 SYNERGIX_USERNAME = settings.SYNERGIX_USERNAME
 SYNERGIX_PASSWORD = settings.SYNERGIX_PASSWORD
-SYNERGIX_TEMPLATE_QUO_ID = settings.SYNERGIX_TEMPLATE_QUO_ID
 SYNERGIX_DEDUP_KEY = settings.SYNERGIX_DEDUP_KEY
 SYNERGIX_HEADLESS = settings.SYNERGIX_HEADLESS
 SYNERGIX_RELOGIN_EVERY = settings.SYNERGIX_RELOGIN_EVERY

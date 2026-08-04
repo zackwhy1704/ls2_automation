@@ -37,8 +37,7 @@ Edit `C:\ls2_automation\.env`. Checklist of what's required for a real (non-stub
 | `ANTHROPIC_API_KEY` | Claude API key, for WO field extraction |
 | `TCMS_BASE_URL`, `TCMS_USERNAME`, `TCMS_PASSWORD` | JBTC TCMS portal service account login |
 | `SYNERGIX_BASE_URL`, `SYNERGIX_USERNAME`, `SYNERGIX_PASSWORD` | Synergix ERP login |
-| `SYNERGIX_TEMPLATE_QUO_ID` | Stable template quotation to "Copy From" (confirm with client) |
-| `IMAP_HOST`, `IMAP_USERNAME`, `IMAP_PASSWORD` | SKTC intake mailbox (app password, not main password) |
+| `IMAP_HOST`, `IMAP_USERNAME`, `IMAP_PASSWORD` | SKTC intake mailbox (app password, not main password — plain-password Basic Auth is often blocked, see docs/automation_context.md) |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Batch summary + crash alerts destination |
 | `DRY_RUN` | **Leave `true` until you've watched several real runs.** Set `false` only when confident. |
 | `HEADLESS`, `SYNERGIX_HEADLESS` | Set `true` for unattended scheduled runs |
