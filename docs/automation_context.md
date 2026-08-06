@@ -42,6 +42,13 @@ working session.
 - **Multi-line-item WOs** (a single WO with several distinct billable line items) are not fully
   modeled — only the first line's figures get captured. Doesn't cause a wrong bill (the money
   cross-check flags it and routes to NEEDS_REVIEW), but needs a human to fill in the rest.
+- **SKTC IMAP is blocked** — Basic Auth (plain username/password) for IMAP is disabled tenant-wide on
+  LS2's Microsoft 365 tenant (Microsoft's default posture since Oct 2022), and there's no admin
+  available to enable app passwords or set up OAuth2. Confirmed by a live login test, not assumed. As
+  a bridge, `SKTC_INTAKE_MODE=folder` (`src/sktc_folder_intake.py`) reads WO PDFs from a Power
+  Automate-populated, OneDrive-synced folder instead — see
+  `docs/power_automate_sktc_setup.md`. `SKTC_INTAKE_MODE=imap` remains fully functional and is a
+  one-line flip back if IMAP access is ever sorted out.
 
 ## Hard-won debugging lessons (so you don't repeat these)
 
@@ -66,5 +73,6 @@ working session.
 
 - `docs/operational_expectations.md` — client-facing summary of what breaks and how you'll find out.
 - `docs/synergix_workflow.md` — the authoritative manual workflow this automates.
+- `docs/power_automate_sktc_setup.md` — how to set up SKTC's folder-based email intake bridge.
 - `deploy/windows/README.md` — how to actually install and schedule this on a Windows machine.
 - Git log / commit messages — every non-obvious fix has a detailed "why," not just "what changed."

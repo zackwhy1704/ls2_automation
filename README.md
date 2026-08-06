@@ -21,7 +21,9 @@ spot-check in Synergix. An older Telegram inline-button approval flow also exist
 (`python -m src.main` without `--batch`) but `--batch` is what actually runs in production.
 
 For deploying this to run unattended on a Windows machine, see
-[deploy/windows/README.md](deploy/windows/README.md).
+[deploy/windows/README.md](deploy/windows/README.md). SKTC email intake normally uses IMAP, but if
+that's blocked (as it currently is on LS2's tenant), see
+[docs/power_automate_sktc_setup.md](docs/power_automate_sktc_setup.md) for the folder-based alternative.
 
 ---
 

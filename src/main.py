@@ -277,17 +277,35 @@ async def run_batch(source: str | None, *, poll: bool = False, limit: int | None
     auto-submitted (gated by DRY_RUN); the outcome of every WO is reported (Telegram/email) for the
     team to spot-check in Synergix.
     """
-    from src.batch import run_batch_from_emails, run_batch_from_tcms
+    from src.batch import WOOutcome, run_batch_from_emails, run_batch_from_tcms
+    from src.models import WOStatus
     from src import report as report_mod
 
     settings.configure_logging()
     logger.info("Batch pipeline — %s%s", settings.summary(), f" (limit={limit})" if limit else "")
     await db.init_db()
 
+    intake_review: list = []
     if poll and not source:
-        from src import mail_poller
-        if mail_poller.imap_configured():
-            await asyncio.to_thread(mail_poller.poll_once)
+        if settings.SKTC_INTAKE_MODE == "folder":
+            from src.sktc_folder_intake import poll_folder_once
+            try:
+                _pdfs, review_items = await asyncio.to_thread(poll_folder_once)
+            except Exception as exc:
+                # Loud, not swallowed: an unreachable/misconfigured intake folder must not look like
+                # "ran fine, found 0 WOs" — see sktc_folder_intake.poll_folder_once's docstring.
+                logger.exception("SKTC folder intake failed")
+                intake_review.append(
+                    WOOutcome("SKTC-INTAKE", WOStatus.FAILED, f"folder intake failed: {exc}")
+                )
+            else:
+                intake_review.extend(
+                    WOOutcome(item.identifier, WOStatus.INVALID, item.reason) for item in review_items
+                )
+        else:
+            from src import mail_poller
+            if mail_poller.imap_configured():
+                await asyncio.to_thread(mail_poller.poll_once)
         source = str(settings.INCOMING_EMAIL_DIR)
 
     if source:
@@ -296,6 +314,8 @@ async def run_batch(source: str | None, *, poll: bool = False, limit: int | None
     else:
         logger.info("Batch: scraping + processing un-invoiced WOs from TCMS (streaming)")
         result = await run_batch_from_tcms(limit=limit)
+
+    result.outcomes[:0] = intake_review  # surface orphans/unverified senders in the same report
 
     await report_mod.send_report(result)
     logger.info("Batch complete: %d WO(s) processed", len(result.outcomes))

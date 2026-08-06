@@ -64,6 +64,19 @@ class Settings(BaseSettings):
     # If true, mark fetched messages \Seen so they aren't pulled again. If false, dedup is by Message-ID.
     IMAP_MARK_SEEN: bool = True
 
+    # --- SKTC folder intake (Power Automate -> synced folder, alternative to IMAP) ---
+    # IMAP Basic Auth is blocked on LS2's M365 tenant with no admin available to re-enable it. Until
+    # that's resolved, a Power Automate flow drops WO PDFs (+ a sidecar JSON per email, for sender
+    # verification) into a OneDrive/SharePoint folder synced locally. "folder" and "imap" are both
+    # always available; this only selects which one `run_batch(..., poll=True)` uses.
+    SKTC_INTAKE_MODE: str = "imap"       # "folder" | "imap"
+    SKTC_INTAKE_FOLDER: str = ""         # local synced path, e.g. "C:\Users\<user>\OneDrive - LS2\SKTC-WO-Intake"
+    SKTC_INTAKE_PROCESSED_SUBFOLDER: str = "processed"
+    SKTC_INTAKE_SIDECAR_WAIT_SECONDS: int = 30
+    # Comma-separated sender addresses/substrings this adapter trusts, independent of whatever Power
+    # Automate's own trigger filter is configured to do — see docs/power_automate_sktc_setup.md.
+    SKTC_SENDER_ALLOWLIST: str = ""
+
     # --- Batch report ---
     # After each batch run, a summary of every WO outcome is sent so the team can spot-check and fix
     # in Synergix. Channel: "telegram" (default), "email", or "both". The report always prints + logs.
@@ -204,6 +217,12 @@ IMAP_MAILBOX = settings.IMAP_MAILBOX
 IMAP_FROM_FILTER = settings.IMAP_FROM_FILTER
 IMAP_SUBJECT_FILTER = settings.IMAP_SUBJECT_FILTER
 IMAP_MARK_SEEN = settings.IMAP_MARK_SEEN
+
+SKTC_INTAKE_MODE = settings.SKTC_INTAKE_MODE
+SKTC_INTAKE_FOLDER = settings.SKTC_INTAKE_FOLDER
+SKTC_INTAKE_PROCESSED_SUBFOLDER = settings.SKTC_INTAKE_PROCESSED_SUBFOLDER
+SKTC_INTAKE_SIDECAR_WAIT_SECONDS = settings.SKTC_INTAKE_SIDECAR_WAIT_SECONDS
+SKTC_SENDER_ALLOWLIST = settings.SKTC_SENDER_ALLOWLIST
 
 REPORT_CHANNEL = settings.REPORT_CHANNEL
 SMTP_HOST = settings.SMTP_HOST
