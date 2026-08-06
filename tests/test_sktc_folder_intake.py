@@ -175,7 +175,7 @@ def test_missing_folder_config_raises(_isolate, monkeypatch):
         intake.poll_folder_once()
 
 
-def test_empty_allowlist_fails_open_with_warning(_isolate, monkeypatch, caplog):
+def test_empty_allowlist_fails_closed_with_warning(_isolate, monkeypatch, caplog):
     folder, incoming = _isolate
     monkeypatch.setattr(settings, "SKTC_SENDER_ALLOWLIST", "")
     _write_pdf(folder, "000059174.pdf")
@@ -185,5 +185,7 @@ def test_empty_allowlist_fails_open_with_warning(_isolate, monkeypatch, caplog):
     with caplog.at_level("WARNING"):
         saved, review = intake.poll_folder_once()
 
-    assert len(saved) == 1  # fails open, not closed, when unconfigured
+    assert len(saved) == 0  # fails closed when unconfigured — never silently trusts every sender
+    assert len(review) == 1
+    assert "SKTC_SENDER_ALLOWLIST" in review[0].reason
     assert any("SKTC_SENDER_ALLOWLIST is empty" in r.message for r in caplog.records)

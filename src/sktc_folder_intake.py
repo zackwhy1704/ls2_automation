@@ -87,11 +87,12 @@ def _is_stable(path: Path) -> bool:
 def _sender_allowed(sender: str) -> bool:
     allowlist = [s.strip().lower() for s in settings.SKTC_SENDER_ALLOWLIST.split(",") if s.strip()]
     if not allowlist:
-        # No allowlist configured: fail open with a loud warning rather than block everything, since
-        # an empty allowlist is very likely a not-yet-configured deployment, not an intentional
-        # "trust nobody" policy. Configure SKTC_SENDER_ALLOWLIST before relying on this in production.
-        logger.warning("SKTC_SENDER_ALLOWLIST is empty — sender verification is NOT active")
-        return True
+        # No allowlist configured: fail CLOSED. This is the sole guard against Power Automate's own
+        # sender filter being loosened (or misconfigured) without anyone here noticing — an empty
+        # allowlist must route everything to review, not silently trust every sender, or a forgotten
+        # .env line before go-live would defeat the whole point of the sidecar re-check.
+        logger.warning("SKTC_SENDER_ALLOWLIST is empty — routing all senders to review until it is set")
+        return False
     sender_l = (sender or "").strip().lower()
     return any(allowed in sender_l for allowed in allowlist)
 
