@@ -443,8 +443,16 @@ class SynergixDriver:
         rows (NOT a modal). Confirmed live (2026-08-01/03) that clicking via generic text-locator
         matching is unreliable — with many near-identical rows, Playwright's own visibility check on
         the matched text node intermittently reports it as hidden even though it's visibly on screen.
-        The robust approach: find the visible panel via JS, then click by the ROW's own computed
-        on-screen coordinates rather than asking Playwright to re-resolve a text locator.
+
+        The row is located via JS (by text match within the visible panel), then clicked through a
+        real Playwright Locator built from a marker attribute stamped onto that exact element — NOT
+        raw `page.mouse.click(x, y)` at its computed bounding-box coordinates. Confirmed live
+        (2026-08-14) that coordinate clicks in this app can silently land on an unrelated overlapping
+        element (`document.elementFromPoint()` at the computed point returned a different container
+        entirely) with no error and no visible symptom besides the selection never taking — the exact
+        bug that left the Details grid empty on 151 production quotations; see _grid_cell_locator's
+        docstring for the full story. A stamped-attribute Locator gets Playwright's own actionability
+        checks (auto-scroll, and a real thrown error if something intercepts the click).
         """
         assert self.page is not None
         page = self.page
@@ -464,27 +472,57 @@ class SynergixDriver:
         await page.keyboard.type(search_text)
         await page.wait_for_timeout(2200)  # ajax panel populate
 
-        coords = await page.evaluate(
-            """([needle]) => {
-                const panels = [...document.querySelectorAll('.ui-datatable, [id$="_panel"]')]
-                    .filter(p => p.offsetParent !== null);
-                if (!panels.length) return null;
-                const panel = panels[panels.length - 1];
-                const rows = [...panel.querySelectorAll('tbody tr')];
-                const match = rows.find(r => r.innerText.includes(needle));
-                if (!match) return null;
-                match.scrollIntoView();
-                const rect = match.getBoundingClientRect();
-                return {x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, text: match.innerText.slice(0, 150)};
-            }""",
-            [must_contain],
-        )
-        if not coords:
+        match_text = await self._click_panel_row_by_text(must_contain)
+        if not match_text:
             return False
-        await page.mouse.click(coords["x"], coords["y"])
         await page.wait_for_timeout(2000)
-        logger.info("Selected %s row: %s", label, coords["text"].replace("\t", " | "))
+        logger.info("Selected %s row: %s", label, match_text.replace("\t", " | "))
         return True
+
+    async def _click_panel_row_by_text(self, needle: str, *, exclude_grids_with_headers: bool = False) -> str | None:
+        """Find a visible autocomplete-panel row containing `needle` and click it, returning its
+        text (or None if no match). Clicks via a real Playwright Locator built from a marker
+        attribute stamped onto the matched row — NOT raw `page.mouse.click(x, y)` at its computed
+        bounding-box coordinates. Confirmed live (2026-08-14) that coordinate clicks in this app can
+        silently land on an unrelated overlapping element (`document.elementFromPoint()` at the
+        computed point returned a different container entirely) with no error and no visible symptom
+        besides the selection never taking — the exact bug that left the Details grid empty on 151
+        production quotations; see _grid_cell_locator's docstring for the full story.
+        """
+        assert self.page is not None
+        page = self.page
+        marker = "data-claude-panel-target"
+        match_text = await page.evaluate(
+            """([needle, marker, excludeHeaders]) => {
+                let panels = [...document.querySelectorAll('.ui-datatable, [id$="_panel"]')]
+                    .filter(p => p.offsetParent !== null);
+                if (excludeHeaders) panels = panels.filter(p => !p.querySelector('th'));
+                for (const panel of panels.slice().reverse()) {
+                    const rows = [...panel.querySelectorAll('tbody tr')];
+                    const match = rows.find(r => r.innerText.includes(needle));
+                    if (match) {
+                        match.setAttribute(marker, '1');
+                        match.scrollIntoView();
+                        return match.innerText.slice(0, 150);
+                    }
+                }
+                return null;
+            }""",
+            [needle, marker, exclude_grids_with_headers],
+        )
+        if not match_text:
+            return None
+        row = page.locator(f'[{marker}="1"]')
+        try:
+            await row.click(timeout=10000)
+        except Exception as exc:
+            logger.warning("Could not click matched panel row for %r: %s", needle, exc)
+            return None
+        finally:
+            await page.evaluate(
+                "(m) => document.querySelectorAll(`[${m}]`).forEach(e => e.removeAttribute(m))", marker
+            )
+        return match_text
 
     async def _grid_cell_locator(self, row_index: int, header_regex: str):
         """Locator for a Details-grid cell's input, found by (row_index, column header).
@@ -536,6 +574,15 @@ class SynergixDriver:
 
         `row_index` selects which Details row to fill when the WO has more than one line item — each
         "Add Row" click appends a new row, so index 0 is the first-added row, 1 the second, etc.
+
+        This cell is a PrimeFaces `<p:autoComplete>` (`role="application"`), not a plain input —
+        confirmed live (2026-08-14) that it swallows real keyboard events entirely: neither
+        `page.keyboard.type()` nor a real keypress after `insertText()` ever changed its value, with
+        no error and no visible symptom (the same silent-failure shape as the Details-grid bug).
+        `insertText()` alone DOES set the value (it bypasses key events) but never triggers the
+        widget's own search, since that's bound to keyup, not input. The fix: set the value via
+        `insertText()`, then trigger the search directly through PrimeFaces' own client-side widget
+        API (`widget.search(value)`) instead of trying to simulate the right keyboard event.
         """
         assert self.page is not None
         page = self.page
@@ -543,37 +590,38 @@ class SynergixDriver:
         if not cell:
             return False
         await cell.click(timeout=10000)
-        await page.wait_for_timeout(500)
-        await page.keyboard.type(item_code)
+        await page.wait_for_timeout(300)
+        await page.keyboard.insert_text(item_code)
+
+        searched = await cell.evaluate(
+            """(input, value) => {
+                const span = input.closest('.ui-autocomplete');
+                let widget = null;
+                if (window.PrimeFaces && window.PrimeFaces.widgets) {
+                    for (const key in window.PrimeFaces.widgets) {
+                        const w = window.PrimeFaces.widgets[key];
+                        if (w && w.jq && w.jq[0] === span) { widget = w; break; }
+                    }
+                }
+                if (!widget || typeof widget.search !== 'function') return false;
+                widget.search(value);
+                return true;
+            }""",
+            item_code,
+        )
+        if not searched:
+            logger.warning("Could not find the Item Code autoComplete widget instance for row %d", row_index)
+            return False
         await page.wait_for_timeout(2200)
 
         # The Details grid itself is a .ui-datatable and stays visible throughout, so it can wrongly
-        # be picked as "the last visible panel" — exclude it explicitly (identify it by containing the
-        # "No records found." placeholder or the grid's own known static header) and only consider
-        # panels whose rows actually contain the searched item_code as an autocomplete match.
-        coords = await page.evaluate(
-            """([needle]) => {
-                const panels = [...document.querySelectorAll('.ui-datatable, [id$="_panel"]')]
-                    .filter(p => p.offsetParent !== null)
-                    .filter(p => !p.querySelector('th')); // exclude grids with column headers (the Details table)
-                for (const panel of panels.reverse()) {
-                    const rows = [...panel.querySelectorAll('tbody tr')];
-                    const match = rows.find(r => r.innerText.includes(needle));
-                    if (match) {
-                        match.scrollIntoView();
-                        const rect = match.getBoundingClientRect();
-                        return {x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, text: match.innerText.slice(0, 150)};
-                    }
-                }
-                return null;
-            }""",
-            [item_code],
-        )
-        if not coords:
+        # be picked as "the last visible panel" — exclude it explicitly (it's the only candidate with
+        # column headers) and only consider panels whose rows actually contain item_code as a match.
+        match_text = await self._click_panel_row_by_text(item_code, exclude_grids_with_headers=True)
+        if not match_text:
             return False
-        await page.mouse.click(coords["x"], coords["y"])
         await page.wait_for_timeout(2000)
-        logger.info("Selected Item Code row: %s", coords["text"].replace("\t", " | "))
+        logger.info("Selected Item Code row: %s", match_text.replace("\t", " | "))
         return True
 
     async def _add_line_item(self) -> bool:
