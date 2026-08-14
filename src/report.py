@@ -45,6 +45,26 @@ def _counts(result: BatchResult) -> str:
     return ", ".join(parts) or "no WOs processed"
 
 
+def _quotation_summary(result: BatchResult) -> tuple[int, int, float | None]:
+    """(quotations generated, non-duplicate WOs attempted, success rate %).
+
+    "Generated" counts both PROCESSED (submitted) and PARTIAL (DRY_RUN draft) — either way a real
+    quotation now exists in Synergix for that WO. The rate is against non-duplicate WOs only: a
+    DUPLICATE is a correct skip, not an attempt, so it shouldn't drag the rate down.
+    """
+    generated = len(result.by_status(WOStatus.PROCESSED)) + len(result.by_status(WOStatus.PARTIAL))
+    attempted = len(result.outcomes) - len(result.by_status(WOStatus.DUPLICATE))
+    rate = (generated / attempted * 100) if attempted else None
+    return generated, attempted, rate
+
+
+def _quotation_summary_line(result: BatchResult) -> str:
+    generated, attempted, rate = _quotation_summary(result)
+    if attempted == 0:
+        return "Quotations generated: 0 (no non-duplicate WOs to process)"
+    return f"Quotations generated: {generated}/{attempted} non-duplicate WO(s) — {rate:.0f}% success rate"
+
+
 def build_subject(result: BatchResult) -> str:
     n = len(result.outcomes)
     submitted = len(result.by_status(WOStatus.PROCESSED))
@@ -57,7 +77,8 @@ def build_subject(result: BatchResult) -> str:
 
 def build_text(result: BatchResult) -> str:
     lines = ["LS2 Adhoc Pest Control — Billing Run Report", "=" * 44, "",
-             _mode_line(), f"Totals: {_counts(result)}", ""]
+             _mode_line(), f"Totals: {_counts(result)}",
+             _quotation_summary_line(result), ""]
     for status, title in _SECTIONS:
         items = result.by_status(status)
         if not items:
@@ -74,7 +95,8 @@ def build_text(result: BatchResult) -> str:
 
 def build_html(result: BatchResult) -> str:
     rows = [f"<p style='font-family:sans-serif'><b>{escape(_mode_line())}</b><br>"
-            f"<span style='color:#555'>Totals: {escape(_counts(result))}</span></p>"]
+            f"<span style='color:#555'>Totals: {escape(_counts(result))}</span><br>"
+            f"<span style='color:#555'>{escape(_quotation_summary_line(result))}</span></p>"]
     for status, title in _SECTIONS:
         items = result.by_status(status)
         if not items:
