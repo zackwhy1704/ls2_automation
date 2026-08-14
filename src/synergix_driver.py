@@ -325,6 +325,7 @@ class SynergixDriver:
         try:
             await self.login()
             await self._stage_b_create_quotation(payload)
+            await self._assert_details_filled(payload)
             quo_id = await self._submit_quotation(payload)
             # Schedule Board (C) and Fulfil (D) remain manual — done by the team in Synergix.
             if settings.DRY_RUN:
@@ -380,6 +381,57 @@ class SynergixDriver:
         await element.click()
         await element.fill(value)
 
+    async def _select_dropdown_option(self, label: str, option_text: str) -> bool:
+        """Select an option from a plain PrimeFaces `ui-selectonemenu` dropdown by its label.
+
+        Unlike Customer/Salesperson/Project Site (live-search autocompletes — _select_autocomplete_row)
+        this is a closed, fixed-option dropdown (role=combobox, aria-haspopup=listbox): click the
+        trigger to open its panel, then click the matching `<li>` by text.
+        """
+        assert self.page is not None
+        page = self.page
+        trigger_id = await page.evaluate(
+            """(label) => {
+                const norm = s => (s||'').replace(/\\s+/g,' ').trim();
+                const host = [...document.querySelectorAll('td,div,span,label')]
+                  .find(e => e.children.length === 0 && norm(e.textContent) === label);
+                if (!host) return null;
+                const tr = host.closest('tr');
+                const trigger = tr ? tr.querySelector('.ui-selectonemenu') : null;
+                return trigger ? trigger.id : null;
+            }""",
+            label,
+        )
+        if not trigger_id:
+            return False
+        try:
+            await page.locator(f'[id="{trigger_id}"]').click(timeout=10000)
+        except Exception:
+            return False
+        await page.wait_for_timeout(500)
+
+        option_coords = await page.evaluate(
+            """([needle]) => {
+                const panels = [...document.querySelectorAll('[id$="_panel"]')]
+                    .filter(p => p.offsetParent !== null);
+                for (const panel of panels.reverse()) {
+                    const items = [...panel.querySelectorAll('li')];
+                    const match = items.find(li => li.textContent.trim() === needle);
+                    if (match) {
+                        const r = match.getBoundingClientRect();
+                        return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+                    }
+                }
+                return null;
+            }""",
+            [option_text],
+        )
+        if not option_coords:
+            return False
+        await page.mouse.click(option_coords["x"], option_coords["y"])
+        await page.wait_for_timeout(500)
+        return True
+
     async def _select_autocomplete_row(
         self, label: str, search_text: str, must_contain: str, *, timeout_ms: int = 8000
     ) -> bool:
@@ -434,6 +486,49 @@ class SynergixDriver:
         logger.info("Selected %s row: %s", label, coords["text"].replace("\t", " | "))
         return True
 
+    async def _grid_cell_locator(self, row_index: int, header_regex: str):
+        """Locator for a Details-grid cell's input, found by (row_index, column header).
+
+        Returns a Playwright Locator built from the input's own `id` attribute — NOT raw pixel
+        coordinates. Confirmed live (2026-08-14) that `getBoundingClientRect()`-based coordinates for
+        this grid do not correspond to the actual clickable point: `document.elementFromPoint()` at
+        those exact coordinates returned an unrelated `.ui-tabs-panel` container, not the input. A
+        `page.mouse.click(x, y)` at such coordinates clicks whatever is really there — silently, no
+        error — which is why every previous fill attempt (both synthetic-event and real-keyboard
+        typing) "succeeded" with no exception while the value never moved. This is the same class of
+        bug the JBTC/TCMS row-selection fix hit earlier: trust Playwright's own actionability-checked
+        `.click()`, which auto-scrolls into view and raises a clear error if something intercepts the
+        pointer, instead of computing a screen point ourselves.
+
+        Retries briefly (up to ~3s): the grid can momentarily have zero matching `.ui-datatable`
+        elements right after Customer/Salesperson/Project Site's AJAX cascades or an "Add Row" click.
+        """
+        assert self.page is not None
+        page = self.page
+        js = """([rowIndex, headerRegex]) => {
+            const re = new RegExp(headerRegex, 'i');
+            const grids = [...document.querySelectorAll('.ui-datatable')];
+            for (const g of grids) {
+                const heads = [...g.querySelectorAll('th')].map(t => (t.innerText || '').trim());
+                const idx = heads.findIndex(h => re.test(h));
+                if (idx < 0) continue;
+                const rows = [...g.querySelectorAll('[id$="_data"] tr')];
+                const row = rows[rowIndex];
+                if (!row) continue;
+                const cell = [...row.querySelectorAll('td')][idx];
+                const input = cell ? cell.querySelector('input,textarea') : null;
+                if (!input || !input.id) continue;
+                return input.id;
+            }
+            return null;
+        }"""
+        for _ in range(6):
+            input_id = await page.evaluate(js, [row_index, header_regex])
+            if input_id:
+                return page.locator(f'[id="{input_id}"]')
+            await page.wait_for_timeout(500)
+        return None
+
     async def _select_item_code(self, item_code: str, row_index: int = 0) -> bool:
         """Type into the Details row's Item Code/Desc cell (a table cell input, NOT a labeled form
         field like Customer/Salesperson/Project Site — _select_autocomplete_row's label-based click
@@ -441,41 +536,13 @@ class SynergixDriver:
 
         `row_index` selects which Details row to fill when the WO has more than one line item — each
         "Add Row" click appends a new row, so index 0 is the first-added row, 1 the second, etc.
-
-        KNOWN GAP (2026-08-03): this reliably finds and fills the Item Code input when tested in
-        isolation on a blank quotation, but returns False (cell_input is null) in the real pipeline
-        after Customer/Salesperson/Project Site have already been selected — those selections likely
-        trigger a partial-page AJAX re-render of the Details grid that this hasn't been traced through
-        yet. Fails safely: the draft is still created with every other field correct, and this is
-        logged as a clear warning so a human knows to fill in the item code/qty/price/remarks by hand
-        before Submit. Worth a fresh investigation pass, but not currently a blocker for using the
-        pipeline (see docs/operational_expectations.md).
         """
         assert self.page is not None
         page = self.page
-        cell_input = await page.evaluate(
-            """([rowIndex]) => {
-                const grids = [...document.querySelectorAll('.ui-datatable')];
-                for (const g of grids) {
-                    const heads = [...g.querySelectorAll('th')].map(t => (t.innerText || '').trim());
-                    const idx = heads.findIndex(h => /item code/i.test(h));
-                    if (idx < 0) continue;
-                    const rows = [...g.querySelectorAll('[id$="_data"] tr')];
-                    const row = rows[rowIndex];
-                    if (!row) continue;
-                    const cell = [...row.querySelectorAll('td')][idx];
-                    const input = cell ? cell.querySelector('input') : null;
-                    if (!input) continue;
-                    const r = input.getBoundingClientRect();
-                    return {x: r.x + r.width / 2, y: r.y + r.height / 2};
-                }
-                return null;
-            }""",
-            [row_index],
-        )
-        if not cell_input:
+        cell = await self._grid_cell_locator(row_index, "item code")
+        if not cell:
             return False
-        await page.mouse.click(cell_input["x"], cell_input["y"])
+        await cell.click(timeout=10000)
         await page.wait_for_timeout(500)
         await page.keyboard.type(item_code)
         await page.wait_for_timeout(2200)
@@ -580,6 +647,11 @@ class SynergixDriver:
         await self._fill_labeled_input("Reference No.", payload.gl_number)
         logger.info("Stage B: filled Subject + Reference No. for %s", payload.wo_po_number)
 
+        # --- Payment Method (SOP requires Cheque; left at the "Sel" placeholder otherwise) ---
+        if not await self._select_dropdown_option("Payment Method", "Cheque"):
+            logger.warning("Stage B: could not set Payment Method for %s — leaving as placeholder",
+                            payload.wo_po_number)
+
         # --- Line items: add one Details row per WO line item, then fill each ---
         # A WO with N "Job Sheet:" rows in its Description of Work table needs N Synergix rows, or
         # the quotation silently bills only the first line — see WOPayload.line_items's docstring.
@@ -597,6 +669,57 @@ class SynergixDriver:
         for i in range(added):
             await self._fill_line_item_row(i, line_items[i], remarks)
         logger.info("Stage B: draft filled for %s", payload.wo_po_number)
+
+    async def _assert_details_filled(self, payload: WOPayload) -> None:
+        """Raise if any Details row is missing Item Code/Qty/Unit Price/Remarks, or Total After Tax
+        is not positive. Called before Submit — never submit (or report success for) an incomplete
+        quotation just because no exception happened to fire while filling it.
+
+        Added 2026-08-14 after a full SOP compliance audit found that ALL 151 quotations from an
+        earlier production run had silently empty Details rows (Item Code/Qty/Unit Price/Remarks all
+        blank, Total 0.00) despite every fill step logging success — the fill mechanism reported
+        {priceOk: true, ...} while the value never actually committed. This assertion is the fail-safe
+        the audit itself recommended: catch that class of failure explicitly rather than trusting the
+        fill code's own optimistic return values.
+        """
+        assert self.page is not None
+        line_items = payload.effective_line_items
+        problems: list[str] = []
+        for i in range(len(line_items)):
+            row = await self._read_grid_row(i, ("item code", "^qty", "unit price", "remarks"))
+            if not (row.get("item code") or "").strip():
+                problems.append(f"row {i}: Item Code is blank")
+            if float(row.get("^qty") or 0) <= 0:
+                problems.append(f"row {i}: Qty is {row.get('^qty')!r}")
+            if float(row.get("unit price") or 0) <= 0:
+                problems.append(f"row {i}: Unit Price is {row.get('unit price')!r}")
+            if not (row.get("remarks") or "").strip():
+                problems.append(f"row {i}: Remarks is blank")
+
+        total_after_tax = await self.page.evaluate(
+            """() => {
+                const label = [...document.querySelectorAll('td,div,span')]
+                    .find(e => e.children.length === 0 && e.textContent.trim() === 'Total After Tax:');
+                if (!label) return null;
+                const row = label.closest('tr') || label.parentElement?.parentElement;
+                if (!row) return null;
+                const nums = [...row.querySelectorAll('td,div,span')]
+                    .map(e => e.textContent.trim())
+                    .filter(t => /^[\\d,]+\\.\\d{2}$/.test(t));
+                return nums.length ? nums[0] : null;
+            }"""
+        )
+        try:
+            if total_after_tax is None or float(total_after_tax.replace(",", "")) <= 0:
+                problems.append(f"Total After Tax is {total_after_tax!r}")
+        except ValueError:
+            problems.append(f"Total After Tax is unparseable: {total_after_tax!r}")
+
+        if problems:
+            raise RuntimeError(
+                f"Details grid incomplete for {payload.wo_po_number} — refusing to submit: "
+                + "; ".join(problems)
+            )
 
     async def _submit_quotation(self, payload: WOPayload) -> str | None:
         """Submit the filled draft (DRY_RUN-gated). Returns the quotation ID if it can be read.
@@ -644,6 +767,7 @@ class SynergixDriver:
         several (one per WO line item) — see _stage_b_create_quotation.
         """
         assert self.page is not None
+        page = self.page
         label = f"row {row_index}"
 
         item_ok = await self._select_item_code(ITEM_CODE, row_index)
@@ -651,42 +775,71 @@ class SynergixDriver:
             logger.warning("Stage B: could not select Item Code %s for %s — leaving %s's item blank",
                             ITEM_CODE, label, label)
 
-        try:
-            # Unit Price + Remarks: inputs in the details row whose column headers say so. Qty is set
-            # explicitly too — a from-scratch row does not inherit "1.00" from any template. Every
-            # row shares the same WO-level remarks (the WO itself, not any one line, is what's billed).
-            filled = await self.page.evaluate(
-                """([rowIndex, price, remarks, qty]) => {
-                    const setVal = (el, v) => {
-                      if (!el) return false;
-                      el.focus(); el.value = v;
-                      el.dispatchEvent(new Event('input', {bubbles:true}));
-                      el.dispatchEvent(new Event('change', {bubbles:true}));
-                      return true;
-                    };
-                    let priceOk = false, remarkOk = false, qtyOk = false;
-                    const grids = [...document.querySelectorAll('.ui-datatable')];
-                    for (const g of grids) {
-                      const heads = [...g.querySelectorAll('th')].map(t => (t.innerText||'').trim());
-                      const pIdx = heads.findIndex(h => /unit price/i.test(h));
-                      const rIdx = heads.findIndex(h => /remarks/i.test(h));
-                      const qIdx = heads.findIndex(h => /^qty/i.test(h));
-                      const rows = [...g.querySelectorAll('[id$="_data"] tr')];
-                      const row = rows[rowIndex];
-                      if (!row) continue;
-                      const cells = [...row.querySelectorAll('td')];
-                      if (pIdx >= 0 && cells[pIdx]) priceOk = setVal(cells[pIdx].querySelector('input'), price) || priceOk;
-                      if (rIdx >= 0 && cells[rIdx]) remarkOk = setVal(cells[rIdx].querySelector('input,textarea'), remarks) || remarkOk;
-                      if (qIdx >= 0 && cells[qIdx]) qtyOk = setVal(cells[qIdx].querySelector('input'), qty) || qtyOk;
+        # Qty/Unit Price/Remarks: click each cell via Playwright's own actionability-checked
+        # `.click()` (see _grid_cell_locator's docstring for why NOT raw coordinates), then type via
+        # real keyboard input and Tab to commit. Verified + retried, not fire-and-forget: confirmed
+        # live (2026-08-14) that typing into one cell right after another can silently not stick
+        # (Tab likely kicks off a PrimeFaces AJAX recalculation — Total Amount depends on Qty * Unit
+        # Price — and moving to the next cell before it settles interrupts that cell's own commit).
+        for field_name, value, header_regex in (
+            ("Qty", f"{line_item.quantity:.2f}", r"^qty"),
+            ("Unit Price", f"{line_item.unit_price:.2f}", "unit price"),
+            ("Remarks", remarks, "remarks"),
+        ):
+            for attempt in range(3):
+                cell = await self._grid_cell_locator(row_index, header_regex)
+                if not cell:
+                    logger.warning("Stage B: could not locate the %s cell for %s", field_name, label)
+                    break
+                try:
+                    await cell.click(timeout=10000)
+                except Exception as exc:
+                    logger.warning("Stage B: could not click the %s cell for %s: %s", field_name, label, exc)
+                    break
+                await page.keyboard.press("Control+A")
+                await page.keyboard.type(value)
+                await page.keyboard.press("Tab")
+                await page.wait_for_timeout(1500)
+                if await cell.input_value() == value:
+                    break
+                logger.warning("Stage B: %s for %s did not stick (attempt %d) — retrying",
+                                field_name, label, attempt + 1)
+
+        # Verify what actually stuck (not just "an input existed to click") before trusting it.
+        actual = await self._read_grid_row(row_index, ("qty", "unit price", "remarks"))
+        logger.info("Stage B line item for %s: %s", label, actual)
+
+    async def _read_grid_row(self, row_index: int, header_regexes: tuple[str, ...]) -> dict:
+        """Read back the CURRENT input values of the given Details-grid row's named columns.
+
+        Used to confirm a fill actually committed, since dispatching input/change events on an input
+        can silently fail to persist (see _fill_line_item_row's docstring) — reading the live DOM
+        value after the fact is the only reliable signal.
+        """
+        assert self.page is not None
+        return await self.page.evaluate(
+            """([rowIndex, headerRegexes]) => {
+                const out = {};
+                const grids = [...document.querySelectorAll('.ui-datatable')];
+                for (const g of grids) {
+                    const heads = [...g.querySelectorAll('th')].map(t => (t.innerText || '').trim());
+                    if (!heads.some(h => /unit price/i.test(h))) continue;
+                    const rows = [...g.querySelectorAll('[id$="_data"] tr')];
+                    const row = rows[rowIndex];
+                    if (!row) continue;
+                    const cells = [...row.querySelectorAll('td')];
+                    for (const hr of headerRegexes) {
+                        const re = new RegExp(hr, 'i');
+                        const idx = heads.findIndex(h => re.test(h));
+                        const input = idx >= 0 && cells[idx] ? cells[idx].querySelector('input,textarea') : null;
+                        out[hr] = input ? input.value : null;
                     }
-                    return {priceOk, remarkOk, qtyOk};
-                }""",
-                [row_index, f"{line_item.unit_price:.2f}", remarks, f"{line_item.quantity:.2f}"],
-            )
-            logger.info("Stage B line item for %s: %s", label, filled)
-        except Exception as exc:
-            logger.warning("Stage B: could not set line item for %s: %s — leaving row partially filled",
-                           label, exc)
+                    return out;
+                }
+                return out;
+            }""",
+            [row_index, list(header_regexes)],
+        )
 
     # ------------------------------------------------------------------ recovery helpers
     async def _back_to_home(self) -> None:
