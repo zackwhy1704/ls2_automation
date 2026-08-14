@@ -9,6 +9,7 @@ wait_for_selector, never fixed sleeps.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 from playwright.async_api import Page, async_playwright
@@ -17,6 +18,27 @@ from config import selectors as S
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+
+class WOAlreadyProcessedError(RuntimeError):
+    """Raised when a WO's live TCMS "WO/PO status" is anything other than "Received" — e.g. already
+    Invoiced or Cancelled by someone else since JBTC's (hand-maintained, can-be-stale) Un-Invoiced WO
+    list was scraped. Callers should treat this as a duplicate, not a failure.
+    """
+
+    def __init__(self, status: str):
+        self.status = status
+        super().__init__(f"status={status!r}, not Received — already processed, skipping")
+
+
+@dataclass
+class DownloadedWO:
+    """Result of TCMSScraper.download_pdf: the PDF plus fields only visible on the TCMS detail
+    page (not on the printed WO PDF itself)."""
+
+    path: str
+    status: str              # the "WO/PO status" field, e.g. "Received", "Invoiced", "Cancelled"
+    property_officer: str = ""  # the "Property officer" field — the TC staff member who raised the WO
 
 
 class TCMSScraper:
@@ -249,7 +271,33 @@ class TCMSScraper:
             "return r.height > 0 ? {x:r.x, y:r.y, w:r.width, h:r.height} : null; }"
         )
 
-    async def download_pdf(self, wo_po_number: str) -> str:
+    async def _read_wo_detail_fields(self) -> tuple[str, str]:
+        """Read (status, property_officer) from the currently-open WO detail page.
+
+        Both are `<label>` fields not present on the printed WO PDF. Matched by restricting the
+        search to `<label>` elements specifically — a broader `label,div,span,td` search (as used for
+        other fields) picks up decoy elements first here: a hidden quick-filter menu template also
+        contains the literal text "WO/PO status" earlier in DOM order than the real field (confirmed
+        live, 2026-08-14).
+        """
+        assert self.page is not None
+        result = await self.page.evaluate(
+            """() => {
+                const norm = s => (s||'').replace(/\\s+/g,' ').trim();
+                const valueFor = (labelText) => {
+                    const label = [...document.querySelectorAll('label')]
+                        .find(l => norm(l.textContent) === labelText);
+                    if (!label) return '';
+                    const parent = label.closest('[data-dyn-controlname]') || label.parentElement;
+                    const input = parent ? parent.querySelector('input') : null;
+                    return input ? input.value.trim() : '';
+                };
+                return {status: valueFor('WO/PO status'), officer: valueFor('Property officer')};
+            }"""
+        )
+        return result.get("status", ""), result.get("officer", "")
+
+    async def download_pdf(self, wo_po_number: str) -> DownloadedWO:
         """Select a WO by its WO/PO number and download its PDF via Preview/Print -> Copy preview.
 
         Verified flow (2026-07-31, via a user codegen recording — see git history for the full
@@ -262,8 +310,15 @@ class TCMSScraper:
         earlier caused this method to silently export a stale/wrong WO's PDF (a billing-critical bug;
         see the content-verification guard below and in batch.self_process_one).
 
-        Returns the saved path. Clicks "Back" afterwards so the next WO starts from a known state
-        (the list). Caller handles per-WO error isolation.
+        Also re-checks the WO's live "WO/PO status" right after selecting it — the "Un-Invoiced WO"
+        list this WO/PO was found in is hand-maintained on JBTC's side and can be stale (confirmed via
+        a live SOP audit finding 3 quotations raised against WOs TCMS already showed Invoiced); this
+        is the second, TCMS-side half of the duplicate check, independent of Synergix's own dedup.
+        Raises RuntimeError with a status-prefixed message if it's anything other than "Received" —
+        the caller (batch.self_process_one) treats that as a duplicate, not a failure.
+
+        Returns the saved path plus Property officer. Clicks "Back" afterwards so the next WO starts
+        from a known state (the list). Caller handles per-WO error isolation.
         """
         assert self.page is not None
         safe_name = wo_po_number.replace("/", "-")
@@ -279,6 +334,10 @@ class TCMSScraper:
             preview_print = S.require("TCMS_WO_PREVIEW_PRINT", S.TCMS_WO_PREVIEW_PRINT)
             await self.page.wait_for_selector(preview_print, state="visible", timeout=20000)
             await self.page.wait_for_timeout(1000)
+
+            status, property_officer = await self._read_wo_detail_fields()
+            if status and status.strip().lower() != "received":
+                raise WOAlreadyProcessedError(status)
 
             await self.page.click(preview_print, timeout=20000)
             await self.page.wait_for_timeout(2000)
@@ -307,7 +366,7 @@ class TCMSScraper:
             download = await dl_info.value
             await download.save_as(str(dest))
             logger.info("Downloaded PDF for %s -> %s", wo_po_number, dest)
-            return str(dest)
+            return DownloadedWO(path=str(dest), status=status, property_officer=property_officer)
         finally:
             await self._back_to_list()
 

@@ -668,6 +668,17 @@ class SynergixDriver:
         if not await self._select_autocomplete_row("Customer", council, council.upper()):
             raise RuntimeError(f"no Customer match found in Synergix for {council!r}")
 
+        # --- Customer Contact: override the cascaded default with the real TC officer who raised
+        # the WO, if TCMS scraping captured one (JBTC/TCMS flow only — unset for SKTC/email WOs,
+        # which have no TCMS page to scrape it from). Best-effort: a full SOP audit found this stuck
+        # on a generic "Account Department" default on every quotation (MAJOR finding 4.3).
+        if payload.property_officer:
+            try:
+                await self._fill_labeled_input("Customer Contact", payload.property_officer)
+            except Exception as exc:
+                logger.warning("Stage B: could not set Customer Contact for %s: %s",
+                                payload.wo_po_number, exc)
+
         # --- Salesperson ---
         # TODO(human): "TAN WEI YING" is the salesperson seen on every real quotation observed so
         # far (both councils), suggesting it's a fixed default rather than per-WO — confirm with the

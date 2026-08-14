@@ -186,6 +186,8 @@ async def self_process_one(wo_id, scraper, synergix, result) -> WOOutcome | None
     Returns None only for the extraction-failed case (which appends its own outcome). Raised
     exceptions / timeouts are handled by the caller.
     """
+    from src.tcms_scraper import WOAlreadyProcessedError
+
     # Cheap dedup on the WO-PO before downloading anything.
     probe = WOPayload(
         wo_po_number=wo_id, job_sheet_number="0", service_location="-",
@@ -197,9 +199,17 @@ async def self_process_one(wo_id, scraper, synergix, result) -> WOOutcome | None
         logger.info("WO %s DUPLICATE (pre-download) — skipping", wo_id)
         return WOOutcome(wo_id, WOStatus.DUPLICATE, "already invoiced in Synergix")
 
-    path = await scraper.download_pdf(wo_id)
+    try:
+        downloaded = await scraper.download_pdf(wo_id)
+    except WOAlreadyProcessedError as exc:
+        # JBTC's Un-Invoiced WO list is hand-maintained and can be stale — this is the TCMS-side half
+        # of the duplicate check, independent of (and a backstop for) Synergix's own dedup above.
+        logger.info("WO %s TCMS status=%r, not Received — skipping", wo_id, exc.status)
+        return WOOutcome(wo_id, WOStatus.DUPLICATE, f"TCMS shows status={exc.status!r}, not Received")
+    path = downloaded.path
     try:
         payload = extract_from_pdf(path)
+        payload.property_officer = downloaded.property_officer or None
         await db.upsert_scraped(payload.wo_po_number, payload.source_path)
     except ExtractionError as exc:
         logger.warning("Extraction failed for %s: %s", wo_id, exc)

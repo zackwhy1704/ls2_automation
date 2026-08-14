@@ -95,6 +95,13 @@ class WOPayload(BaseModel):
 
     sr_number: Optional[str] = None             # the "SR"/Schedule reference seen in subject/body, if any
 
+    # The TCMS WO's "Property officer" — the Town Council staff member who raised the WO. Not on the
+    # printed PDF (extract_from_pdf can't get it); scraped separately from the TCMS WO detail page
+    # (TCMSScraper.download_pdf) and set on the payload afterward for the JBTC/TCMS flow only — the
+    # SKTC/email flow has no TCMS page to scrape, so this stays unset there. Used for Synergix's
+    # Customer Contact field, which otherwise falls back to a generic default.
+    property_officer: Optional[str] = None
+
     # The file the extractor read AND the file Synergix attaches in stage D. For the email flow this
     # is the WO PDF attachment when present, otherwise the saved source email. (Named source_path
     # rather than pdf_path because it is not always a PDF.)

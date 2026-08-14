@@ -45,9 +45,10 @@ async def main(limit: int) -> None:
             logger.info("Processing %d WO(s): %s", len(wo_ids), wo_ids)
             for wo_id in wo_ids:
                 try:
-                    source_path = await scraper.download_pdf(wo_id)
-                    await db.upsert_scraped(wo_id, source_path)
-                    payload = extract(source_path)
+                    downloaded = await scraper.download_pdf(wo_id)
+                    await db.upsert_scraped(wo_id, downloaded.path)
+                    payload = extract(downloaded.path)
+                    payload.property_officer = downloaded.property_officer or None
                     await _validate_dedup_queue(payload, synergix, gate)
                     if (rec := await db.get(payload.wo_po_number)) and \
                             rec["status"] == WOStatus.PENDING_APPROVAL.value:
