@@ -22,7 +22,7 @@ from playwright.async_api import Page, async_playwright
 
 from config import selectors as S
 from config import settings
-from src.models import WOPayload, WOStatus, is_jbtc
+from src.models import LineItem, WOPayload, WOStatus, is_jbtc
 from src.validator import build_remarks, resolve_project_code
 
 logger = logging.getLogger(__name__)
@@ -434,10 +434,13 @@ class SynergixDriver:
         logger.info("Selected %s row: %s", label, coords["text"].replace("\t", " | "))
         return True
 
-    async def _select_item_code(self, item_code: str) -> bool:
+    async def _select_item_code(self, item_code: str, row_index: int = 0) -> bool:
         """Type into the Details row's Item Code/Desc cell (a table cell input, NOT a labeled form
         field like Customer/Salesperson/Project Site — _select_autocomplete_row's label-based click
         doesn't apply here) and click the matching autocomplete row, same panel-locate pattern.
+
+        `row_index` selects which Details row to fill when the WO has more than one line item — each
+        "Add Row" click appends a new row, so index 0 is the first-added row, 1 the second, etc.
 
         KNOWN GAP (2026-08-03): this reliably finds and fills the Item Code input when tested in
         isolation on a blank quotation, but returns False (cell_input is null) in the real pipeline
@@ -451,13 +454,14 @@ class SynergixDriver:
         assert self.page is not None
         page = self.page
         cell_input = await page.evaluate(
-            """() => {
+            """([rowIndex]) => {
                 const grids = [...document.querySelectorAll('.ui-datatable')];
                 for (const g of grids) {
                     const heads = [...g.querySelectorAll('th')].map(t => (t.innerText || '').trim());
                     const idx = heads.findIndex(h => /item code/i.test(h));
                     if (idx < 0) continue;
-                    const row = g.querySelector('[id$="_data"] tr');
+                    const rows = [...g.querySelectorAll('[id$="_data"] tr')];
+                    const row = rows[rowIndex];
                     if (!row) continue;
                     const cell = [...row.querySelectorAll('td')][idx];
                     const input = cell ? cell.querySelector('input') : null;
@@ -466,7 +470,8 @@ class SynergixDriver:
                     return {x: r.x + r.width / 2, y: r.y + r.height / 2};
                 }
                 return null;
-            }"""
+            }""",
+            [row_index],
         )
         if not cell_input:
             return False
@@ -575,12 +580,22 @@ class SynergixDriver:
         await self._fill_labeled_input("Reference No.", payload.gl_number)
         logger.info("Stage B: filled Subject + Reference No. for %s", payload.wo_po_number)
 
-        # --- Line item: add a row, then set Item Code/Qty/Unit Price/Remarks ---
-        if not await self._add_line_item():
-            logger.warning("Stage B: could not add a Details line item for %s — draft left without "
-                            "one, human must add it before Submit", payload.wo_po_number)
-        else:
-            await self._fill_line_item(payload)
+        # --- Line items: add one Details row per WO line item, then fill each ---
+        # A WO with N "Job Sheet:" rows in its Description of Work table needs N Synergix rows, or
+        # the quotation silently bills only the first line — see WOPayload.line_items's docstring.
+        line_items = payload.effective_line_items
+        remarks = build_remarks(payload)
+        added = 0
+        for _ in line_items:
+            if not await self._add_line_item():
+                break
+            added += 1
+        if added < len(line_items):
+            logger.warning(
+                "Stage B: could only add %d/%d Details line item row(s) for %s — human must add the "
+                "rest before Submit", added, len(line_items), payload.wo_po_number)
+        for i in range(added):
+            await self._fill_line_item_row(i, line_items[i], remarks)
         logger.info("Stage B: draft filled for %s", payload.wo_po_number)
 
     async def _submit_quotation(self, payload: WOPayload) -> str | None:
@@ -618,28 +633,30 @@ class SynergixDriver:
         except Exception:
             return None
 
-    async def _fill_line_item(self, payload: WOPayload) -> None:
-        """Fill the freshly-added Details row: Item Code (autocomplete), Qty, Unit Price, Remarks.
+    async def _fill_line_item_row(self, row_index: int, line_item: LineItem, remarks: str) -> None:
+        """Fill one freshly-added Details row: Item Code (autocomplete), Qty, Unit Price, Remarks.
 
         Unlike the old Copy From flow (where the copied row already had Item Code/Type/Qty from the
         template, and only Unit Price/Remarks needed overwriting), a from-scratch row starts fully
         blank — Item Code must be looked up via its own autocomplete (see _select_item_code; it's a
         table-cell input, not a labeled form field, so the generic _select_autocomplete_row doesn't
-        apply) before Unit Price/Remarks can be set.
+        apply) before Unit Price/Remarks can be set. `row_index` picks which row among possibly
+        several (one per WO line item) — see _stage_b_create_quotation.
         """
         assert self.page is not None
-        remarks = build_remarks(payload)
+        label = f"row {row_index}"
 
-        item_ok = await self._select_item_code(ITEM_CODE)
+        item_ok = await self._select_item_code(ITEM_CODE, row_index)
         if not item_ok:
-            logger.warning("Stage B: could not select Item Code %s for %s — leaving row's item blank",
-                            ITEM_CODE, payload.wo_po_number)
+            logger.warning("Stage B: could not select Item Code %s for %s — leaving %s's item blank",
+                            ITEM_CODE, label, label)
 
         try:
             # Unit Price + Remarks: inputs in the details row whose column headers say so. Qty is set
-            # explicitly too — a from-scratch row does not inherit "1.00" from any template.
+            # explicitly too — a from-scratch row does not inherit "1.00" from any template. Every
+            # row shares the same WO-level remarks (the WO itself, not any one line, is what's billed).
             filled = await self.page.evaluate(
-                """([price, remarks, qty]) => {
+                """([rowIndex, price, remarks, qty]) => {
                     const setVal = (el, v) => {
                       if (!el) return false;
                       el.focus(); el.value = v;
@@ -654,7 +671,8 @@ class SynergixDriver:
                       const pIdx = heads.findIndex(h => /unit price/i.test(h));
                       const rIdx = heads.findIndex(h => /remarks/i.test(h));
                       const qIdx = heads.findIndex(h => /^qty/i.test(h));
-                      const row = g.querySelector('[id$="_data"] tr');
+                      const rows = [...g.querySelectorAll('[id$="_data"] tr')];
+                      const row = rows[rowIndex];
                       if (!row) continue;
                       const cells = [...row.querySelectorAll('td')];
                       if (pIdx >= 0 && cells[pIdx]) priceOk = setVal(cells[pIdx].querySelector('input'), price) || priceOk;
@@ -663,12 +681,12 @@ class SynergixDriver:
                     }
                     return {priceOk, remarkOk, qtyOk};
                 }""",
-                [f"{payload.unit_price:.2f}", remarks, f"{payload.quantity:.2f}"],
+                [row_index, f"{line_item.unit_price:.2f}", remarks, f"{line_item.quantity:.2f}"],
             )
-            logger.info("Stage B line item for %s: %s", payload.wo_po_number, filled)
+            logger.info("Stage B line item for %s: %s", label, filled)
         except Exception as exc:
             logger.warning("Stage B: could not set line item for %s: %s — leaving row partially filled",
-                           payload.wo_po_number, exc)
+                           label, exc)
 
     # ------------------------------------------------------------------ recovery helpers
     async def _back_to_home(self) -> None:

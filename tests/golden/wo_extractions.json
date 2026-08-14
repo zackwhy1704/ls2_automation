@@ -180,6 +180,8 @@
     "wo_po_number": "WO-PO/000078229"
   },
   "SKTC/000058855.pdf": {
+    "_verified": false,
+    "_note": "Multi-line-item WO (the sample referenced in docs/operational_expectations.md's known gap). net_amount/quantity/unit_price below reflect the OLD single-line-only extraction (grand_total 9535.32 doesn't reconcile with net_amount 8100.0 + 9% GST). After the 2026-08-07 multi-line-item fix, re-run `python -m tests.regen_golden` against the real sample (data/samples/SKTC/000058855.pdf) to recompute net_amount as the sum of all line items, hand-verify it reconciles, then set _verified true and remove this note.",
     "discount_amount": 900.0,
     "discount_percent": 10.0,
     "gl_number": "731-CP-SCPMAST-541216-9-721010-0000",

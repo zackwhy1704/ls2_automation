@@ -17,7 +17,7 @@ import re
 from pathlib import Path
 
 from config import settings
-from src.models import WOPayload, is_jbtc
+from src.models import LineItem, WOPayload, is_jbtc
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +35,15 @@ Layout cues from these WOs (use them, but rely on the actual document):
   hyphen as the join, e.g. -> "731-AN-ANVZCRes-542353-9-721010-0000". We want the ENTIRE joined string.
 - "Remarks:" holds the location + nature of work, e.g.
   "Blk 330A Anchorvale Street - Inspection for beehive activities at Level 15 - No bees found".
-- A line like "Job Sheet: <ref> A <qty> $<rate> $<gross> $<jobcost>" holds the job sheet reference,
-  quantity, and the gross Rate (unit_price). There is usually a "Discount %", "Discount Amt",
-  "9% GST", and "Grand Total".
+- The "Description of Work" table holds one or more LINE ITEMS, each its own row with a
+  "Job Sheet: <ref>" label, Sect./Schd., Quantity, Unit, Rate, Discount %, Gross Amt, Discount Amt,
+  and Job Cost. MANY WOs have TWO OR MORE line items (e.g. one row for the inspection/treatment work,
+  a separate row for "Transport and administration charges") — all normally sharing the SAME
+  job_sheet_number even though each prints its own "Job Sheet:" label. Capture EVERY row as its own
+  entry in line_items; missing a row is a real, silent under-bill AND makes the grand_total check
+  below fail every time. There is usually a "Discount %", "Discount Amt", "9% GST", and "Grand Total"
+  for the WO as a whole (the GST/Grand Total apply to the SUM of every line item's Job Cost, not any
+  single row).
 - "SR" / "Schedule" reference may appear in the email subject/body, e.g. "(SR: 25955)".
 
 Three fields are easy to confuse — read these rules carefully:
@@ -84,17 +90,22 @@ Return ONLY a JSON object — no prose, no markdown code fences, no explanation.
   "job_date": string,            // the WO Date as ISO "YYYY-MM-DD"
   "prepared_by": string,         // the "Prepared By" person, e.g. "JENNY ANG"
   "gl_number": string,           // FULL G/L No. string incl. numeric account, e.g. "731-AN-ANVZCRes-542353-9-721010-0000"; CRITICAL
-  "quantity": number,            // the line quantity, e.g. 1.0
-  "unit_price": number,          // the gross Rate per unit before discount, e.g. 30.00
-  "discount_percent": number,    // e.g. 10.0 (0 if none)
-  "discount_amount": number,     // the printed "Discount Amt" figure, e.g. 3.00 (0 if none). Read the
-                                  // printed value; do NOT assume it is subtracted from Gross — some
-                                  // WO layouts print "Job Cost" as Gross PLUS this figure, others as
-                                  // Gross MINUS it. Just transcribe the number as printed.
-  "net_amount": number,          // the printed "Job Cost" / "Total" figure (pre-GST subtotal) EXACTLY
-                                  // as printed on the WO. Do NOT compute this yourself from Gross and
-                                  // Discount — different WO layouts combine them differently and
-                                  // guessing the direction will produce a wrong figure. Just read it.
+  "line_items": [                // ONE ENTRY PER ROW of the Description of Work table. Most WOs have
+                                  // exactly one; some have two or more (e.g. inspection + transport) —
+                                  // include every row, in the order printed. Never merge two rows into
+                                  // one, and never drop a row (that silently under-bills the WO and
+                                  // will also make the grand_total check below fail).
+    {
+      "description": string,       // short description of this line's work, e.g. "Rodent surveillance"
+      "quantity": number,          // this line's quantity, e.g. 1.0
+      "unit_price": number,        // this line's gross Rate per unit before discount, e.g. 30.00
+      "discount_percent": number,  // e.g. 10.0 (0 if none)
+      "discount_amount": number    // this line's printed "Discount Amt" figure, e.g. 3.00 (0 if none).
+                                    // Read the printed value; do NOT assume it is subtracted from
+                                    // Gross — some WO layouts print "Job Cost" as Gross PLUS this
+                                    // figure, others as Gross MINUS it. Just transcribe the number.
+    }
+  ],
   "gst_percent": number,         // e.g. 9.0 (0 if none)
   "grand_total": number,         // the printed "Grand Total" figure EXACTLY as printed. Read it, do
                                   // not compute it.
@@ -213,9 +224,9 @@ def _finalize(raw: str, *, source_path: str) -> WOPayload:
     if low_conf:
         logger.warning("%s: model flagged low-confidence fields: %s", Path(source_path).name, low_conf)
 
-    def _opt_float(key: str) -> float | None:
+    def _opt_float(d: dict, key: str) -> float | None:
         """Optional numeric: missing/empty/0 -> None, so 'absent' is distinct from a real 0.00."""
-        v = data.get(key)
+        v = d.get(key)
         if v in (None, "", 0, 0.0):
             return None
         try:
@@ -225,32 +236,69 @@ def _finalize(raw: str, *, source_path: str) -> WOPayload:
 
     sr = str(data.get("sr_number", "") or "").strip()
     town_council = str(data.get("town_council", "") or "")
+    jbtc = is_jbtc(town_council)
 
-    # net_amount is the one figure the model gets arithmetically wrong run-to-run (it sometimes
-    # returns the gross). Compute it deterministically from the fields it DOES read reliably:
-    # quantity, unit_price, discount. Fall back to discount_percent, then the model's value.
-    #
-    # The direction of the discount adjustment is COUNCIL-SPECIFIC — confirmed against all real
-    # labelled samples (2026-08-01, see models.is_jbtc's docstring): JBTC's printed pre-GST base
-    # ("Job Cost") is gross PLUS the discount amount; SKTC's is gross MINUS it, as you'd expect from
-    # a column literally labelled "Discount". Getting this backwards means every JBTC WO bills too
-    # low and/or fails the money-consistency trust gate; do not "simplify" this to gross-discount.
-    quantity = float(data.get("quantity", 0) or 0)
-    unit_price = float(data.get("unit_price", 0) or 0)
-    disc_amt = _opt_float("discount_amount")
-    disc_pct = _opt_float("discount_percent")
-    gross = quantity * unit_price
-    net_amount: float | None
-    if gross > 0:
-        sign = 1 if is_jbtc(town_council) else -1
+    def _line_net_amount(quantity: float, unit_price: float,
+                          disc_amt: float | None, disc_pct: float | None) -> float | None:
+        """Deterministic per-line net (Job Cost), never trusting the model's own arithmetic.
+
+        The model reliably reads quantity/unit_price/discount but gets an aggregate figure like
+        net_amount wrong run-to-run (it sometimes returns the gross). The direction of the discount
+        adjustment is COUNCIL-SPECIFIC — confirmed against all real labelled samples (2026-08-01, see
+        models.is_jbtc's docstring): JBTC's printed pre-GST base ("Job Cost") is gross PLUS the
+        discount amount; SKTC's is gross MINUS it, as you'd expect from a column literally labelled
+        "Discount". Getting this backwards means every JBTC WO bills too low and/or fails the
+        money-consistency trust gate; do not "simplify" this to gross-discount.
+        """
+        gross = quantity * unit_price
+        if gross <= 0:
+            return None
+        sign = 1 if jbtc else -1
         if disc_amt is not None:
-            net_amount = round(gross + sign * disc_amt, 2)
-        elif disc_pct is not None:
-            net_amount = round(gross * (1 + sign * disc_pct / 100), 2)
-        else:
-            net_amount = round(gross, 2)
+            return round(gross + sign * disc_amt, 2)
+        if disc_pct is not None:
+            return round(gross * (1 + sign * disc_pct / 100), 2)
+        return round(gross, 2)
+
+    raw_line_items = data.get("line_items")
+    if not isinstance(raw_line_items, list) or not raw_line_items:
+        # Schema drift safety net: the model occasionally ignores the line_items array and returns
+        # the old flat quantity/unit_price fields directly. Treat that as a single-line WO rather
+        # than losing the figures entirely.
+        raw_line_items = [data] if data.get("quantity") or data.get("unit_price") else []
+
+    line_items: list[LineItem] = []
+    for item in raw_line_items:
+        if not isinstance(item, dict):
+            continue
+        qty = float(item.get("quantity", 0) or 0)
+        price = float(item.get("unit_price", 0) or 0)
+        disc_amt = _opt_float(item, "discount_amount")
+        disc_pct = _opt_float(item, "discount_percent")
+        line_items.append(LineItem(
+            description=str(item.get("description", "") or ""),
+            quantity=qty,
+            unit_price=price,
+            discount_percent=disc_pct,
+            discount_amount=disc_amt,
+            net_amount=_line_net_amount(qty, price, disc_amt, disc_pct),
+        ))
+
+    # Top-level quantity/unit_price/discount mirror the FIRST line item, kept for validate() and the
+    # legacy Telegram-approval display, neither of which reasons about multiple lines. net_amount is
+    # the SUM across every line — comparing grand_total against only the first line's net_amount is
+    # exactly what made every multi-line WO trip the money-consistency trust gate as a false "misread"
+    # (confirmed against 21/21 real flagged WOs, 2026-08-07).
+    if line_items:
+        first = line_items[0]
+        quantity, unit_price = first.quantity, first.unit_price
+        disc_pct, disc_amt = first.discount_percent, first.discount_amount
+        line_nets = [li.net_amount for li in line_items if li.net_amount is not None]
+        net_amount = round(sum(line_nets), 2) if line_nets else None
     else:
-        net_amount = _opt_float("net_amount")  # no usable line figures — trust the model
+        # No parseable line items at all (e.g. unstructured free-text email body) — nothing to sum.
+        quantity, unit_price, disc_pct, disc_amt = 0.0, 0.0, None, None
+        net_amount = _opt_float(data, "net_amount")
 
     try:
         payload = WOPayload(
@@ -264,11 +312,12 @@ def _finalize(raw: str, *, source_path: str) -> WOPayload:
             gl_number=str(data.get("gl_number", "")),
             quantity=quantity,
             unit_price=unit_price,
+            line_items=line_items,
             discount_percent=disc_pct,
             discount_amount=disc_amt,
             net_amount=net_amount,
-            gst_percent=_opt_float("gst_percent"),
-            grand_total=_opt_float("grand_total"),
+            gst_percent=_opt_float(data, "gst_percent"),
+            grand_total=_opt_float(data, "grand_total"),
             sr_number=sr or None,
             source_path=source_path,
             extraction_confidence=float(confidence) if confidence is not None else None,
