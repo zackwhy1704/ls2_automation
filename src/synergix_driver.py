@@ -348,6 +348,60 @@ class SynergixDriver:
         finally:
             await self._back_to_home()
 
+    async def abort_quotation(self, quotation_no: str) -> bool:
+        """Admin/cleanup utility, NOT part of the regular write pipeline: open an existing quotation
+        by its number and abort (discard) it — for removing bad/orphaned drafts, e.g. the batch of
+        empty quotations a full SOP compliance audit found from before the Details-grid fill was
+        fixed. Only works on an un-submitted draft (Revision 0) — Abort is Synergix's own action for
+        discarding a draft, distinct from Cancel/Delete on a submitted record.
+
+        Returns True if the quotation was found and no longer appears in the list afterward.
+        """
+        assert self.page is not None
+        page = self.page
+        await self.login()
+        await self._open_service_quotation_list()
+
+        header = page.locator("th", has_text="Quotation No.").first
+        filter_input = header.locator("input.ui-column-filter").first
+        await filter_input.click()
+        await filter_input.fill(quotation_no)
+        await filter_input.press("Enter")
+        await page.wait_for_timeout(3000)
+
+        link = page.get_by_role("link", name=quotation_no, exact=True)
+        if not await link.count():
+            logger.warning("abort_quotation: %s not found in the list", quotation_no)
+            return False
+        await link.first.click(timeout=10000)
+        await page.wait_for_timeout(4000)
+
+        abort_btn = page.locator("button.abort-button").first
+        if not await abort_btn.count():
+            logger.warning("abort_quotation: no Abort button for %s — may already be submitted "
+                            "(Abort only applies to un-submitted drafts)", quotation_no)
+            return False
+        await abort_btn.click(timeout=10000)
+        await page.wait_for_timeout(1500)
+        yes_btn = page.get_by_role("button", name="Yes")
+        if await yes_btn.count() and await yes_btn.first.is_visible():
+            await yes_btn.first.click(timeout=10000)
+            await page.wait_for_timeout(3000)
+
+        # Verify it's actually gone rather than trusting the click succeeded.
+        await self._open_service_quotation_list()
+        filter_input2 = page.locator("th", has_text="Quotation No.").first.locator("input.ui-column-filter").first
+        await filter_input2.click()
+        await filter_input2.fill(quotation_no)
+        await filter_input2.press("Enter")
+        await page.wait_for_timeout(3000)
+        still_there = await page.get_by_text(quotation_no, exact=True).count() > 0
+        if still_there:
+            logger.warning("abort_quotation: %s still present after Abort+Yes", quotation_no)
+            return False
+        logger.info("Aborted quotation %s", quotation_no)
+        return True
+
     def _subject(self, payload: WOPayload) -> str:
         """Enquiry/Subject string, capped at Synergix's 50-char limit.
 
