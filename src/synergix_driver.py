@@ -514,24 +514,35 @@ class SynergixDriver:
 
         Synergix's JSF ids are auto-generated, so we anchor on the (stable) label text and take the
         input in the same table row. Raises if the field can't be found — the caller marks FAILED.
+
+        Returns a Locator built from the input's own `id` — NOT an ElementHandle from
+        `evaluate_handle()`. Confirmed live (2026-08-15) that an ElementHandle is a frozen reference
+        to one specific DOM node: Customer selection cascades an ajax update (Address/Contact/
+        Currency/Sales Tax/SBU all re-render), and if that cascade replaces this field's node between
+        grabbing the handle and clicking it, the click raises "Element is not attached to the DOM" —
+        confirmed live on the Customer Contact field, which is filled right after Customer's cascade.
+        A Locator re-resolves the id at click time instead of clicking a stale reference, and its
+        ids are stable across a PrimeFaces re-render even though the DOM node object is replaced.
         """
         assert self.page is not None
-        handle = await self.page.evaluate_handle(
+        page = self.page
+        input_id = await page.evaluate(
             """(label) => {
                 const norm = s => (s||'').replace(/\\s+/g,' ').trim();
                 const host = [...document.querySelectorAll('td,div,span,label')]
                   .find(e => e.children.length === 0 && norm(e.textContent) === label);
                 if (!host) return null;
                 const tr = host.closest('tr');
-                return (tr && tr.querySelector('input:not([type=hidden]):not([readonly]), textarea')) || null;
+                const input = tr && tr.querySelector('input:not([type=hidden]):not([readonly]), textarea');
+                return input ? input.id : null;
             }""",
             label,
         )
-        element = handle.as_element()
-        if element is None:
+        if not input_id:
             raise RuntimeError(f"could not locate the input for field {label!r}")
-        await element.click()
-        await element.fill(value)
+        field = page.locator(f'[id="{input_id}"]')
+        await field.click()
+        await field.fill(value)
 
     async def _select_dropdown_option(self, label: str, option_text: str) -> bool:
         """Select an option from a plain PrimeFaces `ui-selectonemenu` dropdown by its label.
@@ -631,13 +642,20 @@ class SynergixDriver:
         guess intermittently missed the actual input — same silent-failure shape as the grid-cell bug
         — showing up as flaky "no Customer match found" / "could not select a Salesperson" despite
         the exact same council/name working moments earlier or later in the same run.
+
+        The input is a Locator built from its own `id`, NOT an ElementHandle from
+        `evaluate_handle()`. Confirmed live (2026-08-15, immediately after the fix above) that an
+        ElementHandle is a frozen reference to one specific DOM node — Customer's own selection
+        cascades an ajax update that re-renders several nearby fields (including Salesperson/Project
+        Site), and clicking a handle grabbed just before that cascade lands can raise "Element is not
+        attached to the DOM". A Locator re-resolves the id at click time instead.
         """
         assert self.page is not None
         page = self.page
         # Required fields render as "Label *" (the asterisk is part of the same text node, not a
         # separate element), so a plain exact match on e.g. "Salesperson" misses "Salesperson *"
         # (confirmed live, 2026-08-03).
-        handle = await page.evaluate_handle(
+        input_id = await page.evaluate(
             """(label) => {
                 const norm = s => (s||'').replace(/\\s+/g,' ').trim();
                 const host = [...document.querySelectorAll('td,div,span,label')]
@@ -645,13 +663,14 @@ class SynergixDriver:
                     && (norm(e.textContent) === label || norm(e.textContent) === label + ' *'));
                 if (!host) return null;
                 const tr = host.closest('tr');
-                return (tr && tr.querySelector('input:not([type=hidden]), textarea')) || null;
+                const input = tr && tr.querySelector('input:not([type=hidden]), textarea');
+                return input ? input.id : null;
             }""",
             label,
         )
-        field_input = handle.as_element()
-        if field_input is None:
+        if not input_id:
             raise RuntimeError(f"could not locate the {label!r} field label")
+        field_input = page.locator(f'[id="{input_id}"]')
         await field_input.click()
         await page.wait_for_timeout(300)
         await page.keyboard.type(search_text)
