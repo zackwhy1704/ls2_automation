@@ -1036,8 +1036,7 @@ class SynergixDriver:
             if not (row.get("remarks") or "").strip():
                 problems.append(f"row {i}: Remarks is blank")
 
-        total_after_tax = await self.page.evaluate(
-            """() => {
+        total_js = """() => {
                 const label = [...document.querySelectorAll('td,div,span')]
                     .find(e => e.children.length === 0 && e.textContent.trim() === 'Total After Tax:');
                 if (!label) return null;
@@ -1048,7 +1047,21 @@ class SynergixDriver:
                     .filter(t => /^[\\d,]+\\.\\d{2}$/.test(t));
                 return nums.length ? nums[0] : null;
             }"""
-        )
+        total_after_tax = await self.page.evaluate(total_js)
+        # Total After Tax is a separate PrimeFaces aggregate recalculation, not part of any single
+        # cell's own commit — confirmed live (2026-08-15) that every individual row can already read
+        # back correct while this summary field still lags at 0.00 for a moment. Only worth polling
+        # when the rows themselves are already clean; if a row still has a real problem, that recalc
+        # would show 0.00 anyway and there's nothing to wait for.
+        if not problems:
+            for _ in range(10):
+                try:
+                    if total_after_tax is not None and float(total_after_tax.replace(",", "")) > 0:
+                        break
+                except ValueError:
+                    pass
+                await self.page.wait_for_timeout(300)
+                total_after_tax = await self.page.evaluate(total_js)
         try:
             if total_after_tax is None or float(total_after_tax.replace(",", "")) <= 0:
                 problems.append(f"Total After Tax is {total_after_tax!r}")
