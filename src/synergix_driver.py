@@ -59,6 +59,11 @@ class DedupResult(str, Enum):
 ITEM_CODE = "SE-400212A"
 ITEM_TYPE = "S"
 
+# Payment Method dropdown target. Confirmed live (2026-08-15) that the previously-targeted
+# "Cheque" does not appear as an option at all for JALAN BESAR TOWN COUNCIL — the only real
+# (non-placeholder) option offered was "GIRO", which the client confirmed is correct.
+PAYMENT_METHOD = "GIRO"
+
 # Project Site search term per council, used to find the right autocomplete row when creating a
 # quotation from scratch (see _select_autocomplete_row). Searching by the bare numeric code is NOT
 # safe — confirmed live that the same code string can match a DIFFERENT council's project (e.g.
@@ -460,7 +465,7 @@ class SynergixDriver:
                     "assertion": f"subject mismatch: quotation shows {subject!r}"}
 
         # Payment Method, if still at the placeholder.
-        if not await self._select_dropdown_option("Payment Method", "Cheque"):
+        if not await self._select_dropdown_option("Payment Method", PAYMENT_METHOD):
             logger.warning("amend_quotation: could not set Payment Method for %s", quotation_no)
 
         # Project Site, only if currently blank (don't disturb an already-correct value).
@@ -978,8 +983,8 @@ class SynergixDriver:
         await self._fill_labeled_input("Reference No.", payload.gl_number)
         logger.info("Stage B: filled Subject + Reference No. for %s", payload.wo_po_number)
 
-        # --- Payment Method (SOP requires Cheque; left at the "Sel" placeholder otherwise) ---
-        if not await self._select_dropdown_option("Payment Method", "Cheque"):
+        # --- Payment Method (left at the "Sel" placeholder if the target option isn't found) ---
+        if not await self._select_dropdown_option("Payment Method", PAYMENT_METHOD):
             logger.warning("Stage B: could not set Payment Method for %s — leaving as placeholder",
                             payload.wo_po_number)
 
