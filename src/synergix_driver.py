@@ -496,6 +496,8 @@ class SynergixDriver:
             added += 1
         for i in range(min(added, len(line_items))):
             await self._fill_line_item_row(i, line_items[i], remarks)
+        if added:
+            await self._verify_and_refill_rows(line_items[:min(added, len(line_items))], remarks)
 
         try:
             await self._assert_details_filled(payload)
@@ -1004,6 +1006,8 @@ class SynergixDriver:
                 "rest before Submit", added, len(line_items), payload.wo_po_number)
         for i in range(added):
             await self._fill_line_item_row(i, line_items[i], remarks)
+        if added:
+            await self._verify_and_refill_rows(line_items[:added], remarks)
         logger.info("Stage B: draft filled for %s", payload.wo_po_number)
 
     async def _assert_details_filled(self, payload: WOPayload) -> None:
@@ -1103,7 +1107,6 @@ class SynergixDriver:
         several (one per WO line item) — see _stage_b_create_quotation.
         """
         assert self.page is not None
-        page = self.page
         label = f"row {row_index}"
 
         item_ok = await self._select_item_code(ITEM_CODE, row_index)
@@ -1122,38 +1125,85 @@ class SynergixDriver:
             ("Unit Price", f"{line_item.unit_price:.2f}", "unit price"),
             ("Remarks", remarks, "remarks"),
         ):
-            for attempt in range(3):
-                cell = await self._grid_cell_locator(row_index, header_regex)
-                if not cell:
-                    logger.warning("Stage B: could not locate the %s cell for %s", field_name, label)
-                    break
-                try:
-                    await cell.click(timeout=10000)
-                except Exception as exc:
-                    logger.warning("Stage B: could not click the %s cell for %s: %s", field_name, label, exc)
-                    break
-                await page.keyboard.press("Control+A")
-                await page.keyboard.type(value)
-                await page.keyboard.press("Tab")
-
-                # Poll instead of a single fixed-wait check: confirmed live (2026-08-15) that the
-                # PrimeFaces ajax recalculation Tab kicks off (Total Amount = Qty * Unit Price) has
-                # variable settle time under server load — a one-shot check at a fixed delay
-                # intermittently read the value as "not stuck" moments before it actually committed.
-                committed = False
-                for _ in range(8):
-                    await page.wait_for_timeout(300)
-                    if await cell.input_value() == value:
-                        committed = True
-                        break
-                if committed:
-                    break
-                logger.warning("Stage B: %s for %s did not stick (attempt %d) — retrying",
-                                field_name, label, attempt + 1)
+            await self._fill_grid_field(row_index, field_name, value, header_regex)
 
         # Verify what actually stuck (not just "an input existed to click") before trusting it.
         actual = await self._read_grid_row(row_index, ("qty", "unit price", "remarks"))
         logger.info("Stage B line item for %s: %s", label, actual)
+
+    async def _fill_grid_field(
+        self, row_index: int, field_name: str, value: str, header_regex: str, *, attempts: int = 3
+    ) -> bool:
+        """Click one Details-grid cell, type `value`, Tab to commit, and poll to confirm it stuck —
+        retrying up to `attempts` times. Returns whether it ultimately committed.
+
+        Extracted from _fill_line_item_row so _verify_and_refill_rows can re-run it standalone on
+        any single cell that a later edit clobbered, without re-filling the whole row.
+        """
+        assert self.page is not None
+        page = self.page
+        for attempt in range(attempts):
+            cell = await self._grid_cell_locator(row_index, header_regex)
+            if not cell:
+                logger.warning("Stage B: could not locate the %s cell for row %d", field_name, row_index)
+                return False
+            try:
+                await cell.click(timeout=10000)
+            except Exception as exc:
+                logger.warning("Stage B: could not click the %s cell for row %d: %s", field_name, row_index, exc)
+                return False
+            await page.keyboard.press("Control+A")
+            await page.keyboard.type(value)
+            await page.keyboard.press("Tab")
+
+            # Poll instead of a single fixed-wait check: confirmed live (2026-08-15) that the
+            # PrimeFaces ajax recalculation Tab kicks off (Total Amount = Qty * Unit Price) has
+            # variable settle time under server load — a one-shot check at a fixed delay
+            # intermittently read the value as "not stuck" moments before it actually committed.
+            for _ in range(8):
+                await page.wait_for_timeout(300)
+                if await cell.input_value() == value:
+                    return True
+            logger.warning("Stage B: %s for row %d did not stick (attempt %d) — retrying",
+                            field_name, row_index, attempt + 1)
+        return False
+
+    async def _verify_and_refill_rows(self, line_items: list[LineItem], remarks: str) -> None:
+        """After every Details row has been filled once, re-read ALL rows and re-fill any field
+        that doesn't match its target — repeating a few rounds until everything holds or the
+        attempt budget runs out.
+
+        Confirmed live (2026-08-15) that a row already read back correctly right after being filled
+        can later revert to blank/0.00 once a SUBSEQUENT row's edits fire their own PrimeFaces ajax
+        recalculation — a server-side ordering race (the earlier row's commit hadn't landed
+        server-side yet when the later row's request went out), not a client-side click/typing bug.
+        _fill_line_item_row's own per-cell retry only checks immediately after typing that cell, so
+        it can't catch a value reverted by a LATER row's edit. This re-checks everything at the end.
+        """
+        assert self.page is not None
+        for round_num in range(3):
+            any_problem = False
+            for i, line_item in enumerate(line_items):
+                row = await self._read_grid_row(i, ("item code", "^qty", "unit price", "remarks"))
+                targets = (
+                    ("Qty", f"{line_item.quantity:.2f}", r"^qty", row.get("^qty")),
+                    ("Unit Price", f"{line_item.unit_price:.2f}", "unit price", row.get("unit price")),
+                    ("Remarks", remarks, "remarks", row.get("remarks")),
+                )
+                if not (row.get("item code") or "").strip():
+                    any_problem = True
+                    logger.warning("Verify pass %d: row %d Item Code reverted — re-selecting", round_num + 1, i)
+                    if not await self._select_item_code(ITEM_CODE, i):
+                        logger.warning("Verify pass %d: could not re-select Item Code for row %d", round_num + 1, i)
+                for field_name, target_value, header_regex, current_value in targets:
+                    if current_value == target_value:
+                        continue
+                    any_problem = True
+                    logger.warning("Verify pass %d: row %d %s reverted (%r != %r) — re-filling",
+                                    round_num + 1, i, field_name, current_value, target_value)
+                    await self._fill_grid_field(i, field_name, target_value, header_regex)
+            if not any_problem:
+                break
 
     async def _read_grid_row(self, row_index: int, header_regexes: tuple[str, ...]) -> dict:
         """Read back the CURRENT input values of the given Details-grid row's named columns.
