@@ -402,6 +402,104 @@ class SynergixDriver:
         logger.info("Aborted quotation %s", quotation_no)
         return True
 
+    async def _read_labeled_value(self, label: str) -> str:
+        """Read the current value of a labeled form field (see _fill_labeled_input) without
+        changing it. Unlike _fill_labeled_input, does not exclude [readonly] — reading should work
+        regardless of the field's edit state.
+        """
+        assert self.page is not None
+        value = await self.page.evaluate(
+            """(label) => {
+                const norm = s => (s||'').replace(/\\s+/g,' ').trim();
+                const host = [...document.querySelectorAll('td,div,span,label')]
+                  .find(e => e.children.length === 0 && norm(e.textContent) === label);
+                if (!host) return '';
+                const tr = host.closest('tr');
+                const input = tr ? tr.querySelector('input:not([type=hidden]), textarea') : null;
+                return input ? input.value : '';
+            }""",
+            label,
+        )
+        return value or ""
+
+    async def amend_quotation(self, quotation_no: str, payload: WOPayload) -> dict:
+        """Admin/cleanup utility, NOT part of the regular write pipeline: open an existing,
+        incomplete quotation (Customer/Subject/GL/Project Site already correct, Details grid empty —
+        the shape every quotation from before the 2026-08-14 fill fix came out in) and fill in
+        whatever's missing, reusing the same fixed logic _stage_b_create_quotation uses. Does NOT
+        touch Customer/Salesperson/Project Site (already correct) or Subject/Reference No. — only
+        adds Details rows, sets Payment Method, and fills Project Site if it was left blank.
+
+        `payload` must already have the correct wo_po_number/line_items/job_sheet_number/etc. for
+        this quotation (the caller is expected to have matched it up, e.g. via the Subject field).
+        Leaves the quotation as an un-submitted draft either way — never submits.
+
+        Returns a dict: {"quo": ..., "wo_po": ..., "assertion": "ok"|<error message>}.
+        """
+        assert self.page is not None
+        page = self.page
+        await self.login()
+        await self._open_service_quotation_list()
+
+        header = page.locator("th", has_text="Quotation No.").first
+        filter_input = header.locator("input.ui-column-filter").first
+        await filter_input.click()
+        await filter_input.fill(quotation_no)
+        await filter_input.press("Enter")
+        await page.wait_for_timeout(2500)
+
+        link = page.get_by_role("link", name=quotation_no, exact=True)
+        if not await link.count():
+            return {"quo": quotation_no, "wo_po": payload.wo_po_number, "assertion": "not_found"}
+        await link.first.click(timeout=10000)
+        await page.wait_for_timeout(5000)
+
+        subject = await self._read_labeled_value("Enquiry/Subject")
+        if payload.wo_po_number not in subject:
+            return {"quo": quotation_no, "wo_po": payload.wo_po_number,
+                    "assertion": f"subject mismatch: quotation shows {subject!r}"}
+
+        # Payment Method, if still at the placeholder.
+        if not await self._select_dropdown_option("Payment Method", "Cheque"):
+            logger.warning("amend_quotation: could not set Payment Method for %s", quotation_no)
+
+        # Project Site, only if currently blank (don't disturb an already-correct value).
+        project_site_value = await self._read_labeled_value("Project Site")
+        if not project_site_value.strip():
+            if is_jbtc(payload.town_council):
+                search_term = _PROJECT_SITE_SEARCH_JBTC
+                match_fragment = resolve_project_code(payload.job_sheet_number)
+            else:
+                search_term = _PROJECT_SITE_SEARCH_SKTC
+                match_fragment = SKTC_PROJECT_SITE_MATCH
+            if not await self._select_autocomplete_row("Project Site", search_term, match_fragment):
+                logger.warning("amend_quotation: no Project Site match for %s", quotation_no)
+
+        # Details rows: add rows only up to the target count — idempotent, so re-running this on a
+        # quotation from a prior partially-failed attempt doesn't pile on duplicate rows.
+        line_items = payload.effective_line_items
+        remarks = build_remarks(payload)
+        existing_rows = await page.evaluate(
+            """() => { const g = [...document.querySelectorAll('.ui-datatable')]
+                .find(g => [...g.querySelectorAll('th')].some(t => /unit price/i.test(t.innerText)));
+                return g ? g.querySelectorAll('[id$="_data"] tr').length : 0; }"""
+        )
+        added = existing_rows
+        while added < len(line_items):
+            if not await self._add_line_item():
+                break
+            added += 1
+        for i in range(min(added, len(line_items))):
+            await self._fill_line_item_row(i, line_items[i], remarks)
+
+        try:
+            await self._assert_details_filled(payload)
+            result = {"quo": quotation_no, "wo_po": payload.wo_po_number, "assertion": "ok"}
+        except Exception as exc:
+            result = {"quo": quotation_no, "wo_po": payload.wo_po_number, "assertion": str(exc)}
+        await self._back_to_home()
+        return result
+
     def _subject(self, payload: WOPayload) -> str:
         """Enquiry/Subject string, capped at Synergix's 50-char limit.
 
@@ -441,6 +539,13 @@ class SynergixDriver:
         Unlike Customer/Salesperson/Project Site (live-search autocompletes — _select_autocomplete_row)
         this is a closed, fixed-option dropdown (role=combobox, aria-haspopup=listbox): click the
         trigger to open its panel, then click the matching `<li>` by text.
+
+        The option `<li>` is clicked via a real Playwright Locator built from a marker attribute
+        stamped onto that exact element, polling for the panel to render — NOT a raw
+        `page.mouse.click(x, y)` at a computed bounding-box center. Confirmed live (2026-08-15) that
+        this dropdown (used for Payment Method) was failing on almost every WO in a full batch run
+        with "could not set Payment Method"; the coordinate click is the same silent-failure class
+        documented on _grid_cell_locator and _click_panel_row_by_text.
         """
         assert self.page is not None
         page = self.page
@@ -462,27 +567,39 @@ class SynergixDriver:
             await page.locator(f'[id="{trigger_id}"]').click(timeout=10000)
         except Exception:
             return False
-        await page.wait_for_timeout(500)
 
-        option_coords = await page.evaluate(
-            """([needle]) => {
+        marker = "data-claude-panel-target"
+        js = """([needle, marker]) => {
                 const panels = [...document.querySelectorAll('[id$="_panel"]')]
                     .filter(p => p.offsetParent !== null);
-                for (const panel of panels.reverse()) {
+                for (const panel of panels.slice().reverse()) {
                     const items = [...panel.querySelectorAll('li')];
                     const match = items.find(li => li.textContent.trim() === needle);
-                    if (match) {
-                        const r = match.getBoundingClientRect();
-                        return {x: r.x + r.width / 2, y: r.y + r.height / 2};
-                    }
+                    if (match) { match.setAttribute(marker, '1'); return true; }
                 }
-                return null;
-            }""",
-            [option_text],
-        )
-        if not option_coords:
+                return false;
+            }"""
+        matched = False
+        elapsed = 0
+        step_ms = 300
+        timeout_ms = 4000
+        while elapsed <= timeout_ms:
+            matched = await page.evaluate(js, [option_text, marker])
+            if matched:
+                break
+            await page.wait_for_timeout(step_ms)
+            elapsed += step_ms
+        if not matched:
+            await page.keyboard.press("Escape")
             return False
-        await page.mouse.click(option_coords["x"], option_coords["y"])
+        try:
+            await page.locator(f'[{marker}="1"]').click(timeout=10000)
+        except Exception:
+            return False
+        finally:
+            await page.evaluate(
+                "(m) => document.querySelectorAll(`[${m}]`).forEach(e => e.removeAttribute(m))", marker
+            )
         await page.wait_for_timeout(500)
         return True
 
@@ -507,33 +624,49 @@ class SynergixDriver:
         bug that left the Details grid empty on 151 production quotations; see _grid_cell_locator's
         docstring for the full story. A stamped-attribute Locator gets Playwright's own actionability
         checks (auto-scroll, and a real thrown error if something intercepts the click).
+
+        The FIELD's own input is now located the same way (host label -> its <tr> -> the real
+        <input>), not the offset-coordinate click used here previously. Confirmed live (2026-08-15,
+        the full-batch rerun) that the previous `page.mouse.click(box.x + box.width + 80, box.y + 8)`
+        guess intermittently missed the actual input — same silent-failure shape as the grid-cell bug
+        — showing up as flaky "no Customer match found" / "could not select a Salesperson" despite
+        the exact same council/name working moments earlier or later in the same run.
         """
         assert self.page is not None
         page = self.page
         # Required fields render as "Label *" (the asterisk is part of the same text node, not a
-        # separate element), so a plain exact=True match on e.g. "Salesperson" misses "Salesperson *"
-        # and raises (confirmed live, 2026-08-03). But exact=False is NOT the fix — "Customer" with
-        # exact=False also matches "Customer Type" (a substring match), and .first then non-
-        # deterministically picks whichever comes first in DOM order, which broke every subsequent
-        # attempt to select the real Customer field (confirmed live, same session). Match precisely:
-        # the label text OR the label text followed by exactly " *", nothing looser.
-        field_label = page.get_by_text(re.compile(rf"^{re.escape(label)}(?: \*)?$")).first
-        box = await field_label.bounding_box()
-        if not box:
+        # separate element), so a plain exact match on e.g. "Salesperson" misses "Salesperson *"
+        # (confirmed live, 2026-08-03).
+        handle = await page.evaluate_handle(
+            """(label) => {
+                const norm = s => (s||'').replace(/\\s+/g,' ').trim();
+                const host = [...document.querySelectorAll('td,div,span,label')]
+                  .find(e => e.children.length === 0
+                    && (norm(e.textContent) === label || norm(e.textContent) === label + ' *'));
+                if (!host) return null;
+                const tr = host.closest('tr');
+                return (tr && tr.querySelector('input:not([type=hidden]), textarea')) || null;
+            }""",
+            label,
+        )
+        field_input = handle.as_element()
+        if field_input is None:
             raise RuntimeError(f"could not locate the {label!r} field label")
-        await page.mouse.click(box["x"] + box["width"] + 80, box["y"] + 8)
-        await page.wait_for_timeout(500)
+        await field_input.click()
+        await page.wait_for_timeout(300)
         await page.keyboard.type(search_text)
-        await page.wait_for_timeout(2200)  # ajax panel populate
 
-        match_text = await self._click_panel_row_by_text(must_contain)
+        match_text = await self._click_panel_row_by_text(must_contain, timeout_ms=timeout_ms)
         if not match_text:
+            await page.keyboard.press("Escape")  # close any half-open panel before the next field
             return False
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(1000)
         logger.info("Selected %s row: %s", label, match_text.replace("\t", " | "))
         return True
 
-    async def _click_panel_row_by_text(self, needle: str, *, exclude_grids_with_headers: bool = False) -> str | None:
+    async def _click_panel_row_by_text(
+        self, needle: str, *, exclude_grids_with_headers: bool = False, timeout_ms: int = 6000
+    ) -> str | None:
         """Find a visible autocomplete-panel row containing `needle` and click it, returning its
         text (or None if no match). Clicks via a real Playwright Locator built from a marker
         attribute stamped onto the matched row — NOT raw `page.mouse.click(x, y)` at its computed
@@ -542,12 +675,17 @@ class SynergixDriver:
         computed point returned a different container entirely) with no error and no visible symptom
         besides the selection never taking — the exact bug that left the Details grid empty on 151
         production quotations; see _grid_cell_locator's docstring for the full story.
+
+        Polls for the match to appear (up to timeout_ms) instead of trusting a single check right
+        after a fixed sleep. Confirmed live (2026-08-15, the full-batch rerun) that the ajax panel's
+        populate time varies with server load — a one-shot check after a fixed wait intermittently
+        ran before the panel had rendered, which read as "no match" even though the same search
+        would have succeeded a second or two later.
         """
         assert self.page is not None
         page = self.page
         marker = "data-claude-panel-target"
-        match_text = await page.evaluate(
-            """([needle, marker, excludeHeaders]) => {
+        js = """([needle, marker, excludeHeaders]) => {
                 let panels = [...document.querySelectorAll('.ui-datatable, [id$="_panel"]')]
                     .filter(p => p.offsetParent !== null);
                 if (excludeHeaders) panels = panels.filter(p => !p.querySelector('th'));
@@ -561,9 +699,16 @@ class SynergixDriver:
                     }
                 }
                 return null;
-            }""",
-            [needle, marker, exclude_grids_with_headers],
-        )
+            }"""
+        match_text = None
+        elapsed = 0
+        step_ms = 300
+        while elapsed <= timeout_ms:
+            match_text = await page.evaluate(js, [needle, marker, exclude_grids_with_headers])
+            if match_text:
+                break
+            await page.wait_for_timeout(step_ms)
+            elapsed += step_ms
         if not match_text:
             return None
         row = page.locator(f'[{marker}="1"]')
@@ -666,15 +811,19 @@ class SynergixDriver:
         if not searched:
             logger.warning("Could not find the Item Code autoComplete widget instance for row %d", row_index)
             return False
-        await page.wait_for_timeout(2200)
 
         # The Details grid itself is a .ui-datatable and stays visible throughout, so it can wrongly
         # be picked as "the last visible panel" — exclude it explicitly (it's the only candidate with
         # column headers) and only consider panels whose rows actually contain item_code as a match.
+        # Polls (see _click_panel_row_by_text) rather than a single fixed-wait check — confirmed live
+        # (2026-08-15) that a one-shot check right after a blind sleep intermittently missed a panel
+        # that just hadn't finished its ajax populate yet, reported as "leaving row's item blank",
+        # which then left a half-open autocomplete panel that could block the row's next cell click.
         match_text = await self._click_panel_row_by_text(item_code, exclude_grids_with_headers=True)
         if not match_text:
+            await page.keyboard.press("Escape")  # close any half-open panel before the next cell
             return False
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(1000)
         logger.info("Selected Item Code row: %s", match_text.replace("\t", " | "))
         return True
 
@@ -912,8 +1061,18 @@ class SynergixDriver:
                 await page.keyboard.press("Control+A")
                 await page.keyboard.type(value)
                 await page.keyboard.press("Tab")
-                await page.wait_for_timeout(1500)
-                if await cell.input_value() == value:
+
+                # Poll instead of a single fixed-wait check: confirmed live (2026-08-15) that the
+                # PrimeFaces ajax recalculation Tab kicks off (Total Amount = Qty * Unit Price) has
+                # variable settle time under server load — a one-shot check at a fixed delay
+                # intermittently read the value as "not stuck" moments before it actually committed.
+                committed = False
+                for _ in range(8):
+                    await page.wait_for_timeout(300)
+                    if await cell.input_value() == value:
+                        committed = True
+                        break
+                if committed:
                     break
                 logger.warning("Stage B: %s for %s did not stick (attempt %d) — retrying",
                                 field_name, label, attempt + 1)
