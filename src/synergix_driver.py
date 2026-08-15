@@ -544,6 +544,52 @@ class SynergixDriver:
         await field.click()
         await field.fill(value)
 
+    async def _ensure_tab_active(self, element_id: str) -> None:
+        """If `element_id` sits inside a hidden PrimeFaces tab panel, click that tab's header to
+        activate it first.
+
+        Confirmed live (2026-08-15) via direct DOM inspection that Payment Method/Payment Term
+        live on a SEPARATE tab (icon-only header, no visible text — matched by position among
+        sibling tabs, not label) from the "General" tab that's active when a quotation draft is
+        first created. Every earlier fix attempt at "could not set Payment Method" (coordinate
+        click, then marker-Locator click, then polling) missed this because the trigger really was
+        `display: none` the whole time — not a timing race or wrong-element click, a genuinely
+        inactive tab. `computedStyle(el).display === 'none'` on every ancestor check confirmed this.
+        """
+        assert self.page is not None
+        page = self.page
+        marker = "data-claude-tab-target"
+        stamped = await page.evaluate(
+            """([elementId, marker]) => {
+                const el = document.getElementById(elementId);
+                if (!el) return false;
+                const panel = el.closest('.ui-tabs-panel');
+                if (!panel || !panel.classList.contains('ui-helper-hidden')) return false;
+                const panelsContainer = panel.parentElement;
+                const panels = [...panelsContainer.children];
+                const panelIndex = panels.indexOf(panel);
+                const tabsRoot = panelsContainer.closest('.ui-tabs');
+                const nav = tabsRoot ? tabsRoot.querySelector('ul.ui-tabs-nav') : null;
+                const headers = nav ? [...nav.children] : [];
+                const header = headers[panelIndex];
+                if (!header) return false;
+                header.setAttribute(marker, '1');
+                return true;
+            }""",
+            [element_id, marker],
+        )
+        if not stamped:
+            return
+        try:
+            await page.locator(f'[{marker}="1"]').click(timeout=5000)
+        except Exception as exc:
+            logger.warning("Could not activate the tab containing %s: %s", element_id, exc)
+        finally:
+            await page.evaluate(
+                "(m) => document.querySelectorAll(`[${m}]`).forEach(e => e.removeAttribute(m))", marker
+            )
+        await page.wait_for_timeout(800)
+
     async def _select_dropdown_option(self, label: str, option_text: str) -> bool:
         """Select an option from a plain PrimeFaces `ui-selectonemenu` dropdown by its label.
 
@@ -557,6 +603,9 @@ class SynergixDriver:
         this dropdown (used for Payment Method) was failing on almost every WO in a full batch run
         with "could not set Payment Method"; the coordinate click is the same silent-failure class
         documented on _grid_cell_locator and _click_panel_row_by_text.
+
+        Also activates the field's tab first if it's hidden — see _ensure_tab_active's docstring
+        for the real root cause this addresses (Payment Method/Term live on a non-default tab).
         """
         assert self.page is not None
         page = self.page
@@ -574,6 +623,7 @@ class SynergixDriver:
         )
         if not trigger_id:
             return False
+        await self._ensure_tab_active(trigger_id)
         try:
             await page.locator(f'[id="{trigger_id}"]').click(timeout=10000)
         except Exception:
