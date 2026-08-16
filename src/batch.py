@@ -154,6 +154,26 @@ async def run_batch_from_tcms(limit: int | None = None) -> BatchResult:
                     except Exception:
                         logger.exception("Proactive re-login failed before WO %s — continuing", wo_id)
 
+                # Guardrail: recycle the whole Synergix browser (not just the login session) every N
+                # WOs. Confirmed live (2026-08-16, a 9.5-hour/321-WO unrestricted run) that Synergix
+                # gets slower/flakier the longer a single browser process stays open under sustained
+                # automation — a relogin alone (same browser, same process) doesn't fix that; only a
+                # genuinely fresh browser launch does. Success rate on hand-picked short validation
+                # batches earlier that same night (fresh browser each time) was roughly double the
+                # rate seen deep into the long continuous run.
+                fresh_every = settings.SYNERGIX_FRESH_BROWSER_EVERY
+                if fresh_every and i > 0 and i % fresh_every == 0:
+                    logger.info("Recycling Synergix browser after %d WOs for a fresh session", i)
+                    try:
+                        await synergix.close()
+                        synergix = SynergixDriver()
+                        await synergix.start()
+                    except Exception:
+                        logger.exception(
+                            "Synergix browser recycle failed before WO %s — continuing with "
+                            "whatever driver state exists; subsequent WOs may fail until the next "
+                            "recycle point", wo_id)
+
                 # Guardrail: cap each WO's wall-clock so a wedged/expired session can never hang the
                 # whole batch (previously a single WO stalled ~90 min on stacked click timeouts).
                 try:

@@ -101,6 +101,13 @@ class Settings(BaseSettings):
     # wedged session can never hang the batch. 0 disables proactive re-login.
     SYNERGIX_RELOGIN_EVERY: int = 5
     SYNERGIX_WO_TIMEOUT_S: int = 300   # hard ceiling per WO (seconds)
+    # A page-level relogin (above) reuses the same browser process — confirmed live (2026-08-16,
+    # a 9.5-hour/321-WO unrestricted run) that Synergix itself gets slower/flakier the longer a single
+    # browser session stays open under sustained automation, independent of the login session timeout
+    # relogin already guards against. Every N WOs, close the browser entirely and launch a brand new
+    # one (fresh process, fresh cookies-loaded-from-disk context) instead of just re-navigating.
+    # 0 disables this heavier recycle; keep it a multiple of SYNERGIX_RELOGIN_EVERY.
+    SYNERGIX_FRESH_BROWSER_EVERY: int = 40
 
     # --- Behaviour ---
     DRY_RUN: bool = True          # defaults to True — never default to live
@@ -225,6 +232,7 @@ SYNERGIX_DEDUP_KEY = settings.SYNERGIX_DEDUP_KEY
 SYNERGIX_HEADLESS = settings.SYNERGIX_HEADLESS
 SYNERGIX_RELOGIN_EVERY = settings.SYNERGIX_RELOGIN_EVERY
 SYNERGIX_WO_TIMEOUT_S = settings.SYNERGIX_WO_TIMEOUT_S
+SYNERGIX_FRESH_BROWSER_EVERY = settings.SYNERGIX_FRESH_BROWSER_EVERY
 
 DRY_RUN = settings.DRY_RUN
 DEDUP_STUB_ASSUME_SAFE = settings.DEDUP_STUB_ASSUME_SAFE
