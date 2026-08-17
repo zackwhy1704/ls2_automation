@@ -523,6 +523,19 @@ class SynergixDriver:
             return {"quo": quotation_no, "wo_po": payload.wo_po_number,
                     "assertion": f"subject mismatch: quotation shows {subject!r}"}
 
+        # Customer Contact: map to the WO's real Property officer, overriding the generic "Account
+        # Department" cascaded default. Client explicitly decided (2026-08-17, after a post-
+        # remediation audit flagged this on all 62 live quotations) to map the officer here rather
+        # than accept the default. Must run BEFORE Payment Method for the same tab-hiding reason as
+        # Project Site below. Skip if it already shows the right officer (idempotent re-run).
+        if payload.property_officer:
+            current_contact = await self._read_labeled_value("Customer Contact")
+            if payload.property_officer.strip().upper() not in current_contact.strip().upper():
+                if not await self._try_set_customer_contact(payload.property_officer):
+                    logger.warning(
+                        "amend_quotation: no registered Customer Contact matches %r for %s — left as %r",
+                        payload.property_officer, quotation_no, current_contact)
+
         # Project Site, only if currently blank (don't disturb an already-correct value). Must run
         # BEFORE Payment Method: confirmed live (2026-08-17) that Payment Method's tab-activation
         # (see _ensure_tab_active) switches away from the "General" tab Project Site lives on and
