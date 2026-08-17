@@ -59,3 +59,12 @@ selector or click sequence in this codebase.
   distinct, diagnosable error (see `_detect_mfa_dead_end` in `src/tcms_scraper.py`) rather than a
   silent hang, but resolving it needs a tenant-side exemption or a dedicated non-MFA service account,
   which is a conversation with JBTC, not a code fix.
+- **A small number of WOs on the Un-Invoiced list can never be selected, even after unlimited
+  scrolling — this is a genuine TCMS/D365 rendering defect, not a scraper bug.** Confirmed live
+  (2026-08-17): the WO's row exists in the DOM (correctly counted by `list_uninvoiced()`) but TCMS's
+  own grid gives that specific row's cell a permanently zero-height layout, reproduced identically
+  across 3 independent fresh sessions (full re-login + list reopen each time). These are reported as
+  a distinct status (`TCMS_RENDER_PENDING`, 🔁 in the batch report) rather than lumped in with FAILED
+  — no action needed, they're expected to clear on a later run as the list shifts (other WOs get
+  invoiced/added). If the same WO stays stuck across many consecutive days, that's worth flagging to
+  JBTC directly as a TCMS defect — see `WORowNeverRenderedError` in `src/tcms_scraper.py`.

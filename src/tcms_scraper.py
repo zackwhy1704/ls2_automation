@@ -31,6 +31,35 @@ class WOAlreadyProcessedError(RuntimeError):
         super().__init__(f"status={status!r}, not Received — already processed, skipping")
 
 
+class WORowNeverRenderedError(RuntimeError):
+    """Raised when a WO that list_uninvoiced() genuinely saw can never be made selectable — its row
+    exists in the DOM (confirmed via aria-rowindex) but the FixedDataTable virtualizer gives it a
+    permanently zero-height cell layout, so no amount of scrolling brings it into a real, clickable
+    viewport position.
+
+    Confirmed live (2026-08-17) this is NOT a scroll-budget or session-timing issue: reproduced
+    identically across 3 independent fresh page loads (full re-login + list reopen each time, no
+    shared state), and direct DOM inspection showed the row's entire FixedDataTable cell-layout
+    ancestor chain (fixedDataTableCellLayout_wrap1/2/3, cellContent, cellMain) all report height=0
+    while offsetParent is null — a genuine client-side rendering defect in TCMS's grid for this
+    specific record, not something a different scroll strategy can work around. See
+    docs/operational_expectations.md.
+
+    Distinct from a plain RuntimeError ("not found in the un-invoiced list") so callers can route it
+    to a specific, retryable status rather than a generic FAILED — the client's own investigation
+    (2026-08-04) and other JBTC batch runs both observed a WO that was stuck this way eventually
+    becoming selectable in a LATER run (as other WOs are invoiced/added and the list's virtualization
+    window shifts), so retrying on the next scheduled batch is the correct recovery, not a code fix.
+    """
+
+    def __init__(self, wo_po_number: str):
+        self.wo_po_number = wo_po_number
+        super().__init__(
+            f"{wo_po_number}: row exists in TCMS's un-invoiced list but its grid cell never renders "
+            "with a real height (TCMS-side rendering defect, not a scroll/timing issue) — will retry "
+            "on a future batch run")
+
+
 @dataclass
 class DownloadedWO:
     """Result of TCMSScraper.download_pdf: the PDF plus fields only visible on the TCMS detail
@@ -327,7 +356,18 @@ class TCMSScraper:
             if not await self._wo_row_visible(wo_po_number):
                 await self._scroll_to_wo(wo_po_number)
             if not await self._wo_row_visible(wo_po_number):
-                raise RuntimeError(f"WO {wo_po_number} not found in the un-invoiced list")
+                # Distinguish "the row's data is in the DOM but the grid never gives it real
+                # dimensions" (a TCMS-side rendering defect — see WORowNeverRenderedError) from
+                # "genuinely not present at all" (a different, more concerning problem: the WO may
+                # have been removed from the list entirely, or list_uninvoiced()'s scroll-collect
+                # missed it — worth its own generic error, not silently treated the same way).
+                present = await self._wo_input_locator(wo_po_number).count() > 0
+                if present:
+                    raise WORowNeverRenderedError(wo_po_number)
+                raise RuntimeError(
+                    f"WO {wo_po_number} not found in the un-invoiced list (no matching row in the DOM "
+                    "at all, not even a hidden one — may have been removed from TCMS's list since it "
+                    "was scraped)")
             await self._wo_input_locator(wo_po_number).first.click(timeout=15000)
             # Wait for the selection to actually settle (Preview/Print becoming clickable) rather than
             # a fixed delay — under sustained batch load the page can take longer than 2s to react.

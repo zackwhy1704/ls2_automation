@@ -206,7 +206,7 @@ async def self_process_one(wo_id, scraper, synergix, result) -> WOOutcome | None
     Returns None only for the extraction-failed case (which appends its own outcome). Raised
     exceptions / timeouts are handled by the caller.
     """
-    from src.tcms_scraper import WOAlreadyProcessedError
+    from src.tcms_scraper import WOAlreadyProcessedError, WORowNeverRenderedError
 
     # Cheap dedup on the WO-PO before downloading anything.
     probe = WOPayload(
@@ -226,6 +226,12 @@ async def self_process_one(wo_id, scraper, synergix, result) -> WOOutcome | None
         # of the duplicate check, independent of (and a backstop for) Synergix's own dedup above.
         logger.info("WO %s TCMS status=%r, not Received — skipping", wo_id, exc.status)
         return WOOutcome(wo_id, WOStatus.DUPLICATE, f"TCMS shows status={exc.status!r}, not Received")
+    except WORowNeverRenderedError as exc:
+        # A known TCMS-side grid rendering defect for this specific row, not a code bug — see the
+        # exception's own docstring. Reported distinctly from FAILED so the team doesn't chase it as
+        # a pipeline error; it's expected to clear on a later run.
+        logger.info("WO %s: TCMS render-pending (will retry on a future run): %s", wo_id, exc)
+        return WOOutcome(wo_id, WOStatus.TCMS_RENDER_PENDING, str(exc))
     path = downloaded.path
     try:
         payload = extract_from_pdf(path)

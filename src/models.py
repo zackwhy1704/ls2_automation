@@ -15,6 +15,9 @@ class WOStatus(str, Enum):
     INVALID = "invalid"              # failed validation
     DUPLICATE = "duplicate"          # already invoiced in Synergix — must NOT be billed again
     NEEDS_REVIEW = "needs_review"    # dedup check was inconclusive/errored — a human must verify before billing
+    TCMS_RENDER_PENDING = "tcms_render_pending"  # TCMS's own grid never rendered this row (see
+                                      # WORowNeverRenderedError) — not a code bug, expected to clear
+                                      # on a later run as the list's virtualization window shifts
     PENDING_APPROVAL = "pending_approval"
     APPROVED = "approved"
     REJECTED = "rejected"

@@ -22,6 +22,7 @@ _SECTIONS: list[tuple[WOStatus, str]] = [
     (WOStatus.NEEDS_REVIEW, "⚠️ Needs manual review (see reason per item)"),
     (WOStatus.FAILED, "❌ Failed"),
     (WOStatus.INVALID, "⛔ Invalid (bad/missing data)"),
+    (WOStatus.TCMS_RENDER_PENDING, "🔁 TCMS render-pending — no action needed, will retry automatically"),
     (WOStatus.DUPLICATE, "♻️ Skipped — already invoiced"),
     (WOStatus.PROCESSED, "✅ Submitted to Synergix"),
     (WOStatus.PARTIAL, "📝 Draft created (DRY_RUN — not submitted)"),
@@ -50,10 +51,12 @@ def _quotation_summary(result: BatchResult) -> tuple[int, int, float | None]:
 
     "Generated" counts both PROCESSED (submitted) and PARTIAL (DRY_RUN draft) — either way a real
     quotation now exists in Synergix for that WO. The rate is against non-duplicate WOs only: a
-    DUPLICATE is a correct skip, not an attempt, so it shouldn't drag the rate down.
+    DUPLICATE is a correct skip, not an attempt, so it shouldn't drag the rate down. Same for
+    TCMS_RENDER_PENDING — it never got past the TCMS download step, so it's not a fill attempt either.
     """
     generated = len(result.by_status(WOStatus.PROCESSED)) + len(result.by_status(WOStatus.PARTIAL))
-    attempted = len(result.outcomes) - len(result.by_status(WOStatus.DUPLICATE))
+    attempted = (len(result.outcomes) - len(result.by_status(WOStatus.DUPLICATE))
+                 - len(result.by_status(WOStatus.TCMS_RENDER_PENDING)))
     rate = (generated / attempted * 100) if attempted else None
     return generated, attempted, rate
 
