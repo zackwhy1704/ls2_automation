@@ -149,6 +149,22 @@ class SynergixDriver:
     async def close(self) -> None:
         if self.stubbed:
             return
+        # Settle before closing: confirmed live (2026-08-17) that the LAST record touched before a
+        # batch ends can silently revert a just-typed value. A field committing in the DOM (what
+        # every verify/poll step in this file checks) is the client's own optimistic update, sent
+        # to the server via an async PrimeFaces ajax request — it is not proof the server has
+        # actually received and saved it yet. Spot-checked 7 records spanning an entire 56-item
+        # batch: every one PRIOR to the last-processed record persisted correctly; only the very
+        # last one (with no next-item processing to buffer the gap before this close() call) had
+        # reverted to its pre-edit value. Closing the browser can kill an in-flight save request
+        # before the server ever processes it. This wait gives that final request time to land,
+        # for every caller of close() (the main batch, and every ad-hoc script), not just the one
+        # instance that already happened to fail.
+        if self.page:
+            try:
+                await self.page.wait_for_timeout(4000)
+            except Exception:
+                pass
         if self._context:
             await self._context.close()
         if self._pw:
