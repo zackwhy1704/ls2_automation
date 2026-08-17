@@ -64,6 +64,12 @@ ITEM_TYPE = "S"
 # (non-placeholder) option offered was "GIRO", which the client confirmed is correct.
 PAYMENT_METHOD = "GIRO"
 
+# External Remarks picker target. Confirmed live (2026-08-17) that the "External Remarks" field's
+# magnifying-glass search panel offers a fixed catalog of boilerplate remark codes (OCBC BANK
+# DETAIL, several T&C variants); the client asked for OCBC BANK DETAIL specifically, matching the
+# GIRO payment method.
+EXTERNAL_REMARK_CODE = "OCBC BANK DETAIL"
+
 # Project Site search term per council, used to find the right autocomplete row when creating a
 # quotation from scratch (see _select_autocomplete_row). Searching by the bare numeric code is NOT
 # safe — confirmed live that the same code string can match a DIFFERENT council's project (e.g.
@@ -458,6 +464,12 @@ class SynergixDriver:
         """Read the current value of a labeled form field (see _fill_labeled_input) without
         changing it. Unlike _fill_labeled_input, does not exclude [readonly] — reading should work
         regardless of the field's edit state.
+
+        Falls back to the label's own parent container if it has no `<tr>` ancestor. Confirmed live
+        (2026-08-17) that "External Remarks" uses a div-based grid layout (label + content as
+        sibling divs under a shared `grid-item-column` parent), not a table row — `closest('tr')`
+        found nothing, so this always silently returned '' for that field regardless of its real
+        value, masking whether a fix actually worked or not.
         """
         assert self.page is not None
         value = await self.page.evaluate(
@@ -466,8 +478,8 @@ class SynergixDriver:
                 const host = [...document.querySelectorAll('td,div,span,label')]
                   .find(e => e.children.length === 0 && norm(e.textContent) === label);
                 if (!host) return '';
-                const tr = host.closest('tr');
-                const input = tr ? tr.querySelector('input:not([type=hidden]), textarea') : null;
+                const scope = host.closest('tr') || host.parentElement;
+                const input = scope ? scope.querySelector('input:not([type=hidden]), textarea') : null;
                 return input ? input.value : '';
             }""",
             label,
@@ -528,6 +540,13 @@ class SynergixDriver:
                 match_fragment = SKTC_PROJECT_SITE_MATCH
             if not await self._select_autocomplete_row("Project Site", search_term, match_fragment):
                 logger.warning("amend_quotation: no Project Site match for %s", quotation_no)
+
+        # External Remarks, only if currently blank (don't disturb an already-correct value).
+        external_remarks_value = await self._read_labeled_value("External Remarks")
+        if not external_remarks_value.strip():
+            if not await self._select_external_remark(EXTERNAL_REMARK_CODE):
+                logger.warning("amend_quotation: no External Remarks match for %r on %s",
+                                EXTERNAL_REMARK_CODE, quotation_no)
 
         # Payment Method, if still at the placeholder.
         if not await self._select_dropdown_option("Payment Method", PAYMENT_METHOD):
@@ -616,6 +635,78 @@ class SynergixDriver:
         field = page.locator(f'[id="{input_id}"]')
         await field.click()
         await field.fill(value)
+
+    async def _select_external_remark(self, remark_code: str, *, timeout_ms: int = 6000) -> bool:
+        """Set the 'External Remarks' field via its magnifying-glass search picker, selecting the
+        row whose Remark Code matches `remark_code` (e.g. "OCBC BANK DETAIL"). Returns whether a
+        match was found and selected; leaves the field untouched otherwise.
+
+        A structurally distinct widget from every other autocomplete in this file: clicking the
+        search button opens a real datatable of remark code/description rows, but the row's actual
+        click handler (SynFaces.searchPanel.onSearchPanelResultSelect(...), which both sets the
+        textarea and fires a PrimeFaces ajax update) lives on an `<a>` INSIDE the row's first cell,
+        not on the `<tr>` itself. Confirmed live (2026-08-17) that clicking the row the usual way
+        (a Locator built on the `<tr>`, which Playwright clicks at its bounding-box center) landed
+        on empty cell space next to the link and left the textarea untouched, with no error — the
+        same silent-failure shape documented throughout this file, just with the wrong element
+        being the row instead of the link inside it.
+        """
+        assert self.page is not None
+        page = self.page
+
+        button_id = await page.evaluate(
+            """(label) => {
+                const norm = s => (s||'').replace(/\\s+/g,' ').trim();
+                const host = [...document.querySelectorAll('div.grid-item-label')]
+                    .find(e => norm(e.textContent) === label);
+                if (!host) return null;
+                const container = host.parentElement;
+                const btn = container ? container.querySelector('.synfaces-search-button') : null;
+                return btn ? btn.id : null;
+            }""",
+            "External Remarks",
+        )
+        if not button_id:
+            return False
+        try:
+            await page.locator(f'[id="{button_id}"]').click(timeout=10000)
+        except Exception:
+            return False
+
+        marker = "data-claude-remark-target"
+        js = """([needle, marker]) => {
+                const table = document.querySelector('[id$="searchResultTable"]');
+                if (!table || table.offsetParent === null) return false;
+                const rows = [...table.querySelectorAll('tbody tr')];
+                const match = rows.find(r => r.innerText.includes(needle));
+                if (!match) return false;
+                const link = match.querySelector('a');
+                if (!link) return false;
+                link.setAttribute(marker, '1');
+                return true;
+            }"""
+        found = False
+        elapsed = 0
+        step_ms = 300
+        while elapsed <= timeout_ms:
+            found = await page.evaluate(js, [remark_code, marker])
+            if found:
+                break
+            await page.wait_for_timeout(step_ms)
+            elapsed += step_ms
+        if not found:
+            await page.keyboard.press("Escape")
+            return False
+        try:
+            await page.locator(f'[{marker}="1"]').click(timeout=10000)
+        except Exception:
+            return False
+        finally:
+            await page.evaluate(
+                "(m) => document.querySelectorAll(`[${m}]`).forEach(e => e.removeAttribute(m))", marker
+            )
+        await page.wait_for_timeout(1500)
+        return True
 
     async def _ensure_tab_active(self, element_id: str) -> None:
         """If `element_id` sits inside a hidden PrimeFaces tab panel, click that tab's header to
@@ -1096,6 +1187,11 @@ class SynergixDriver:
         await self._fill_labeled_input("Enquiry/Subject", self._subject(payload))
         await self._fill_labeled_input("Reference No.", payload.gl_number)
         logger.info("Stage B: filled Subject + Reference No. for %s", payload.wo_po_number)
+
+        # --- External Remarks (before Payment Method — same tab-hiding reason as Project Site) ---
+        if not await self._select_external_remark(EXTERNAL_REMARK_CODE):
+            logger.warning("Stage B: no External Remarks match for %r on %s",
+                            EXTERNAL_REMARK_CODE, payload.wo_po_number)
 
         # --- Payment Method (left at the "Sel" placeholder if the target option isn't found) ---
         if not await self._select_dropdown_option("Payment Method", PAYMENT_METHOD):
