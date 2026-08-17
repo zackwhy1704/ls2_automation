@@ -277,13 +277,17 @@ async def main(
         logger.info("Stopped.")
 
 
-async def run_batch(source: str | None, *, poll: bool = False, limit: int | None = None) -> None:
-    """Telegram-free batch pipeline (the recommended path): intake -> auto-submit -> report.
+async def run_batch(
+    source: str | None, *, poll: bool = False, limit: int | None = None, no_telegram: bool = False
+) -> None:
+    """Batch pipeline (the recommended path): intake -> auto-submit -> report.
 
     source: an emails file/dir to ingest, or None to scrape TCMS. `poll` pulls the IMAP mailbox first.
     `limit` caps how many WOs are handled (TCMS path) for sampling. Every valid, non-duplicate WO is
     auto-submitted (gated by DRY_RUN); the outcome of every WO is reported (Telegram/email) for the
-    team to spot-check in Synergix.
+    team to spot-check in Synergix. `no_telegram` (the `--no-telegram` CLI flag) suppresses that
+    report send — logs the report as usual but posts nothing — for testing against production
+    Synergix/TCMS without also spamming the real ops Telegram chat.
     """
     from src.batch import WOOutcome, run_batch_from_emails, run_batch_from_tcms
     from src.models import WOStatus
@@ -325,7 +329,7 @@ async def run_batch(source: str | None, *, poll: bool = False, limit: int | None
 
     result.outcomes[:0] = intake_review  # surface orphans/unverified senders in the same report
 
-    await report_mod.send_report(result)
+    await report_mod.send_report(result, send=not no_telegram)
     logger.info("Batch complete: %d WO(s) processed", len(result.outcomes))
 
 
@@ -335,6 +339,8 @@ if __name__ == "__main__":
     #   python -m src.main --batch --limit 20            # cap to the first 20 WOs (sampling)
     #   python -m src.main --batch --poll                # pull IMAP emails, then batch-process
     #   python -m src.main --batch --emails path/to/dir  # batch-process a dir/file of .msg/.eml/.pdf
+    #   python -m src.main --batch --no-telegram --limit 3  # dry-run against prod TCMS/Synergix
+    #                                                         # without posting to the real Telegram chat
     #   --- legacy Telegram-approval flows: ---
     #   python -m src.main                               # TCMS scrape -> Telegram approval
     #   python -m src.main --emails path/to/dir          # email flow -> Telegram approval
@@ -359,6 +365,6 @@ if __name__ == "__main__":
         _eml = argv[0]
 
     if _batch:
-        asyncio.run(run_batch(_eml, poll=_poll, limit=_limit))
+        asyncio.run(run_batch(_eml, poll=_poll, limit=_limit, no_telegram=_no_tg))
     else:
         asyncio.run(main(_eml, no_telegram=_no_tg, poll=_poll))

@@ -601,6 +601,32 @@ class SynergixDriver:
         subject = f"{payload.wo_po_number} - {council}"
         return subject[:50]
 
+    async def _click_when_clear(self, locator, *, timeout_ms: int = 10000, overlay_wait_ms: int = 8000) -> None:
+        """Click `locator`, but first wait out any active PrimeFaces `blockUI` overlay.
+
+        Added 2026-08-17 after a live run hit a 30s Locator.click timeout on the Customer field
+        with the call log showing `<div class="blockUI blockOverlay"></div> intercepts pointer
+        events` on every retry — the exact failure mode the client's own audit already identified
+        as the root cause of the original 151-empty-quotation incident (see
+        _abort_blank_draft's docstring). That incident's fix (_abort_blank_draft) cleans up the
+        orphaned draft AFTER the failure; this addresses the failure itself by waiting for the
+        overlay PrimeFaces shows during its own ajax calls to detach before attempting the click,
+        instead of fighting it via Playwright's built-in click retries (which give up at the
+        locator's own timeout regardless of overlay state).
+
+        Bounded: if the overlay never clears within overlay_wait_ms, proceeds to the click attempt
+        anyway (the ordinary Locator timeout/error still applies) rather than hanging indefinitely
+        — a genuinely stuck overlay must still surface as a clear failure, not a silent hang.
+        """
+        assert self.page is not None
+        page = self.page
+        try:
+            await page.locator(".blockUI.blockOverlay").first.wait_for(
+                state="detached", timeout=overlay_wait_ms)
+        except Exception:
+            pass  # no overlay was showing, or it didn't clear in time — either way, try the click
+        await locator.click(timeout=timeout_ms)
+
     async def _fill_labeled_input(self, label: str, value: str, *, timeout_ms: int = 4000) -> None:
         """Fill the input/textarea belonging to a form field identified by its on-screen label.
 
@@ -646,7 +672,7 @@ class SynergixDriver:
         if not input_id:
             raise RuntimeError(f"could not locate the input for field {label!r}")
         field = page.locator(f'[id="{input_id}"]')
-        await field.click()
+        await self._click_when_clear(field)
         await field.fill(value)
 
     async def _select_external_remark(self, remark_code: str, *, timeout_ms: int = 6000) -> bool:
@@ -682,7 +708,7 @@ class SynergixDriver:
         if not button_id:
             return False
         try:
-            await page.locator(f'[id="{button_id}"]').click(timeout=10000)
+            await self._click_when_clear(page.locator(f'[id="{button_id}"]'))
         except Exception:
             return False
 
@@ -711,7 +737,7 @@ class SynergixDriver:
             await page.keyboard.press("Escape")
             return False
         try:
-            await page.locator(f'[{marker}="1"]').click(timeout=10000)
+            await self._click_when_clear(page.locator(f'[{marker}="1"]'))
         except Exception:
             return False
         finally:
@@ -758,7 +784,7 @@ class SynergixDriver:
         if not stamped:
             return
         try:
-            await page.locator(f'[{marker}="1"]').click(timeout=5000)
+            await self._click_when_clear(page.locator(f'[{marker}="1"]'), timeout_ms=5000)
         except Exception as exc:
             logger.warning("Could not activate the tab containing %s: %s", element_id, exc)
         finally:
@@ -802,7 +828,7 @@ class SynergixDriver:
             return False
         await self._ensure_tab_active(trigger_id)
         try:
-            await page.locator(f'[id="{trigger_id}"]').click(timeout=10000)
+            await self._click_when_clear(page.locator(f'[id="{trigger_id}"]'))
         except Exception:
             return False
 
@@ -831,7 +857,7 @@ class SynergixDriver:
             await page.keyboard.press("Escape")
             return False
         try:
-            await page.locator(f'[{marker}="1"]').click(timeout=10000)
+            await self._click_when_clear(page.locator(f'[{marker}="1"]'))
         except Exception:
             return False
         finally:
@@ -899,7 +925,7 @@ class SynergixDriver:
         if not input_id:
             raise RuntimeError(f"could not locate the {label!r} field label")
         field_input = page.locator(f'[id="{input_id}"]')
-        await field_input.click()
+        await self._click_when_clear(field_input)
         await page.wait_for_timeout(300)
         # Clear any existing text before typing — confirmed live (2026-08-17) that calling this
         # twice on the same field (e.g. a failed search followed by restoring the original value)
@@ -1020,7 +1046,7 @@ class SynergixDriver:
             return None
         row = page.locator(f'[{marker}="1"]')
         try:
-            await row.click(timeout=10000)
+            await self._click_when_clear(row)
         except Exception as exc:
             logger.warning("Could not click matched panel row for %r: %s", needle, exc)
             return None
@@ -1095,7 +1121,7 @@ class SynergixDriver:
         cell = await self._grid_cell_locator(row_index, "item code")
         if not cell:
             return False
-        await cell.click(timeout=10000)
+        await self._click_when_clear(cell)
         await page.wait_for_timeout(300)
         await page.keyboard.insert_text(item_code)
 
@@ -1432,7 +1458,7 @@ class SynergixDriver:
                 logger.warning("Stage B: could not locate the %s cell for row %d", field_name, row_index)
                 return False
             try:
-                await cell.click(timeout=10000)
+                await self._click_when_clear(cell)
             except Exception as exc:
                 logger.warning("Stage B: could not click the %s cell for row %d: %s", field_name, row_index, exc)
                 return False

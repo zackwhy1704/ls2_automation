@@ -113,16 +113,22 @@ def build_html(result: BatchResult) -> str:
     return "".join(rows)
 
 
-async def send_report(result: BatchResult) -> bool:
+async def send_report(result: BatchResult, *, send: bool = True) -> bool:
     """Send the batch report over the configured channel(s). Always logs it first.
 
     Async because the caller (the batch pipeline) runs inside an event loop. REPORT_CHANNEL:
     "telegram" (default), "email", or "both". Returns True if at least one channel delivered.
+
+    send=False logs the report but skips every network send — used by --batch --no-telegram for a
+    console-only dry run (e.g. this verification session), so it doesn't post real batch reports to
+    the production Telegram chat while testing.
     """
     import asyncio
 
     text = build_text(result)
     logger.info("Batch report:\n%s", text)  # always log it
+    if not send:
+        return False
 
     channel = settings.REPORT_CHANNEL.strip().lower()
     sent = False
