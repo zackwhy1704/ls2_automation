@@ -1485,6 +1485,21 @@ class SynergixDriver:
     async def _back_to_home(self) -> None:
         if not self.page:
             return
+        # Settle before navigating away: confirmed live (2026-08-17, an independent audit) that
+        # this is the SAME class of bug as close()'s pre-close wait, just triggered by navigation
+        # instead of closing the browser — a page.goto() abandons any in-flight PrimeFaces ajax
+        # request the moment it starts, before the server has necessarily processed/saved it. Since
+        # _back_to_home() runs after EVERY record in a batch (write()'s finally, and the end of
+        # amend_quotation), not just the very last one, this explains a wider pattern than close()
+        # alone covered: 5 of ~20 multi-line quotations in one run had their unit price commit
+        # correctly but a quantity field on one row silently revert to 0 afterward — the pricing
+        # value settled before this navigation, the quantity value (written later, per-field) did
+        # not. The wait must happen BEFORE goto(), not after — the in-flight request is abandoned
+        # the instant navigation starts, so waiting only after wait_for_load_state is too late.
+        try:
+            await self.page.wait_for_timeout(4000)
+        except Exception:
+            pass
         try:
             await self.page.goto(settings.SYNERGIX_BASE_URL)
             await self.page.wait_for_load_state("networkidle")
