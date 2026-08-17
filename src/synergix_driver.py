@@ -495,11 +495,13 @@ class SynergixDriver:
             return {"quo": quotation_no, "wo_po": payload.wo_po_number,
                     "assertion": f"subject mismatch: quotation shows {subject!r}"}
 
-        # Payment Method, if still at the placeholder.
-        if not await self._select_dropdown_option("Payment Method", PAYMENT_METHOD):
-            logger.warning("amend_quotation: could not set Payment Method for %s", quotation_no)
-
-        # Project Site, only if currently blank (don't disturb an already-correct value).
+        # Project Site, only if currently blank (don't disturb an already-correct value). Must run
+        # BEFORE Payment Method: confirmed live (2026-08-17) that Payment Method's tab-activation
+        # (see _ensure_tab_active) switches away from the "General" tab Project Site lives on and
+        # never switches back, so filling Payment Method first leaves Project Site's own input
+        # genuinely not visible — a Locator.click on it then times out for the full 30s rather than
+        # failing fast. _stage_b_create_quotation already does Project Site before Payment Method
+        # for the same reason; this just matches that proven order.
         project_site_value = await self._read_labeled_value("Project Site")
         if not project_site_value.strip():
             if is_jbtc(payload.town_council):
@@ -510,6 +512,10 @@ class SynergixDriver:
                 match_fragment = SKTC_PROJECT_SITE_MATCH
             if not await self._select_autocomplete_row("Project Site", search_term, match_fragment):
                 logger.warning("amend_quotation: no Project Site match for %s", quotation_no)
+
+        # Payment Method, if still at the placeholder.
+        if not await self._select_dropdown_option("Payment Method", PAYMENT_METHOD):
+            logger.warning("amend_quotation: could not set Payment Method for %s", quotation_no)
 
         # Details rows: add rows only up to the target count — idempotent, so re-running this on a
         # quotation from a prior partially-failed attempt doesn't pile on duplicate rows.
