@@ -85,11 +85,19 @@ async def _process_one(
     wo_id: str, scraper: TCMSScraper, synergix: SynergixDriver, gate: TelegramGate
 ) -> None:
     """TCMS scrape path: download the WO PDF, then run the shared extract/validate/queue pipeline."""
+    from src.tcms_scraper import WOAlreadyProcessedError
+
     logger.info("Processing WO %s", wo_id)
-    source_path = await scraper.download_pdf(wo_id)
-    await db.upsert_scraped(wo_id, source_path)
     try:
-        payload = extract(source_path)  # PDF -> WOPayload
+        downloaded = await scraper.download_pdf(wo_id)
+    except WOAlreadyProcessedError as exc:
+        logger.info("WO %s TCMS status=%r, not Received — skipping", wo_id, exc.status)
+        await db.set_status(wo_id, WOStatus.DUPLICATE, error=f"TCMS shows status={exc.status!r}")
+        return
+    await db.upsert_scraped(wo_id, downloaded.path)
+    try:
+        payload = extract(downloaded.path)  # PDF -> WOPayload
+        payload.property_officer = downloaded.property_officer or None
     except ExtractionError as exc:
         logger.warning("Extraction failed for %s: %s", wo_id, exc)
         await db.set_status(wo_id, WOStatus.INVALID, error=f"extraction failed: {exc}")

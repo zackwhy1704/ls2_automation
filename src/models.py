@@ -50,6 +50,39 @@ def is_jbtc(town_council: str) -> bool:
     return "jalan besar" in (town_council or "").strip().lower()
 
 
+class LineItem(BaseModel):
+    """One row of a WO's "Description of Work" table. Most WOs have exactly one; some (e.g. a
+    combined inspection + transport charge) have several, each under its own "Job Sheet:" block but
+    sharing the same job_sheet_number — see WOPayload.line_items.
+    """
+
+    description: str = ""            # the line's work description, for reference only
+    quantity: float
+    unit_price: float                # gross Rate per unit for THIS line (e.g. $30.00)
+    discount_percent: Optional[float] = None   # e.g. 10.0 for "10.00%"
+    discount_amount: Optional[float] = None     # e.g. 3.00
+    net_amount: Optional[float] = None          # this line's Job Cost (gross adjusted for discount)
+
+    @property
+    def billed_unit_price(self) -> float:
+        """The per-unit price that must actually be billed to Synergix — net_amount / quantity, NOT
+        the raw gross unit_price.
+
+        Added 2026-08-17 after a client SOP review of 54 live quotations found every single one
+        under-billed by exactly the JBTC 10% SOR uplift (net_amount = gross + discount_amount for
+        JBTC — see is_jbtc's docstring): the Synergix Details-grid fill was typing `unit_price`
+        (gross) instead of the authorised net figure. quantity x unit_price on the WO IS the gross
+        job cost the discount then adjusts, so unit_price alone was never the billable rate for any
+        WO with a discount — dividing net_amount back out by quantity recovers the correct per-unit
+        rate to enter, so Synergix's own qty x price reproduces net_amount on the quotation.
+        Falls back to the raw gross unit_price only if net_amount/quantity aren't usable (e.g. a
+        malformed or free/zero-cost line), rather than raising.
+        """
+        if self.net_amount is not None and self.quantity:
+            return round(self.net_amount / self.quantity, 2)
+        return self.unit_price
+
+
 class WOPayload(BaseModel):
     wo_po_number: str                # format WO-PO/XXXXXXXXX
     town_council: str = ""           # e.g. "Sengkang Town Council" — from the WO header, drives remarks
@@ -59,19 +92,34 @@ class WOPayload(BaseModel):
     job_date: date
     prepared_by: str                 # becomes customer contact
     gl_number: str                   # goes into Reference No. — the "731-AN-..." alphanumeric G/L code
-    quantity: float
-    unit_price: float                # gross Rate per unit (e.g. $30.00 on the WO)
+    quantity: float                  # first line item's quantity — kept for validate()/remarks/legacy display
+    unit_price: float                # first line item's gross Rate — same reason
 
-    # Full pricing breakdown from the WO. Captured so the Synergix line mapping can decide which
-    # figure to use; unit_price above stays the gross Rate for backward compatibility.
+    # Every line item on the WO (usually just one). Synergix needs one Details-grid row per entry;
+    # net_amount below is the SUM across all of them, which is what must reconcile with grand_total —
+    # comparing grand_total against only the first line's net_amount is exactly what caused every
+    # multi-line WO to trip the money-consistency trust gate as a false "misread" (confirmed against
+    # 21/21 real flagged WOs, 2026-08-07: every one reconciled once ALL lines were summed).
+    line_items: list[LineItem] = Field(default_factory=list)
+
+    # Full pricing breakdown from the WO. discount_percent/discount_amount are the first line's, kept
+    # for backward compatibility; net_amount is the SUM of every line_items entry (pre-GST, before
+    # discount is what "gross" means — net_amount is gross adjusted for discount).
     # TODO(human): confirm which amount Synergix expects on the line (gross vs net-after-discount).
     discount_percent: Optional[float] = None   # e.g. 10.0 for "10.00%"
     discount_amount: Optional[float] = None     # e.g. 3.00
-    net_amount: Optional[float] = None          # gross less discount, before GST (e.g. 27.00)
+    net_amount: Optional[float] = None          # SUM of all line items' net Job Cost, before GST
     gst_percent: Optional[float] = None         # e.g. 9.0
     grand_total: Optional[float] = None         # net + GST (e.g. 29.43)
 
     sr_number: Optional[str] = None             # the "SR"/Schedule reference seen in subject/body, if any
+
+    # The TCMS WO's "Property officer" — the Town Council staff member who raised the WO. Not on the
+    # printed PDF (extract_from_pdf can't get it); scraped separately from the TCMS WO detail page
+    # (TCMSScraper.download_pdf) and set on the payload afterward for the JBTC/TCMS flow only — the
+    # SKTC/email flow has no TCMS page to scrape, so this stays unset there. Used for Synergix's
+    # Customer Contact field, which otherwise falls back to a generic default.
+    property_officer: Optional[str] = None
 
     # The file the extractor read AND the file Synergix attaches in stage D. For the email flow this
     # is the WO PDF attachment when present, otherwise the saved source email. (Named source_path
@@ -81,3 +129,20 @@ class WOPayload(BaseModel):
     # pydantic eagerly evaluates field annotations, unlike the deferred `from __future__ import annotations`.
     extraction_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)  # 0..1 from Haiku
     low_confidence_fields: list[str] = Field(default_factory=list)  # field names Haiku itself flagged as unsure
+
+    @property
+    def effective_line_items(self) -> list[LineItem]:
+        """line_items if the extractor populated it, else a single line synthesized from the
+        top-level quantity/unit_price/discount fields — so a payload built directly (e.g. in tests,
+        or anything predating the multi-line-item extractor change) still yields exactly one Synergix
+        Details row, matching the old behavior.
+        """
+        if self.line_items:
+            return self.line_items
+        return [LineItem(
+            quantity=self.quantity,
+            unit_price=self.unit_price,
+            discount_percent=self.discount_percent,
+            discount_amount=self.discount_amount,
+            net_amount=self.net_amount,
+        )]

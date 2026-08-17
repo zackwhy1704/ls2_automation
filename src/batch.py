@@ -154,6 +154,26 @@ async def run_batch_from_tcms(limit: int | None = None) -> BatchResult:
                     except Exception:
                         logger.exception("Proactive re-login failed before WO %s — continuing", wo_id)
 
+                # Guardrail: recycle the whole Synergix browser (not just the login session) every N
+                # WOs. Confirmed live (2026-08-16, a 9.5-hour/321-WO unrestricted run) that Synergix
+                # gets slower/flakier the longer a single browser process stays open under sustained
+                # automation — a relogin alone (same browser, same process) doesn't fix that; only a
+                # genuinely fresh browser launch does. Success rate on hand-picked short validation
+                # batches earlier that same night (fresh browser each time) was roughly double the
+                # rate seen deep into the long continuous run.
+                fresh_every = settings.SYNERGIX_FRESH_BROWSER_EVERY
+                if fresh_every and i > 0 and i % fresh_every == 0:
+                    logger.info("Recycling Synergix browser after %d WOs for a fresh session", i)
+                    try:
+                        await synergix.close()
+                        synergix = SynergixDriver()
+                        await synergix.start()
+                    except Exception:
+                        logger.exception(
+                            "Synergix browser recycle failed before WO %s — continuing with "
+                            "whatever driver state exists; subsequent WOs may fail until the next "
+                            "recycle point", wo_id)
+
                 # Guardrail: cap each WO's wall-clock so a wedged/expired session can never hang the
                 # whole batch (previously a single WO stalled ~90 min on stacked click timeouts).
                 try:
@@ -186,6 +206,8 @@ async def self_process_one(wo_id, scraper, synergix, result) -> WOOutcome | None
     Returns None only for the extraction-failed case (which appends its own outcome). Raised
     exceptions / timeouts are handled by the caller.
     """
+    from src.tcms_scraper import WOAlreadyProcessedError
+
     # Cheap dedup on the WO-PO before downloading anything.
     probe = WOPayload(
         wo_po_number=wo_id, job_sheet_number="0", service_location="-",
@@ -197,9 +219,17 @@ async def self_process_one(wo_id, scraper, synergix, result) -> WOOutcome | None
         logger.info("WO %s DUPLICATE (pre-download) — skipping", wo_id)
         return WOOutcome(wo_id, WOStatus.DUPLICATE, "already invoiced in Synergix")
 
-    path = await scraper.download_pdf(wo_id)
+    try:
+        downloaded = await scraper.download_pdf(wo_id)
+    except WOAlreadyProcessedError as exc:
+        # JBTC's Un-Invoiced WO list is hand-maintained and can be stale — this is the TCMS-side half
+        # of the duplicate check, independent of (and a backstop for) Synergix's own dedup above.
+        logger.info("WO %s TCMS status=%r, not Received — skipping", wo_id, exc.status)
+        return WOOutcome(wo_id, WOStatus.DUPLICATE, f"TCMS shows status={exc.status!r}, not Received")
+    path = downloaded.path
     try:
         payload = extract_from_pdf(path)
+        payload.property_officer = downloaded.property_officer or None
         await db.upsert_scraped(payload.wo_po_number, payload.source_path)
     except ExtractionError as exc:
         logger.warning("Extraction failed for %s: %s", wo_id, exc)

@@ -89,3 +89,84 @@ def test_no_discount_same_for_both_councils():
             _raw(town_council=council, discount_amount=0, discount_percent=0), source_path="x.pdf",
         )
         assert payload.net_amount == 30.0
+
+
+# --- multi-line-item WOs (2026-08-07 fix: net_amount must SUM every line, not just the first) ---
+#
+# Confirmed against 21/21 real WOs flagged NEEDS_REVIEW in production: every one was a multi-line WO
+# whose grand_total only reconciled once ALL line items' Job Cost figures were added together — see
+# WOPayload.line_items's docstring. These numbers are the real WO-PO/000079106 example (two line
+# items, both JBTC, adding via discount_amount): 44.00 + 33.00 = 77.00, * 1.09 GST = 83.93.
+
+def _raw_multi_line(*, town_council: str, line_items: list[dict], grand_total: float) -> str:
+    base = dict(
+        wo_po_number="WO-PO/000079106",
+        town_council=town_council,
+        job_sheet_number="25949",
+        service_location="Blk 333 Kreta Ayer Road",
+        nature_of_work="Rodent surveillance",
+        job_date="2026-06-10",
+        prepared_by="leslieng",
+        gl_number="431-KK-KKR2P1-080333-0-721010-0000",
+        line_items=line_items,
+        gst_percent=9.0,
+        grand_total=grand_total,
+        sr_number="",
+        confidence=0.95,
+        low_confidence_fields=[],
+    )
+    return json.dumps(base)
+
+
+def test_multi_line_items_net_amount_sums_all_lines():
+    raw = _raw_multi_line(
+        town_council="Jalan Besar Town Council",
+        line_items=[
+            {"description": "Rodent surveillance", "quantity": 1.0, "unit_price": 40.0,
+             "discount_percent": 10.0, "discount_amount": 4.0},
+            {"description": "Transport charges", "quantity": 1.0, "unit_price": 30.0,
+             "discount_percent": 10.0, "discount_amount": 3.0},
+        ],
+        grand_total=83.93,
+    )
+    payload = _finalize(raw, source_path="x.pdf")
+
+    assert len(payload.line_items) == 2
+    assert payload.line_items[0].net_amount == 44.0
+    assert payload.line_items[1].net_amount == 33.0
+    assert payload.net_amount == 77.0  # the sum — NOT just the first line's 44.0
+    # Top-level quantity/unit_price mirror the first line, for validate()/legacy display.
+    assert payload.quantity == 1.0
+    assert payload.unit_price == 40.0
+
+
+def test_multi_line_items_trust_gate_passes_once_summed():
+    from src.validator import check_extraction_trust
+
+    raw = _raw_multi_line(
+        town_council="Jalan Besar Town Council",
+        line_items=[
+            {"quantity": 1.0, "unit_price": 40.0, "discount_percent": 10.0, "discount_amount": 4.0},
+            {"quantity": 1.0, "unit_price": 30.0, "discount_percent": 10.0, "discount_amount": 3.0},
+        ],
+        grand_total=83.93,
+    )
+    payload = _finalize(raw, source_path="x.pdf")
+    assert not any("money mismatch" in c for c in check_extraction_trust(payload))
+
+
+def test_effective_line_items_falls_back_when_unset():
+    # A payload built directly (no extractor involved, e.g. in other tests) should still yield
+    # exactly one synthetic line item matching its flat fields.
+    from src.models import WOPayload
+
+    payload = WOPayload(
+        wo_po_number="WO-PO/1", job_sheet_number="A1", service_location="x", nature_of_work="x",
+        job_date="2026-01-01", prepared_by="x", gl_number="GL-1",
+        quantity=2.0, unit_price=50.0, net_amount=100.0, source_path="x.pdf",
+    )
+    items = payload.effective_line_items
+    assert len(items) == 1
+    assert items[0].quantity == 2.0
+    assert items[0].unit_price == 50.0
+    assert items[0].net_amount == 100.0
