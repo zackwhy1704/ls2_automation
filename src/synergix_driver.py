@@ -842,7 +842,8 @@ class SynergixDriver:
         return True
 
     async def _select_autocomplete_row(
-        self, label: str, search_text: str, must_contain: str, *, timeout_ms: int = 8000
+        self, label: str, search_text: str, must_contain: str, *, timeout_ms: int = 8000,
+        extra_words: list[str] | None = None,
     ) -> bool:
         """Click a live-autocomplete field by its label, type search_text, and click the first
         visible dropdown row whose text contains must_contain.
@@ -907,7 +908,8 @@ class SynergixDriver:
         await page.keyboard.press("Control+A")
         await page.keyboard.type(search_text)
 
-        match_text = await self._click_panel_row_by_text(must_contain, timeout_ms=timeout_ms)
+        match_text = await self._click_panel_row_by_text(
+            must_contain, timeout_ms=timeout_ms, extra_needles=extra_words)
         if not match_text:
             await page.keyboard.press("Escape")  # close any half-open panel before the next field
             return False
@@ -924,16 +926,27 @@ class SynergixDriver:
         "Account Department" on every quotation) that this field is a real PrimeFaces autoComplete
         with its own hidden id field (`{"party_code":...,"party_contact_code":...}`) backing a
         CLOSED list of contacts registered against the customer in Synergix — not a free-text field.
-        Searching a real TCMS-scraped property-officer name (e.g. "NURUL") against it returned zero
-        results live: these Town Council officer names generally aren't registered as Synergix
-        contacts at all. Blindly `.fill()`-ing the visible input (the previous approach) would show
-        the officer's name in the box while the hidden field silently kept pointing at the old
-        contact — a display/data mismatch, not a fix. So: try the real search-and-select; if nothing
-        matches, re-search-and-reselect the ORIGINAL value to restore a consistent state instead of
-        leaving whatever text the failed search typed in.
+        Blindly `.fill()`-ing the visible input (the previous approach) would show the officer's
+        name in the box while the hidden field silently kept pointing at the old contact — a
+        display/data mismatch, not a fix. So: try the real search-and-select; if nothing matches,
+        re-search-and-reselect the ORIGINAL value to restore a consistent state instead of leaving
+        whatever text the failed search typed in.
+
+        Search by the officer's FIRST word only, not the full name. Confirmed live (2026-08-17) that
+        Synergix's ajax search appears to filter on a single name field: searching "NURUL" (one
+        word) returned the real contact row ("BUYER35 | Nurul Hasanah"), but searching the full
+        "NURUL HASANAH" returned zero rows for that contact at all — a multi-word query the server
+        itself can't satisfy, not a client-side matching problem. The remaining word(s) are instead
+        required (case-insensitively) to also appear in whichever row the first word turns up, so a
+        first-name collision with an unrelated contact doesn't get picked by mistake.
         """
         original = await self._read_labeled_value("Customer Contact")
-        if await self._select_autocomplete_row("Customer Contact", name, name.upper(), timeout_ms=4000):
+        words = [w for w in name.split() if w]
+        search_term = words[0] if words else name
+        extra_words = words[1:]
+        if await self._select_autocomplete_row(
+            "Customer Contact", search_term, search_term, timeout_ms=4000, extra_words=extra_words
+        ):
             return True
         if original.strip():
             if not await self._select_autocomplete_row(
@@ -945,33 +958,46 @@ class SynergixDriver:
         return False
 
     async def _click_panel_row_by_text(
-        self, needle: str, *, exclude_grids_with_headers: bool = False, timeout_ms: int = 6000
+        self, needle: str, *, exclude_grids_with_headers: bool = False, timeout_ms: int = 6000,
+        extra_needles: list[str] | None = None,
     ) -> str | None:
-        """Find a visible autocomplete-panel row containing `needle` and click it, returning its
-        text (or None if no match). Clicks via a real Playwright Locator built from a marker
-        attribute stamped onto the matched row — NOT raw `page.mouse.click(x, y)` at its computed
-        bounding-box coordinates. Confirmed live (2026-08-14) that coordinate clicks in this app can
-        silently land on an unrelated overlapping element (`document.elementFromPoint()` at the
-        computed point returned a different container entirely) with no error and no visible symptom
-        besides the selection never taking — the exact bug that left the Details grid empty on 151
-        production quotations; see _grid_cell_locator's docstring for the full story.
+        """Find a visible autocomplete-panel row containing `needle` (and, if given, every one of
+        `extra_needles` too) and click it, returning its text (or None if no match). Clicks via a
+        real Playwright Locator built from a marker attribute stamped onto the matched row — NOT raw
+        `page.mouse.click(x, y)` at its computed bounding-box coordinates. Confirmed live
+        (2026-08-14) that coordinate clicks in this app can silently land on an unrelated overlapping
+        element (`document.elementFromPoint()` at the computed point returned a different container
+        entirely) with no error and no visible symptom besides the selection never taking — the exact
+        bug that left the Details grid empty on 151 production quotations; see _grid_cell_locator's
+        docstring for the full story.
 
         Polls for the match to appear (up to timeout_ms) instead of trusting a single check right
         after a fixed sleep. Confirmed live (2026-08-15, the full-batch rerun) that the ajax panel's
         populate time varies with server load — a one-shot check after a fixed wait intermittently
         ran before the panel had rendered, which read as "no match" even though the same search
         would have succeeded a second or two later.
+
+        Match is case-insensitive. Confirmed live (2026-08-17, Customer Contact mapping) that a
+        case-sensitive `.includes()` silently missed a real, currently-displayed match — the panel
+        row read "Nurul Hasanah" (Synergix's own Title Case) while the caller's needle was the
+        TCMS-scraped ALL-CAPS "NURUL HASANAH", so the exact same bug shape (looks empty, isn't) that
+        _read_labeled_value already hit for External Remarks.
         """
         assert self.page is not None
         page = self.page
         marker = "data-claude-panel-target"
-        js = """([needle, marker, excludeHeaders]) => {
+        js = """([needle, marker, excludeHeaders, extraNeedles]) => {
                 let panels = [...document.querySelectorAll('.ui-datatable, [id$="_panel"]')]
                     .filter(p => p.offsetParent !== null);
                 if (excludeHeaders) panels = panels.filter(p => !p.querySelector('th'));
+                const needleUp = needle.toUpperCase();
+                const extraUp = (extraNeedles || []).map(e => e.toUpperCase());
                 for (const panel of panels.slice().reverse()) {
                     const rows = [...panel.querySelectorAll('tbody tr')];
-                    const match = rows.find(r => r.innerText.includes(needle));
+                    const match = rows.find(r => {
+                        const t = r.innerText.toUpperCase();
+                        return t.includes(needleUp) && extraUp.every(e => t.includes(e));
+                    });
                     if (match) {
                         match.setAttribute(marker, '1');
                         match.scrollIntoView();
@@ -984,7 +1010,8 @@ class SynergixDriver:
         elapsed = 0
         step_ms = 300
         while elapsed <= timeout_ms:
-            match_text = await page.evaluate(js, [needle, marker, exclude_grids_with_headers])
+            match_text = await page.evaluate(
+                js, [needle, marker, exclude_grids_with_headers, extra_needles])
             if match_text:
                 break
             await page.wait_for_timeout(step_ms)
