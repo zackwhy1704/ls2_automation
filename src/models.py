@@ -63,6 +63,25 @@ class LineItem(BaseModel):
     discount_amount: Optional[float] = None     # e.g. 3.00
     net_amount: Optional[float] = None          # this line's Job Cost (gross adjusted for discount)
 
+    @property
+    def billed_unit_price(self) -> float:
+        """The per-unit price that must actually be billed to Synergix — net_amount / quantity, NOT
+        the raw gross unit_price.
+
+        Added 2026-08-17 after a client SOP review of 54 live quotations found every single one
+        under-billed by exactly the JBTC 10% SOR uplift (net_amount = gross + discount_amount for
+        JBTC — see is_jbtc's docstring): the Synergix Details-grid fill was typing `unit_price`
+        (gross) instead of the authorised net figure. quantity x unit_price on the WO IS the gross
+        job cost the discount then adjusts, so unit_price alone was never the billable rate for any
+        WO with a discount — dividing net_amount back out by quantity recovers the correct per-unit
+        rate to enter, so Synergix's own qty x price reproduces net_amount on the quotation.
+        Falls back to the raw gross unit_price only if net_amount/quantity aren't usable (e.g. a
+        malformed or free/zero-cost line), rather than raising.
+        """
+        if self.net_amount is not None and self.quantity:
+            return round(self.net_amount / self.quantity, 2)
+        return self.unit_price
+
 
 class WOPayload(BaseModel):
     wo_po_number: str                # format WO-PO/XXXXXXXXX

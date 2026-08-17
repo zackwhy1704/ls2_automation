@@ -516,7 +516,7 @@ class SynergixDriver:
         subject = f"{payload.wo_po_number} - {council}"
         return subject[:50]
 
-    async def _fill_labeled_input(self, label: str, value: str) -> None:
+    async def _fill_labeled_input(self, label: str, value: str, *, timeout_ms: int = 4000) -> None:
         """Fill the input/textarea belonging to a form field identified by its on-screen label.
 
         Synergix's JSF ids are auto-generated, so we anchor on the (stable) label text and take the
@@ -530,11 +530,17 @@ class SynergixDriver:
         confirmed live on the Customer Contact field, which is filled right after Customer's cascade.
         A Locator re-resolves the id at click time instead of clicking a stale reference, and its
         ids are stable across a PrimeFaces re-render even though the DOM node object is replaced.
+
+        Polls for the host+input to appear (up to timeout_ms) instead of a single check. Confirmed
+        live (2026-08-17, per a client SOP review) that Customer Contact was failing with "could not
+        locate the input" on effectively every WO all night: it's filled immediately after Customer's
+        own cascade, and a one-shot check right after that cascade starts can run before the
+        cascade-rendered row exists yet — the same ajax-timing class of bug already fixed elsewhere
+        in this file (_click_panel_row_by_text, _select_dropdown_option's option match).
         """
         assert self.page is not None
         page = self.page
-        input_id = await page.evaluate(
-            """(label) => {
+        js = """(label) => {
                 const norm = s => (s||'').replace(/\\s+/g,' ').trim();
                 const host = [...document.querySelectorAll('td,div,span,label')]
                   .find(e => e.children.length === 0 && norm(e.textContent) === label);
@@ -542,9 +548,16 @@ class SynergixDriver:
                 const tr = host.closest('tr');
                 const input = tr && tr.querySelector('input:not([type=hidden]):not([readonly]), textarea');
                 return input ? input.id : null;
-            }""",
-            label,
-        )
+            }"""
+        input_id = None
+        elapsed = 0
+        step_ms = 300
+        while elapsed <= timeout_ms:
+            input_id = await page.evaluate(js, label)
+            if input_id:
+                break
+            await page.wait_for_timeout(step_ms)
+            elapsed += step_ms
         if not input_id:
             raise RuntimeError(f"could not locate the input for field {label!r}")
         field = page.locator(f'[id="{input_id}"]')
@@ -730,6 +743,11 @@ class SynergixDriver:
         field_input = page.locator(f'[id="{input_id}"]')
         await field_input.click()
         await page.wait_for_timeout(300)
+        # Clear any existing text before typing — confirmed live (2026-08-17) that calling this
+        # twice on the same field (e.g. a failed search followed by restoring the original value)
+        # otherwise inserts the new text into the middle of whatever was already there instead of
+        # replacing it, since a plain click() only focuses the field without selecting its content.
+        await page.keyboard.press("Control+A")
         await page.keyboard.type(search_text)
 
         match_text = await self._click_panel_row_by_text(must_contain, timeout_ms=timeout_ms)
@@ -739,6 +757,35 @@ class SynergixDriver:
         await page.wait_for_timeout(1000)
         logger.info("Selected %s row: %s", label, match_text.replace("\t", " | "))
         return True
+
+    async def _try_set_customer_contact(self, name: str) -> bool:
+        """Try to select `name` as Customer Contact via the field's own autocomplete search;
+        restore the original selection if there's no match, rather than leaving a typed-but-
+        unselected mismatch. Returns whether `name` was actually selected.
+
+        Confirmed live (2026-08-17, per a client SOP review flagging Customer Contact stuck on
+        "Account Department" on every quotation) that this field is a real PrimeFaces autoComplete
+        with its own hidden id field (`{"party_code":...,"party_contact_code":...}`) backing a
+        CLOSED list of contacts registered against the customer in Synergix — not a free-text field.
+        Searching a real TCMS-scraped property-officer name (e.g. "NURUL") against it returned zero
+        results live: these Town Council officer names generally aren't registered as Synergix
+        contacts at all. Blindly `.fill()`-ing the visible input (the previous approach) would show
+        the officer's name in the box while the hidden field silently kept pointing at the old
+        contact — a display/data mismatch, not a fix. So: try the real search-and-select; if nothing
+        matches, re-search-and-reselect the ORIGINAL value to restore a consistent state instead of
+        leaving whatever text the failed search typed in.
+        """
+        original = await self._read_labeled_value("Customer Contact")
+        if await self._select_autocomplete_row("Customer Contact", name, name.upper(), timeout_ms=4000):
+            return True
+        if original.strip():
+            if not await self._select_autocomplete_row(
+                "Customer Contact", original, original, timeout_ms=4000
+            ):
+                logger.warning(
+                    "Could not restore original Customer Contact %r after failed search for %r",
+                    original, name)
+        return False
 
     async def _click_panel_row_by_text(
         self, needle: str, *, exclude_grids_with_headers: bool = False, timeout_ms: int = 6000
@@ -952,11 +999,10 @@ class SynergixDriver:
         # which have no TCMS page to scrape it from). Best-effort: a full SOP audit found this stuck
         # on a generic "Account Department" default on every quotation (MAJOR finding 4.3).
         if payload.property_officer:
-            try:
-                await self._fill_labeled_input("Customer Contact", payload.property_officer)
-            except Exception as exc:
-                logger.warning("Stage B: could not set Customer Contact for %s: %s",
-                                payload.wo_po_number, exc)
+            if not await self._try_set_customer_contact(payload.property_officer):
+                logger.warning(
+                    "Stage B: no registered Customer Contact matches %r for %s — left at the "
+                    "cascaded default", payload.property_officer, payload.wo_po_number)
 
         # --- Salesperson ---
         # TODO(human): "TAN WEI YING" is the salesperson seen on every real quotation observed so
@@ -1025,8 +1071,10 @@ class SynergixDriver:
         assert self.page is not None
         line_items = payload.effective_line_items
         problems: list[str] = []
+        rows: list[dict] = []
         for i in range(len(line_items)):
             row = await self._read_grid_row(i, ("item code", "^qty", "unit price", "remarks"))
+            rows.append(row)
             if not (row.get("item code") or "").strip():
                 problems.append(f"row {i}: Item Code is blank")
             if float(row.get("^qty") or 0) <= 0:
@@ -1035,6 +1083,27 @@ class SynergixDriver:
                 problems.append(f"row {i}: Unit Price is {row.get('unit price')!r}")
             if not (row.get("remarks") or "").strip():
                 problems.append(f"row {i}: Remarks is blank")
+
+        # Standing control added 2026-08-17 per a client SOP review of 54 live quotations: every
+        # single one was under-billed by exactly the JBTC 10% SOR uplift because the grid was being
+        # filled with the gross unit_price instead of the WO-authorised net figure (see
+        # LineItem.billed_unit_price). Each row individually looked "filled" the whole time — only a
+        # reconciliation against the WO's own net_amount actually catches a wrong-but-nonzero value.
+        # Only meaningful once every row is individually clean; skip if the payload has no
+        # net_amount to reconcile against (e.g. an unstructured free-text WO).
+        if not problems and payload.net_amount is not None:
+            computed_total = 0.0
+            for row in rows:
+                try:
+                    computed_total += float(row.get("^qty") or 0) * float(row.get("unit price") or 0)
+                except (TypeError, ValueError):
+                    pass
+            computed_total = round(computed_total, 2)
+            if abs(computed_total - payload.net_amount) > 0.05:
+                problems.append(
+                    f"pre-GST total {computed_total:.2f} does not match WO-authorised net amount "
+                    f"{payload.net_amount:.2f}"
+                )
 
         total_js = """() => {
                 const label = [...document.querySelectorAll('td,div,span')]
@@ -1135,7 +1204,7 @@ class SynergixDriver:
         # Price — and moving to the next cell before it settles interrupts that cell's own commit).
         for field_name, value, header_regex in (
             ("Qty", f"{line_item.quantity:.2f}", r"^qty"),
-            ("Unit Price", f"{line_item.unit_price:.2f}", "unit price"),
+            ("Unit Price", f"{line_item.billed_unit_price:.2f}", "unit price"),
             ("Remarks", remarks, "remarks"),
         ):
             await self._fill_grid_field(row_index, field_name, value, header_regex)
@@ -1200,7 +1269,7 @@ class SynergixDriver:
                 row = await self._read_grid_row(i, ("item code", "^qty", "unit price", "remarks"))
                 targets = (
                     ("Qty", f"{line_item.quantity:.2f}", r"^qty", row.get("^qty")),
-                    ("Unit Price", f"{line_item.unit_price:.2f}", "unit price", row.get("unit price")),
+                    ("Unit Price", f"{line_item.billed_unit_price:.2f}", "unit price", row.get("unit price")),
                     ("Remarks", remarks, "remarks", row.get("remarks")),
                 )
                 if not (row.get("item code") or "").strip():
