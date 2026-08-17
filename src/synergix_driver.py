@@ -353,6 +353,37 @@ class SynergixDriver:
         finally:
             await self._back_to_home()
 
+    async def _abort_blank_draft(self, quo_id: str | None, wo_po_number: str) -> None:
+        """Best-effort cleanup: abort a just-created draft that failed before Customer was even set,
+        so a genuinely empty shell (no customer, no subject, nothing a human could act on) doesn't
+        linger in Synergix forever.
+
+        Added 2026-08-17 after an independent audit found QUO0006650 — a fresh blank shell dated
+        that same day, created by exactly this failure mode (a Customer-selection crash right after
+        the "+" click, from a stuck blockUI overlay). The write() pipeline's normal except handler
+        just logs and returns FAILED with no cleanup step, which is how the ORIGINAL 151-empty-
+        quotation incident this whole investigation started from actually happened — this closes
+        that gap for the specific case where NOTHING useful was captured yet.
+
+        Deliberately only called this early. A failure after Customer/Salesperson/Details are
+        already set still leaves a (possibly incomplete) draft that has real review value — e.g.
+        the 54 partial drafts from tonight's runs — and must NOT be aborted just because one later
+        step failed.
+        """
+        if not quo_id:
+            logger.warning(
+                "Stage B failed before Customer was set for %s, and no draft id could be read to "
+                "clean up — a blank shell may have been left behind; check Synergix manually",
+                wo_po_number)
+            return
+        try:
+            logger.warning("Aborting blank draft %s for %s (failed before Customer was set)",
+                            quo_id, wo_po_number)
+            await self.abort_quotation(quo_id)
+        except Exception:
+            logger.exception("Could not abort blank draft %s for %s — may need manual cleanup",
+                              quo_id, wo_po_number)
+
     async def abort_quotation(self, quotation_no: str) -> bool:
         """Admin/cleanup utility, NOT part of the regular write pipeline: open an existing quotation
         by its number and abort (discard) it — for removing bad/orphaned drafts, e.g. the batch of
@@ -988,10 +1019,23 @@ class SynergixDriver:
 
         await page.locator("button:has(span.fa-plus)").first.click()
         await page.wait_for_timeout(8000)
+        # Captured now, while the freshly-created draft's form is still visibly loaded — used only
+        # to clean up a genuinely blank shell if Customer selection fails below. Capturing it here
+        # (rather than re-reading it at failure time) matters because the failure mode this guards
+        # against can leave the page stuck on an unrelated view (e.g. still the list page behind a
+        # stuck blockUI overlay), where _current_quotation_id() would find nothing to abort even
+        # though a real empty draft was already created by the "+" click above.
+        draft_quo_id = await self._current_quotation_id()
 
         # --- Customer (cascades Address/Contact/Currency/Sales Tax/SBU) ---
         council = payload.town_council.strip() or "Town Council"
-        if not await self._select_autocomplete_row("Customer", council, council.upper()):
+        try:
+            customer_ok = await self._select_autocomplete_row("Customer", council, council.upper())
+        except Exception:
+            await self._abort_blank_draft(draft_quo_id, payload.wo_po_number)
+            raise
+        if not customer_ok:
+            await self._abort_blank_draft(draft_quo_id, payload.wo_po_number)
             raise RuntimeError(f"no Customer match found in Synergix for {council!r}")
 
         # --- Customer Contact: override the cascaded default with the real TC officer who raised
