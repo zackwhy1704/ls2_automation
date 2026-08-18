@@ -375,14 +375,40 @@ class TCMSScraper:
             # more time" — a real WO tested this way found it instantly (<1s). A timeout here means
             # the row click didn't put the page into the expected selected state at all. First fix
             # attempt (widening 20s->45s) was WRONG — same WO still timed out at 45s, confirming this
-            # isn't a patience problem. Kept at 20s; on timeout, capture real diagnostics (below)
-            # instead of guessing again.
+            # isn't a patience problem.
+            #
+            # Root cause (confirmed live 2026-08-18 via a saved screenshot on a real failure): the
+            # click can land the SPA on a completely different page — a "Work order" detail/search
+            # module (title "Work order", a filter sidebar with "Cancelled WO"/"All WO", no Preview/
+            # Print anywhere) — instead of the expected in-place "Un-Invoiced WO" list selection, even
+            # though the URL's `mi=` parameter stayed the same. This looks like a client-side routing
+            # race: the click fires while a previous in-flight navigation (from _open_uninvoiced_list
+            # or the prior WO's _back_to_list) hasn't fully settled. Retrying once via a fresh
+            # list-reopen is a reasonable first attempt at recovery, NOT yet confirmed live to work —
+            # if it fails too, that's still surfaced as a real error with diagnostics, not swallowed.
             preview_print = S.require("TCMS_WO_PREVIEW_PRINT", S.TCMS_WO_PREVIEW_PRINT)
             try:
                 await self.page.wait_for_selector(preview_print, state="visible", timeout=20000)
             except Exception:
-                await self._diagnose_selection_failure(wo_po_number)
-                raise
+                title = await self.page.title()
+                if "un-invoiced" not in title.lower():
+                    logger.warning(
+                        "WO %s: landed on unexpected page %r after clicking its row (routing race) — "
+                        "reopening the list fresh and retrying once", wo_po_number, title)
+                    try:
+                        await self._open_uninvoiced_list()
+                        if not await self._wo_row_visible(wo_po_number):
+                            await self._scroll_to_wo(wo_po_number)
+                        if not await self._wo_row_visible(wo_po_number):
+                            raise WORowNeverRenderedError(wo_po_number)
+                        await self._wo_input_locator(wo_po_number).first.click(timeout=15000)
+                        await self.page.wait_for_selector(preview_print, state="visible", timeout=20000)
+                    except Exception:
+                        await self._diagnose_selection_failure(wo_po_number)
+                        raise
+                else:
+                    await self._diagnose_selection_failure(wo_po_number)
+                    raise
             await self.page.wait_for_timeout(1000)
 
             status, property_officer = await self._read_wo_detail_fields()
