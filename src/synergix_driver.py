@@ -601,7 +601,7 @@ class SynergixDriver:
         subject = f"{payload.wo_po_number} - {council}"
         return subject[:50]
 
-    async def _click_when_clear(self, locator, *, timeout_ms: int = 10000, overlay_wait_ms: int = 8000) -> None:
+    async def _click_when_clear(self, locator, *, timeout_ms: int = 10000, overlay_wait_ms: int = 30000) -> None:
         """Click `locator`, but first wait out any active PrimeFaces `blockUI` overlay.
 
         Added 2026-08-17 after a live run hit a 30s Locator.click timeout on the Customer field
@@ -614,9 +614,18 @@ class SynergixDriver:
         instead of fighting it via Playwright's built-in click retries (which give up at the
         locator's own timeout regardless of overlay state).
 
+        overlay_wait_ms widened from 8s to 30s (2026-08-18) after a live batch run hit this exact
+        failure again on the Customer field right after quotation creation, with the overlay still
+        blocking after the full original 8s+10s (18s) budget. Measured live immediately after: 5
+        fresh back-to-back draft creations in the same session all cleared in 2.2-2.9s — the slow
+        case is a genuine occasional server-side spike on an operation that reliably does complete,
+        not a permanently-stuck state (unlike the unrelated TCMS grid-scoping bug this was once
+        confused with) — so more patience here is the right fix, not a guess.
+
         Bounded: if the overlay never clears within overlay_wait_ms, proceeds to the click attempt
         anyway (the ordinary Locator timeout/error still applies) rather than hanging indefinitely
-        — a genuinely stuck overlay must still surface as a clear failure, not a silent hang.
+        — a genuinely stuck overlay must still surface as a clear failure, not a silent hang. The
+        existing _abort_blank_draft safety net still cleans up if it does.
         """
         assert self.page is not None
         page = self.page
