@@ -122,13 +122,15 @@ async def run_batch_from_pdfs(pdf_paths: list[str]) -> BatchResult:
     return result
 
 
-async def run_batch_from_tcms(limit: int | None = None) -> BatchResult:
+async def run_batch_from_tcms(limit: int | None = None, skip: int = 0) -> BatchResult:
     """Scrape TCMS and process each un-invoiced WO in a STREAMING pipeline.
 
     For each WO id from the un-invoiced list we: (1) dedup on the WO-PO FIRST — a DUPLICATE is skipped
     without the expensive PDF download; (2) otherwise download the PDF, extract, and process. Results
     stream in one WO at a time, so a mid-run failure still leaves everything-so-far done and reported.
-    `limit` caps how many WOs are handled (for sampling); None = all.
+    `limit` caps how many WOs are handled (for sampling); None = all. `skip` drops that many from the
+    front first, so e.g. `skip=50, limit=50` covers the NEXT 50 rather than re-processing the first
+    50 again — the un-invoiced list has no other pagination/offset mechanism.
     """
     import asyncio
     from src.tcms_scraper import TCMSScraper
@@ -140,9 +142,14 @@ async def run_batch_from_tcms(limit: int | None = None) -> BatchResult:
         async with TCMSScraper() as scraper:
             await scraper.login()
             wo_ids = await scraper.list_uninvoiced()
+            if skip:
+                wo_ids = wo_ids[skip:]
             if limit is not None:
                 wo_ids = wo_ids[:limit]
-                logger.info("Batch capped to first %d of the un-invoiced WOs", len(wo_ids))
+            if skip or limit is not None:
+                logger.info(
+                    "Batch capped to %d WO(s) (skip=%d, limit=%s) of the un-invoiced list",
+                    len(wo_ids), skip, limit)
 
             for i, wo_id in enumerate(wo_ids):
                 # Guardrail: proactively start a fresh Synergix session every N WOs so we stay under

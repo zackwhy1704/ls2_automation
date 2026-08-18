@@ -278,12 +278,15 @@ async def main(
 
 
 async def run_batch(
-    source: str | None, *, poll: bool = False, limit: int | None = None, no_telegram: bool = False
+    source: str | None, *, poll: bool = False, limit: int | None = None, skip: int = 0,
+    no_telegram: bool = False,
 ) -> None:
     """Batch pipeline (the recommended path): intake -> auto-submit -> report.
 
     source: an emails file/dir to ingest, or None to scrape TCMS. `poll` pulls the IMAP mailbox first.
-    `limit` caps how many WOs are handled (TCMS path) for sampling. Every valid, non-duplicate WO is
+    `limit` caps how many WOs are handled (TCMS path) for sampling; `skip` drops that many from the
+    front first, so consecutive runs can cover consecutive slices (e.g. skip=0/limit=50, then
+    skip=50/limit=50) instead of re-processing the same WOs. Every valid, non-duplicate WO is
     auto-submitted (gated by DRY_RUN); the outcome of every WO is reported (Telegram/email) for the
     team to spot-check in Synergix. `no_telegram` (the `--no-telegram` CLI flag) suppresses that
     report send — logs the report as usual but posts nothing — for testing against production
@@ -294,7 +297,8 @@ async def run_batch(
     from src import report as report_mod
 
     settings.configure_logging()
-    logger.info("Batch pipeline — %s%s", settings.summary(), f" (limit={limit})" if limit else "")
+    logger.info("Batch pipeline — %s%s", settings.summary(),
+                f" (skip={skip}, limit={limit})" if (skip or limit) else "")
     await db.init_db()
 
     intake_review: list = []
@@ -325,7 +329,7 @@ async def run_batch(
         result = await run_batch_from_emails(source)
     else:
         logger.info("Batch: scraping + processing un-invoiced WOs from TCMS (streaming)")
-        result = await run_batch_from_tcms(limit=limit)
+        result = await run_batch_from_tcms(limit=limit, skip=skip)
 
     result.outcomes[:0] = intake_review  # surface orphans/unverified senders in the same report
 
@@ -337,6 +341,8 @@ if __name__ == "__main__":
     # Usage:
     #   python -m src.main --batch                       # RECOMMENDED: TCMS scrape -> auto-submit -> report
     #   python -m src.main --batch --limit 20            # cap to the first 20 WOs (sampling)
+    #   python -m src.main --batch --skip 50 --limit 50  # cover the NEXT 50 (e.g. after a prior
+    #                                                         --limit 50 run), not the same 50 again
     #   python -m src.main --batch --poll                # pull IMAP emails, then batch-process
     #   python -m src.main --batch --emails path/to/dir  # batch-process a dir/file of .msg/.eml/.pdf
     #   python -m src.main --batch --no-telegram --limit 3  # dry-run against prod TCMS/Synergix
@@ -356,6 +362,12 @@ if __name__ == "__main__":
         if i + 1 < len(argv):
             _limit = int(argv[i + 1])
             del argv[i:i + 2]
+    _skip = 0
+    if "--skip" in argv:
+        i = argv.index("--skip")
+        if i + 1 < len(argv):
+            _skip = int(argv[i + 1])
+            del argv[i:i + 2]
     argv = [a for a in argv if a not in ("--no-telegram", "--poll", "--batch")]
 
     _eml: str | None = None
@@ -365,6 +377,6 @@ if __name__ == "__main__":
         _eml = argv[0]
 
     if _batch:
-        asyncio.run(run_batch(_eml, poll=_poll, limit=_limit, no_telegram=_no_tg))
+        asyncio.run(run_batch(_eml, poll=_poll, limit=_limit, skip=_skip, no_telegram=_no_tg))
     else:
         asyncio.run(main(_eml, no_telegram=_no_tg, poll=_poll))
