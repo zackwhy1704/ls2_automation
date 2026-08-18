@@ -122,7 +122,8 @@ async def run_batch_from_pdfs(pdf_paths: list[str]) -> BatchResult:
     return result
 
 
-async def run_batch_from_tcms(limit: int | None = None, skip: int = 0) -> BatchResult:
+async def run_batch_from_tcms(limit: int | None = None, skip: int = 0,
+                              max_new: int | None = None) -> BatchResult:
     """Scrape TCMS and process each un-invoiced WO in a STREAMING pipeline.
 
     For each WO id from the un-invoiced list we: (1) dedup on the WO-PO FIRST — a DUPLICATE is skipped
@@ -131,6 +132,12 @@ async def run_batch_from_tcms(limit: int | None = None, skip: int = 0) -> BatchR
     `limit` caps how many WOs are handled (for sampling); None = all. `skip` drops that many from the
     front first, so e.g. `skip=50, limit=50` covers the NEXT 50 rather than re-processing the first
     50 again — the un-invoiced list has no other pagination/offset mechanism.
+
+    `max_new` stops the run once that many NON-DUPLICATE WOs have actually been attempted (same
+    definition report._quotation_summary uses: DUPLICATE and TCMS_RENDER_PENDING are correct skips,
+    not attempts). JBTC's un-invoiced list is mostly already-invoiced records — a live validation
+    run that wants "N real quotations" would otherwise have to grind through a few hundred dedup
+    checks to find them, so this caps the work by outcome instead of by list position.
     """
     import asyncio
     from src.tcms_scraper import TCMSScraper
@@ -202,6 +209,16 @@ async def run_batch_from_tcms(limit: int | None = None, skip: int = 0) -> BatchR
                 except Exception as exc:
                     logger.exception("Failed handling WO %s — recording FAILED, continuing", wo_id)
                     result.outcomes.append(WOOutcome(wo_id, WOStatus.FAILED, str(exc)))
+
+                if max_new is not None:
+                    attempted = sum(
+                        1 for o in result.outcomes
+                        if o.status not in (WOStatus.DUPLICATE, WOStatus.TCMS_RENDER_PENDING))
+                    if attempted >= max_new:
+                        logger.info(
+                            "Reached max_new=%d non-duplicate WO(s) after scanning %d of %d "
+                            "candidate(s) — stopping here", max_new, i + 1, len(wo_ids))
+                        break
     finally:
         await synergix.close()
     return result
