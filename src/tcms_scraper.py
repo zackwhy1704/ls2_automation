@@ -197,17 +197,37 @@ class TCMSScraper:
         await self.page.wait_for_timeout(12000)
         await self.page.wait_for_selector(S.require("TCMS_WO_ROW", S.TCMS_WO_ROW))
 
-    # JS that reads every rendered WO/PO id from any D365 grid cell input on the page.
+    # The "Un-Invoiced WO" view renders THREE grids on the same page simultaneously: "Purchase
+    # order header versions" (the real un-invoiced list), "Purchase line versions", and
+    # "VendorPortal:PurchaseOrderResponseHdrNotArchVerLabel" (the "WO for Acknowledgement" queue —
+    # a different status entirely, ~80 rows, that admin staff have already moved these WOs to).
+    # Confirmed live (2026-08-18, per the client's own correction after this was misdiagnosed as a
+    # TCMS rendering defect) that every WO-lookup helper below was UNSCOPED — querySelectorAll/XPath
+    # searched the WHOLE page — so it silently mixed in rows from the Acknowledgement grid. Those
+    # rows genuinely exist in the DOM (hence "found" by a page-wide search) but were never going to
+    # become visible no matter how much we scrolled the Un-Invoiced grid's own scrollbar, because
+    # they were never IN it. All lookups now scope to this one grid specifically.
+    _WO_GRID_SELECTOR = '[role="grid"][aria-label*="header versions"]'
+
+    def _wo_grid_locator(self):
+        assert self.page is not None
+        return self.page.locator(self._WO_GRID_SELECTOR).first
+
+    # JS that reads every rendered WO/PO id from the Un-Invoiced grid specifically (see
+    # _WO_GRID_SELECTOR) — takes the grid selector as its one argument.
     _COLLECT_WO_IDS_JS = (
-        "() => { const out = []; "
-        "document.querySelectorAll('[role=\"grid\"] input').forEach(i => { "
+        "(gridSelector) => { const out = []; const grid = document.querySelector(gridSelector); "
+        "if (!grid) return out; "
+        "grid.querySelectorAll('input').forEach(i => { "
         "const v = (i.value || '').trim(); if (v.startsWith('WO-PO/')) out.push(v); }); "
         "return out; }"
     )
 
     def _wo_input_locator(self, wo_po_number: str):
         """Locator for the WO/PO cell input holding this exact id, matched by its `value` ATTRIBUTE
-        (present in the DOM per live inspection, not just the JS property) via XPath.
+        (present in the DOM per live inspection, not just the JS property) via XPath, scoped to the
+        Un-Invoiced grid specifically (see _WO_GRID_SELECTOR) — NOT a page-wide search, which would
+        also match the co-located "WO for Acknowledgement" grid's rows.
 
         NOT Playwright's role/description locator: confirmed live (2026-08-04) that the row's
         accessible description (derived from its `title` attribute, since aria-label already claims
@@ -219,8 +239,7 @@ class TCMSScraper:
         here (observed all-zero for an otherwise visible, in-viewport cell), so let Playwright's own
         `.click()` do the scroll-into-view + actionability work instead of computing coordinates.
         """
-        assert self.page is not None
-        return self.page.locator(f'xpath=//input[@value="{wo_po_number}"]')
+        return self._wo_grid_locator().locator(f'xpath=.//input[@value="{wo_po_number}"]')
 
     async def _wo_row_visible(self, wo_po_number: str) -> bool:
         """True only once the row is genuinely on-screen and clickable, not merely present in the DOM.
@@ -247,19 +266,39 @@ class TCMSScraper:
     _SCROLLBAR_FACE = ".ScrollbarLayout_main.ScrollbarLayout_mainVertical.public_Scrollbar_main"
 
     async def _focus_scrollbar(self) -> bool:
-        """Click the WO grid's own vertical scrollbar to focus it for ArrowDown-driven scrolling.
+        """Click the Un-Invoiced grid's own vertical scrollbar to focus it for ArrowDown-driven
+        scrolling — NOT just any visible scrollbar on the page.
 
-        The page can have more than one `.ScrollbarLayout_main.ScrollbarLayout_mainVertical` element
-        (e.g. a stale/hidden one from another panel) — `.first` isn't reliable. Pick the visible one.
+        The page can have more than one `.ScrollbarLayout_main.ScrollbarLayout_mainVertical`
+        element: besides a stale/hidden one from another panel, the co-located "WO for
+        Acknowledgement" grid (see _WO_GRID_SELECTOR) renders its OWN visible scrollbar too.
+        Confirmed live (2026-08-18) that picking "the first visible one" could silently focus and
+        scroll the WRONG grid while _wo_row_visible polled the CORRECT grid for a row that was
+        never going to move — explaining the inconsistent, seemingly-random pattern of which rows
+        "never rendered" across otherwise-identical runs. Now prefers whichever visible candidate's
+        vertical position actually overlaps the Un-Invoiced grid's own bounding rect.
         """
         assert self.page is not None
         candidates = self.page.locator(self._SCROLLBAR_FACE)
         count = await candidates.count()
+        grid_rect = await self._wo_grid_rect()
+        fallback = None
         for i in range(count):
             candidate = candidates.nth(i)
-            if await candidate.is_visible():
+            if not await candidate.is_visible():
+                continue
+            if fallback is None:
+                fallback = candidate
+            if not grid_rect:
+                continue
+            box = await candidate.bounding_box()
+            if (box and box["y"] < grid_rect["y"] + grid_rect["h"]
+                    and box["y"] + box["height"] > grid_rect["y"]):
                 await candidate.click(timeout=5000)
                 return True
+        if fallback is not None:
+            await fallback.click(timeout=5000)
+            return True
         return False
 
     async def list_uninvoiced(self) -> list[str]:
@@ -273,14 +312,14 @@ class TCMSScraper:
         assert self.page is not None
         await self._open_uninvoiced_list()
 
-        seen: set[str] = set(await self.page.evaluate(self._COLLECT_WO_IDS_JS))
+        seen: set[str] = set(await self.page.evaluate(self._COLLECT_WO_IDS_JS, self._WO_GRID_SELECTOR))
         if await self._focus_scrollbar():
             stagnant = 0
             for _ in range(600):  # generous cap (verified reaching 252/252 rows); exits on stagnation
                 await self.page.keyboard.press("ArrowDown")
                 await self.page.wait_for_timeout(150)
                 before = len(seen)
-                seen.update(await self.page.evaluate(self._COLLECT_WO_IDS_JS))
+                seen.update(await self.page.evaluate(self._COLLECT_WO_IDS_JS, self._WO_GRID_SELECTOR))
                 stagnant = 0 if len(seen) > before else stagnant + 1
                 if stagnant >= 40:  # ~6s of no new rows -> reached the end
                     break
@@ -290,14 +329,15 @@ class TCMSScraper:
         return ids
 
     async def _wo_grid_rect(self) -> dict | None:
-        """Bounding rect of the un-invoiced WO grid (the one whose aria-rowcount is the WO count)."""
+        """Bounding rect of the Un-Invoiced grid specifically (see _WO_GRID_SELECTOR) — NOT
+        whichever grid on the page happens to have the most rows, which could be the co-located
+        "WO for Acknowledgement" grid instead."""
         assert self.page is not None
         return await self.page.evaluate(
-            "() => { const gs = [...document.querySelectorAll('[role=\"grid\"]')]; "
-            "const g = gs.find(x => (x.getAttribute('aria-label')||'').includes('header versions')) "
-            "|| gs.sort((a,b)=>(+b.getAttribute('aria-rowcount'||0))-(+a.getAttribute('aria-rowcount'||0)))[0]; "
+            "(sel) => { const g = document.querySelector(sel); "
             "if (!g) return null; const r = g.getBoundingClientRect(); "
-            "return r.height > 0 ? {x:r.x, y:r.y, w:r.width, h:r.height} : null; }"
+            "return r.height > 0 ? {x:r.x, y:r.y, w:r.width, h:r.height} : null; }",
+            self._WO_GRID_SELECTOR,
         )
 
     async def _read_wo_detail_fields(self) -> tuple[str, str]:
@@ -483,7 +523,7 @@ class TCMSScraper:
             await self.page.wait_for_timeout(150)
             if await rendered():
                 return
-            seen.update(await self.page.evaluate(self._COLLECT_WO_IDS_JS))
+            seen.update(await self.page.evaluate(self._COLLECT_WO_IDS_JS, self._WO_GRID_SELECTOR))
             stagnant = 0 if len(seen) > prev_seen else stagnant + 1
             prev_seen = len(seen)
             if stagnant >= 60:
