@@ -123,6 +123,17 @@ class TCMSScraper:
             logger.info("TCMS session still valid — already on dashboard")
             return
 
+        # Entra can show an account-picker ("Pick an account" / <email> / "Use another account")
+        # before the email/password steps, typically when a stale or ambiguous persisted session
+        # cookie is present. Confirmed live (2026-08-18): with no handler for this, login() ran to
+        # the end of its flow without error at any single step and only failed at the final
+        # dashboard check, 20+s later, with no specific diagnostic — this screen was invisible to
+        # every other check. Click the matching account tile if present, then continue as normal.
+        account_tile = self.page.get_by_text(settings.TCMS_USERNAME, exact=False)
+        if await self.page.get_by_text("Pick an account", exact=False).count() and await account_tile.count():
+            await account_tile.first.click()
+            await self.page.wait_for_timeout(4000)
+
         # Entra step 1: email.
         if await self.page.locator("#i0116").count():
             await self.page.fill("#i0116", settings.TCMS_USERNAME)
