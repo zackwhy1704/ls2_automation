@@ -583,6 +583,7 @@ class SynergixDriver:
             await self._fill_line_item_row(i, line_items[i], remarks)
         if added:
             await self._verify_and_refill_rows(line_items[:min(added, len(line_items))], remarks)
+            await self._force_totals_commit(payload, line_items[:min(added, len(line_items))])
 
         try:
             await self._assert_details_filled(payload)
@@ -1291,6 +1292,9 @@ class SynergixDriver:
             await self._fill_line_item_row(i, line_items[i], remarks)
         if added:
             await self._verify_and_refill_rows(line_items[:added], remarks)
+            # The rows can all read back correctly while the server is still short of the authorised
+            # total — only the page total exposes that. See _force_totals_commit.
+            await self._force_totals_commit(payload, line_items[:added])
         logger.info("Stage B: draft filled for %s", payload.wo_po_number)
 
     async def _assert_details_filled(self, payload: WOPayload) -> None:
@@ -1369,10 +1373,42 @@ class SynergixDriver:
                 await self.page.wait_for_timeout(300)
                 total_after_tax = await self.page.evaluate(total_js)
         try:
-            if total_after_tax is None or float(total_after_tax.replace(",", "")) <= 0:
-                problems.append(f"Total After Tax is {total_after_tax!r}")
+            total_value = None if total_after_tax is None else float(total_after_tax.replace(",", ""))
         except ValueError:
+            total_value = None
             problems.append(f"Total After Tax is unparseable: {total_after_tax!r}")
+
+        if total_after_tax is not None and total_value is None:
+            pass  # already reported as unparseable above
+        elif total_value is None or total_value <= 0:
+            problems.append(f"Total After Tax is {total_after_tax!r}")
+        else:
+            # A positive total is NOT sufficient: it must also equal what the WO authorises. Added
+            # 2026-08-18 after finding that a row the server never committed (see
+            # _force_totals_commit) leaves the OTHER rows' amounts summing to a positive but
+            # understated total, which this gate used to accept. Concretely, WO-PO/000080321 (rows
+            # 1x33.00 + 4x44.00 = 209.00) could submit at 176.00 — the qty-1 row silently missing —
+            # because every per-row DOM check passed and the total was merely "> 0". That is the same
+            # under-billing class this file's billed_unit_price fix exists to prevent, reached by a
+            # different route, so it gets the same standing reconciliation.
+            #
+            # Which figure this field holds is not assumed: measured live at 44.00 for a single
+            # 1 x 44.00 line (i.e. pre-GST there), but the label reads "Total After Tax", so both the
+            # pre-GST net and the GST-inclusive grand total are accepted and the match is logged —
+            # real runs will show which it actually is without risking a false rejection now.
+            candidates = {"net_amount": payload.net_amount, "grand_total": payload.grand_total}
+            known = {name: v for name, v in candidates.items() if v is not None}
+            if known:
+                matched = [name for name, v in known.items() if abs(total_value - v) <= 0.05]
+                if matched:
+                    logger.info("Total After Tax %.2f matches payload %s", total_value,
+                                " and ".join(matched))
+                else:
+                    problems.append(
+                        f"Total After Tax {total_value:.2f} matches neither the WO's net amount "
+                        f"({payload.net_amount}) nor its grand total ({payload.grand_total}) — a row "
+                        "the server never committed would look exactly like this"
+                    )
 
         if problems:
             raise RuntimeError(
@@ -1523,6 +1559,108 @@ class SynergixDriver:
                     await self._fill_grid_field(i, field_name, target_value, header_regex)
             if not any_problem:
                 break
+
+    _TOTAL_AFTER_TAX_JS = """() => {
+                const label = [...document.querySelectorAll('td,div,span')]
+                    .find(e => e.children.length === 0 && e.textContent.trim() === 'Total After Tax:');
+                if (!label) return null;
+                const row = label.closest('tr') || label.parentElement?.parentElement;
+                if (!row) return null;
+                const nums = [...row.querySelectorAll('td,div,span')]
+                    .map(e => e.textContent.trim())
+                    .filter(t => /^[\\d,]+\\.\\d{2}$/.test(t));
+                return nums.length ? nums[0] : null;
+            }"""
+
+    async def _read_total_after_tax(self) -> float | None:
+        """The page's own total aggregate, parsed — or None if absent/unparseable.
+
+        This is the ONLY signal that reflects what the server actually committed. Every per-cell and
+        per-row check in this file reads the DOM, which can show correct values for a row the server
+        never recorded — see _force_totals_commit.
+        """
+        assert self.page is not None
+        raw = await self.page.evaluate(self._TOTAL_AFTER_TAX_JS)
+        if raw is None:
+            return None
+        try:
+            return float(raw.replace(",", ""))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _expected_totals(payload: WOPayload) -> list[float]:
+        """The figures the page total may legitimately equal: the WO's pre-GST net and its
+        GST-inclusive grand total. Which one this field holds isn't assumed — see the reconciliation
+        in _assert_details_filled."""
+        return [v for v in (payload.net_amount, payload.grand_total) if v is not None]
+
+    async def _total_is_settled(self, expected: list[float]) -> tuple[bool, float | None]:
+        """(is the page total both positive and equal to an expected figure, the total itself).
+
+        With no expected figures to compare against (an unstructured WO), a positive total is all
+        that can be required.
+        """
+        total = await self._read_total_after_tax()
+        if total is None or total <= 0:
+            return False, total
+        if not expected:
+            return True, total
+        return any(abs(total - e) <= 0.05 for e in expected), total
+
+    async def _force_totals_commit(self, payload: WOPayload, line_items: list[LineItem]) -> None:
+        """Wait for the page total to reach the WO-authorised figure, re-writing each row's Qty via a
+        nudge (0.00, then the real value) whenever it stalls short of it.
+
+        Writes into a freshly-added Details row are unreliable, and the failure is NOT confined to one
+        field or one quantity. Established live on 2026-08-18, across two independent investigations:
+
+        - A fresh row's Qty defaults to '0.00' (measured immediately after Add Row, and again after
+          selecting a real Item Code, without touching Qty).
+        - Sometimes the writes visibly never land: with a qty=1 / price=33.00 line, BOTH Qty and Unit
+          Price failed all three retry attempts and stayed 0.00/0.00 through _verify_and_refill_rows.
+          That case is loud, and the submit gate already rejects it correctly.
+        - Sometimes the DOM reads back CORRECT while the server has not caught up: on
+          WO-PO/000080454 (rows 1x44.00 + 1x55.00) both rows read qty 1.00 with prices 44.00/55.00
+          while the page total sat at 44.00 — row 1's amount simply missing. This is the dangerous
+          shape, because every per-row DOM check passes and only the total exposes it.
+
+        Deliberately NOT claimed here: that quantity=1 causes this. Every all-qty-1 WO failed and
+        every WO with a qty>1 row succeeded (5 and 3 respectively on 2026-08-18), but a same-value
+        no-op cannot be the mechanism — the default is 0.00, so writing 1.00 is a genuine change like
+        any other. With 8 samples that split may well be coincidence; it is recorded as unexplained
+        rather than dressed up as a cause.
+
+        So this method is a recovery keyed on the only trustworthy signal rather than a fix for a
+        known mechanism: poll the page total against what the WO authorises, and if it stalls short,
+        re-write every row's Qty (via 0.00 then the real value, so the final write is a change
+        whatever the field currently holds) and poll again. Waiting for the EXPECTED total matters —
+        returning as soon as it went positive stopped at 44.00 on the WO above, which the submit gate
+        then correctly rejected as understated.
+        """
+        assert self.page is not None
+        expected = self._expected_totals(payload)
+        for attempt in range(3):
+            for _ in range(24):  # ~12s per round for in-flight commits to land
+                settled, total = await self._total_is_settled(expected)
+                if settled:
+                    if attempt:
+                        logger.info("Totals committed after %d nudge round(s): total=%.2f",
+                                    attempt, total)
+                    return
+                await self.page.wait_for_timeout(500)
+            logger.warning(
+                "Page total is %r, expected one of %s — re-committing every row's Qty via a nudge "
+                "(round %d/3)", total, expected or "(nothing to compare against)", attempt + 1)
+            for i, line_item in enumerate(line_items):
+                target = f"{line_item.quantity:.2f}"
+                if target == "0.00":
+                    continue  # nothing to nudge toward; a zero-qty line is a data problem, not this bug
+                await self._fill_grid_field(i, "Qty", "0.00", r"^qty")
+                await self._fill_grid_field(i, "Qty", target, r"^qty")
+        _, final = await self._total_is_settled(expected)
+        logger.warning("Page total still %r after 3 nudge rounds — the submit gate will reject this",
+                        final)
 
     async def _read_grid_row(self, row_index: int, header_regexes: tuple[str, ...]) -> dict:
         """Read back the CURRENT input values of the given Details-grid row's named columns.
