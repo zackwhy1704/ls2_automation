@@ -369,10 +369,20 @@ class TCMSScraper:
                     "at all, not even a hidden one — may have been removed from TCMS's list since it "
                     "was scraped)")
             await self._wo_input_locator(wo_po_number).first.click(timeout=15000)
-            # Wait for the selection to actually settle (Preview/Print becoming clickable) rather than
-            # a fixed delay — under sustained batch load the page can take longer than 2s to react.
+            # Preview/Print is a FIXED TOOLBAR button (confirmed live 2026-08-18 — always present at
+            # the same position regardless of which row is selected or scrolled, NOT a per-row
+            # element), so a timeout waiting for it visible does NOT mean "still rendering, give it
+            # more time" — a real WO tested this way found it instantly (<1s). A timeout here means
+            # the row click didn't put the page into the expected selected state at all. First fix
+            # attempt (widening 20s->45s) was WRONG — same WO still timed out at 45s, confirming this
+            # isn't a patience problem. Kept at 20s; on timeout, capture real diagnostics (below)
+            # instead of guessing again.
             preview_print = S.require("TCMS_WO_PREVIEW_PRINT", S.TCMS_WO_PREVIEW_PRINT)
-            await self.page.wait_for_selector(preview_print, state="visible", timeout=20000)
+            try:
+                await self.page.wait_for_selector(preview_print, state="visible", timeout=20000)
+            except Exception:
+                await self._diagnose_selection_failure(wo_po_number)
+                raise
             await self.page.wait_for_timeout(1000)
 
             status, property_officer = await self._read_wo_detail_fields()
@@ -452,6 +462,42 @@ class TCMSScraper:
             prev_seen = len(seen)
             if stagnant >= 60:
                 return
+
+    async def _diagnose_selection_failure(self, wo_po_number: str) -> None:
+        """Capture real evidence when a row click doesn't put the page into the expected selected
+        state (Preview/Print never becomes visible), instead of guessing again.
+
+        Added 2026-08-18 after a wrong first fix attempt (widening the wait from 20s to 45s) didn't
+        help — the SAME WO still timed out at 45s, and the user confirmed live that Preview/Print is
+        a fixed toolbar button, not something that should ever need real patience. Saves a screenshot
+        plus page title/URL and whether the target row's input still reports itself as focused/
+        selected, so the NEXT occurrence has hard evidence instead of another guess.
+        """
+        if not self.page:
+            return
+        try:
+            safe = wo_po_number.replace("/", "-")
+            path = settings.LOGS_DIR / f"tcms_selection_failure_{safe}.png"
+            await self.page.screenshot(path=str(path))
+            title = await self.page.title()
+            url = self.page.url
+            state = await self.page.evaluate(
+                """(wo) => {
+                    const el = document.evaluate(`//input[@value="${wo}"]`, document, null,
+                        XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                    return {
+                        rowFound: !!el,
+                        isActiveElement: el === document.activeElement,
+                        rowClasses: el ? el.className : null,
+                    };
+                }""",
+                wo_po_number,
+            )
+            logger.error(
+                "TCMS selection diagnostic for %s: title=%r url=%r state=%s screenshot=%s",
+                wo_po_number, title, url, state, path)
+        except Exception:
+            logger.exception("Could not capture TCMS selection-failure diagnostics for %s", wo_po_number)
 
     async def _back_to_list(self) -> None:
         """Return to the Un-Invoiced WO list via the in-app "Back" button (known-state recovery).
