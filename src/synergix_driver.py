@@ -1570,14 +1570,43 @@ class SynergixDriver:
     async def _fill_grid_field(
         self, row_index: int, field_name: str, value: str, header_regex: str, *, attempts: int = 3
     ) -> bool:
-        """Click one Details-grid cell, type `value`, Tab to commit, and poll to confirm it stuck —
-        retrying up to `attempts` times. Returns whether it ultimately committed.
+        """Fill one Details-grid cell and poll to confirm it stuck — retrying up to `attempts` times.
+        Returns whether it ultimately committed.
+
+        Uses Locator.fill(), NOT click + Control+A + keyboard.type() + Tab. Confirmed live
+        (2026-08-19), directly prompted by the user manually typing into a stuck cell and having it
+        commit instantly: 6 different keystroke-simulation commit strategies (Tab, Enter, click-away,
+        explicit Tab down/up, human-cadence typed delay) were tested head-to-head against fill() on
+        the same cell — every keystroke-simulation method failed (0/6 across two full test runs,
+        including the exact production sequence used here before this fix), while fill() stuck 5/5.
+        fill() sets the value and dispatches real input/change events directly, bypassing individual
+        key events entirely — whatever server-side listener this PrimeFaces cell binds its commit to
+        is apparently keyed off input/change, not the keydown/keyup sequence Playwright's
+        keyboard.type() produces, which is why a real human's native browser keystrokes worked all
+        along while the automated equivalent did not.
+
+        The bigger finding (2026-08-19, from watching the user type manually into a live cell with
+        5s polling): the grid RE-RENDERS ITSELF independently of any write in flight, and can
+        transiently blank out an already-committed, untouched cell for several seconds before it
+        recovers on its own — observed directly on Qty while the user was typing into an unrelated
+        Unit Price cell. The old 2.4s patience window (8 x 300ms) is shorter than that recovery
+        window, so it was reading a mid-flicker blank as "genuinely failed" and immediately
+        overwriting — an overwrite landing mid-re-render is a plausible way to actually corrupt what
+        would otherwise have recovered fine on its own. Two changes address this directly:
+          1. The window is now much longer (up to ~15s) before giving up on one attempt.
+          2. A read is only trusted once it's STABLE across two consecutive checks (not just present
+             once) — a single matching read can itself be a flicker artifact on its way to something
+             else, same as a single blank read can be.
+        This is deliberately defensive: it costs a little time on the (common) fast-committing case,
+        but a slow, correct commit is far cheaper than a fast, wrong retry that corrupts a good value.
 
         Extracted from _fill_line_item_row so _verify_and_refill_rows can re-run it standalone on
         any single cell that a later edit clobbered, without re-filling the whole row.
         """
         assert self.page is not None
         page = self.page
+        poll_interval_ms = 500
+        max_polls = 30  # ~15s per attempt
         for attempt in range(attempts):
             cell = await self._grid_cell_locator(row_index, header_regex)
             if not cell:
@@ -1588,18 +1617,27 @@ class SynergixDriver:
             except Exception as exc:
                 logger.warning("Stage B: could not click the %s cell for row %d: %s", field_name, row_index, exc)
                 return False
-            await page.keyboard.press("Control+A")
-            await page.keyboard.type(value)
-            await page.keyboard.press("Tab")
+            await cell.fill(value)
 
-            # Poll instead of a single fixed-wait check: confirmed live (2026-08-15) that the
-            # PrimeFaces ajax recalculation Tab kicks off (Total Amount = Qty * Unit Price) has
-            # variable settle time under server load — a one-shot check at a fixed delay
-            # intermittently read the value as "not stuck" moments before it actually committed.
-            for _ in range(8):
-                await page.wait_for_timeout(300)
-                if await cell.input_value() == value:
+            # Require the target value to read back correctly on TWO CONSECUTIVE polls, not just
+            # one — a single matching read can itself be a transient state on its way to reverting,
+            # same as a single non-matching read can be on its way to recovering. See docstring.
+            previously_matched = False
+            for _ in range(max_polls):
+                await page.wait_for_timeout(poll_interval_ms)
+                try:
+                    current = await cell.input_value()
+                except Exception:
+                    # The cell can go briefly stale/detached during a grid re-render; re-resolve it
+                    # rather than treat a transient DOM error as a real failure.
+                    cell = await self._grid_cell_locator(row_index, header_regex)
+                    if not cell:
+                        break
+                    continue
+                matched = current == value
+                if matched and previously_matched:
                     return True
+                previously_matched = matched
             logger.warning("Stage B: %s for row %d did not stick (attempt %d) — retrying",
                             field_name, row_index, attempt + 1)
         return False
@@ -1615,6 +1653,12 @@ class SynergixDriver:
         server-side yet when the later row's request went out), not a client-side click/typing bug.
         _fill_line_item_row's own per-cell retry only checks immediately after typing that cell, so
         it can't catch a value reverted by a LATER row's edit. This re-checks everything at the end.
+
+        Confirmed live (2026-08-19) that the grid can also transiently blank out an already-correct,
+        untouched cell for several seconds during its own re-render, unrelated to any write — a
+        single read here is not proof of a real problem. Before treating a mismatch as real (and
+        triggering a re-fill, which risks overwriting mid-flicker), re-checks that SAME cell once
+        more after a short wait — only acts if it's still wrong on the second look.
         """
         assert self.page is not None
         for round_num in range(3):
@@ -1627,16 +1671,32 @@ class SynergixDriver:
                     ("Remarks", remarks, "remarks", row.get("remarks")),
                 )
                 if not (row.get("item code") or "").strip():
-                    any_problem = True
-                    logger.warning("Verify pass %d: row %d Item Code reverted — re-selecting", round_num + 1, i)
-                    if not await self._select_item_code(ITEM_CODE, i):
-                        logger.warning("Verify pass %d: could not re-select Item Code for row %d", round_num + 1, i)
+                    await self.page.wait_for_timeout(2000)
+                    row = await self._read_grid_row(i, ("item code",))
+                    if not (row.get("item code") or "").strip():
+                        any_problem = True
+                        logger.warning("Verify pass %d: row %d Item Code reverted — re-selecting",
+                                        round_num + 1, i)
+                        if not await self._select_item_code(ITEM_CODE, i):
+                            logger.warning("Verify pass %d: could not re-select Item Code for row %d",
+                                            round_num + 1, i)
                 for field_name, target_value, header_regex, current_value in targets:
                     if current_value == target_value:
                         continue
+                    # Double-check before acting — confirmed live this can be a transient re-render
+                    # flicker, not a real reversion.
+                    await self.page.wait_for_timeout(2000)
+                    recheck = await self._read_grid_row(i, (header_regex,))
+                    recheck_value = recheck.get(header_regex)
+                    if recheck_value == target_value:
+                        logger.info("Verify pass %d: row %d %s read %r once but %r on recheck — "
+                                    "a flicker, not a real reversion, leaving it alone",
+                                    round_num + 1, i, field_name, current_value, recheck_value)
+                        continue
                     any_problem = True
-                    logger.warning("Verify pass %d: row %d %s reverted (%r != %r) — re-filling",
-                                    round_num + 1, i, field_name, current_value, target_value)
+                    logger.warning("Verify pass %d: row %d %s reverted (%r != %r, confirmed on "
+                                    "recheck) — re-filling",
+                                    round_num + 1, i, field_name, recheck_value, target_value)
                     await self._fill_grid_field(i, field_name, target_value, header_regex)
             if not any_problem:
                 break
@@ -1730,6 +1790,22 @@ class SynergixDriver:
                                     attempt, total)
                     return
                 await self.page.wait_for_timeout(500)
+            # Confirmed live (2026-08-19) that the grid can transiently show a stale/blank total
+            # during its own re-render, unrelated to any real problem — a single "still unsettled"
+            # read after the wait above is not proof nudging is actually needed. Re-check once more
+            # after a short pause before nudging, same defensive pattern as _fill_grid_field and
+            # _verify_and_refill_rows: a nudge that lands mid-flicker is a plausible way to corrupt
+            # an otherwise-fine row (this method only re-writes Qty — a wrong nudge risks knocking
+            # out Unit Price via the same server-side ordering race _verify_and_refill_rows guards
+            # against elsewhere).
+            await self.page.wait_for_timeout(3000)
+            settled, total = await self._total_is_settled(expected)
+            if settled:
+                logger.info("Page total settled on the recheck (%.2f) — was a flicker, not nudging",
+                            total)
+                if attempt:
+                    logger.info("Totals committed after %d nudge round(s): total=%.2f", attempt, total)
+                return
             logger.warning(
                 "Page total is %r, expected one of %s — re-committing every row's Qty via a nudge "
                 "(round %d/3)", total, expected or "(nothing to compare against)", attempt + 1)
