@@ -206,6 +206,15 @@ async def run_batch_from_tcms(limit: int | None = None, skip: int = 0,
                         await synergix.relogin()  # a timeout usually means a wedged session; reset it
                     except Exception:
                         logger.exception("Re-login after timeout failed — continuing")
+                    try:
+                        # asyncio.wait_for cancelled the write() coroutine mid-flight, so its own
+                        # draft-abort-on-failure handling never ran — a draft can be left behind
+                        # that permanently masks this WO from future dedup checks. See
+                        # SynergixDriver.reap_incomplete_draft's docstring (confirmed live 2026-08-19
+                        # on WO-PO/000080321 and WO-PO/000080420).
+                        await synergix.reap_incomplete_draft(wo_id)
+                    except Exception:
+                        logger.exception("Reaping an incomplete draft for %s failed — continuing", wo_id)
                 except Exception as exc:
                     logger.exception("Failed handling WO %s — recording FAILED, continuing", wo_id)
                     result.outcomes.append(WOOutcome(wo_id, WOStatus.FAILED, str(exc)))

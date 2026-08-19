@@ -352,7 +352,33 @@ class SynergixDriver:
         try:
             await self.login()
             await self._stage_b_create_quotation(payload)
-            await self._assert_details_filled(payload)
+            try:
+                await self._assert_details_filled(payload)
+            except Exception:
+                # Confirmed live (2026-08-19) on WO-PO/000080321 and WO-PO/000080420: when the
+                # Details-grid fill fails this late (Customer/Salesperson/Project Site/Item Code
+                # already set, only Qty/Unit Price never committing) and the WO-level 300s timeout
+                # or this assertion cuts it off, the draft was left behind with NOTHING aborted —
+                # _abort_blank_draft only covers a failure before Customer is set. That draft (e.g.
+                # QUO0006683/QUO0006684, Total After Tax 0.00, blank Item Code) then permanently
+                # masks the WO from every future run: check_duplicate sees a real quotation exists
+                # and reports DUPLICATE forever, even though nothing was ever actually billed. This
+                # is narrower than the general "later failures keep their draft for review" policy
+                # (see _abort_blank_draft's docstring) — a draft that fails ITS OWN completeness
+                # assertion has no review value by definition, unlike e.g. a Payment Method or
+                # Customer Contact miss that still leaves a usable draft.
+                draft_quo_id = await self._current_quotation_id()
+                logger.warning(
+                    "Details grid never became valid for %s — aborting draft %s rather than "
+                    "leaving a broken record that would mask this WO from future dedup checks",
+                    payload.wo_po_number, draft_quo_id)
+                if draft_quo_id:
+                    try:
+                        await self.abort_quotation(draft_quo_id)
+                    except Exception:
+                        logger.exception("Could not abort incomplete draft %s for %s — may need "
+                                         "manual cleanup", draft_quo_id, payload.wo_po_number)
+                raise
             quo_id = await self._submit_quotation(payload)
             # Schedule Board (C) and Fulfil (D) remain manual — done by the team in Synergix.
             if settings.DRY_RUN:
@@ -459,6 +485,61 @@ class SynergixDriver:
             return False
         logger.info("Aborted quotation %s", quotation_no)
         return True
+
+    async def reap_incomplete_draft(self, wo_po_number: str) -> bool:
+        """Find whatever quotation Synergix now has for `wo_po_number` and abort it, but ONLY if
+        it's genuinely incomplete (Total After Tax not positive) — never touches a quotation that
+        looks legitimately filled, submitted or not.
+
+        For a WO whose write() call was cut off by the batch-level SYNERGIX_WO_TIMEOUT_S guardrail
+        (asyncio.wait_for cancels the coroutine — write()'s own except block never runs, so its
+        draft-abort-on-Details-failure handling can't fire either). Confirmed live (2026-08-19) on
+        WO-PO/000080321 and WO-PO/000080420: both timed out deep in the Details-grid retry loop and
+        left behind a draft (QUO0006683: empty grid; QUO0006684: Item Code/Qty/Unit Price all
+        blank, Total After Tax 0.00) that then permanently masks the WO — check_duplicate finds a
+        real quotation and reports DUPLICATE forever, even though nothing was ever actually billed.
+
+        Not part of the regular write() path — call this from the batch loop's timeout handler,
+        same admin-utility spirit as abort_quotation.
+        """
+        assert self.page is not None
+        page = self.page
+        try:
+            await self._open_service_quotation_list()
+            header = page.locator("th", has_text="Enquiry/Subject").first
+            filter_input = header.locator("input.ui-column-filter").first
+            await filter_input.click()
+            await filter_input.fill("")
+            await filter_input.press("Enter")
+            await page.wait_for_timeout(2000)
+            await filter_input.fill(wo_po_number)
+            await filter_input.press("Enter")
+            await page.wait_for_timeout(6000)
+
+            row = page.locator(f"tr:has-text('{wo_po_number}')").first
+            quo_link = row.locator("a").first
+            if not await quo_link.count():
+                logger.info("reap_incomplete_draft: no quotation found for %s — nothing to reap",
+                            wo_po_number)
+                return False
+            quo_id = (await quo_link.inner_text()).strip()
+            await quo_link.click(timeout=10000)
+            await page.wait_for_timeout(5000)
+
+            total = await self._read_total_after_tax()
+            if total is not None and total > 0:
+                logger.info("reap_incomplete_draft: %s (for %s) has Total After Tax %.2f — looks "
+                            "legitimate, leaving it alone", quo_id, wo_po_number, total)
+                return False
+
+            logger.warning("reap_incomplete_draft: %s (for %s) has Total After Tax %r — aborting "
+                            "as an incomplete draft left behind by a timed-out write",
+                            quo_id, wo_po_number, total)
+            return await self.abort_quotation(quo_id)
+        except Exception:
+            logger.exception("reap_incomplete_draft: error while checking %s — leaving as-is",
+                              wo_po_number)
+            return False
 
     async def _read_labeled_value(self, label: str) -> str:
         """Read the current value of a labeled form field (see _fill_labeled_input) without
