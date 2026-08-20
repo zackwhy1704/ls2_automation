@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from enum import Enum
 
@@ -650,6 +651,7 @@ class SynergixDriver:
         # quotation from a prior partially-failed attempt doesn't pile on duplicate rows.
         line_items = payload.effective_line_items
         remarks = build_remarks(payload)
+        fill_started_at = time.monotonic()
         existing_rows = await page.evaluate(
             """() => { const g = [...document.querySelectorAll('.ui-datatable')]
                 .find(g => [...g.querySelectorAll('th')].some(t => /unit price/i.test(t.innerText)));
@@ -665,6 +667,9 @@ class SynergixDriver:
         if added:
             await self._verify_and_refill_rows(line_items[:min(added, len(line_items))], remarks)
             await self._force_totals_commit(payload, line_items[:min(added, len(line_items))])
+        # Monitoring only — see the matching log line in _stage_b_create_quotation for why.
+        logger.info("amend_quotation: Details-grid fill took %.1fs for %s",
+                     time.monotonic() - fill_started_at, quotation_no)
 
         try:
             await self._assert_details_filled(payload)
@@ -1360,6 +1365,7 @@ class SynergixDriver:
         # the quotation silently bills only the first line — see WOPayload.line_items's docstring.
         line_items = payload.effective_line_items
         remarks = build_remarks(payload)
+        fill_started_at = time.monotonic()
         added = 0
         for _ in line_items:
             if not await self._add_line_item():
@@ -1376,7 +1382,13 @@ class SynergixDriver:
             # The rows can all read back correctly while the server is still short of the authorised
             # total — only the page total exposes that. See _force_totals_commit.
             await self._force_totals_commit(payload, line_items[:added])
-        logger.info("Stage B: draft filled for %s", payload.wo_po_number)
+        # Monitoring only: the flicker-tolerance fix (see _fill_grid_field) widened per-cell
+        # patience from ~2.4s to ~15s to correctly ride out the grid's own re-render — worst case
+        # that's real time added per field, not just per WO. Logging how long the whole Details
+        # fill actually took makes a real slowdown visible in logs rather than only discovered when
+        # a batch job runs unexpectedly long.
+        logger.info("Stage B: draft filled for %s (Details-grid fill took %.1fs)",
+                     payload.wo_po_number, time.monotonic() - fill_started_at)
 
     async def _assert_details_filled(self, payload: WOPayload) -> None:
         """Raise if any Details row is missing Item Code/Qty/Unit Price/Remarks, or Total After Tax
@@ -1394,17 +1406,43 @@ class SynergixDriver:
         line_items = payload.effective_line_items
         problems: list[str] = []
         rows: list[dict] = []
+
+        def _blank(v) -> bool:
+            return not (v or "").strip()
+
+        def _not_positive(v) -> bool:
+            return float(v or 0) <= 0
+
+        _FIELD_CHECKS = (
+            ("item code", _blank, "Item Code is blank"),
+            ("^qty", _not_positive, "Qty is {value!r}"),
+            ("unit price", _not_positive, "Unit Price is {value!r}"),
+            ("remarks", _blank, "Remarks is blank"),
+        )
         for i in range(len(line_items)):
             row = await self._read_grid_row(i, ("item code", "^qty", "unit price", "remarks"))
             rows.append(row)
-            if not (row.get("item code") or "").strip():
-                problems.append(f"row {i}: Item Code is blank")
-            if float(row.get("^qty") or 0) <= 0:
-                problems.append(f"row {i}: Qty is {row.get('^qty')!r}")
-            if float(row.get("unit price") or 0) <= 0:
-                problems.append(f"row {i}: Unit Price is {row.get('unit price')!r}")
-            if not (row.get("remarks") or "").strip():
-                problems.append(f"row {i}: Remarks is blank")
+            for header_regex, is_bad, message_template in _FIELD_CHECKS:
+                value = row.get(header_regex)
+                if not is_bad(value):
+                    continue
+                # Re-check the SAME field once more after a short wait before treating it as a real
+                # problem — confirmed live (2026-08-19) the grid can transiently blank/zero an
+                # already-correct, untouched cell for several seconds during its own re-render. This
+                # function is the last gate before a WO is trusted (added after the 151-empty-
+                # quotation incident), so a false positive here wrongly routes a genuinely fine WO to
+                # FAILED/review. Same defensive pattern as _verify_and_refill_rows's recheck.
+                await self.page.wait_for_timeout(2000)
+                recheck = await self._read_grid_row(i, (header_regex,))
+                recheck_value = recheck.get(header_regex)
+                if not is_bad(recheck_value):
+                    logger.info(
+                        "_assert_details_filled: row %d %s read %r once but %r on recheck — a "
+                        "flicker, not a real problem, not reporting it", i, header_regex, value,
+                        recheck_value)
+                    row[header_regex] = recheck_value  # keep `rows` consistent for the reconciliation below
+                    continue
+                problems.append(f"row {i}: " + message_template.format(value=recheck_value))
 
         # Standing control added 2026-08-17 per a client SOP review of 54 live quotations: every
         # single one was under-billed by exactly the JBTC 10% SOR uplift because the grid was being
