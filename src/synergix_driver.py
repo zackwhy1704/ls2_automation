@@ -1832,12 +1832,20 @@ class SynergixDriver:
         """
         assert self.page is not None
         expected = self._expected_totals(payload)
-        for attempt in range(3):
+        # One round tends to land exactly ONE row, because repairing a row can knock out the cells a
+        # previous round just fixed. Measured live (2026-08-20) on the 4-row WO-PO/000079836: the
+        # total climbed 33.00 -> 77.00 -> 110.00 across three rounds, adding one row's amount each
+        # time, and was still converging when a hardcoded 3-round budget cut it off short of 275.00.
+        # The 3-row WO-PO/000081257 passed the same day needing only one round. So the budget has to
+        # scale with row count, not sit at a constant: one round per row, plus headroom for rows that
+        # need a second attempt. Still bounded — a genuinely stuck grid must fail, not spin forever.
+        rounds = max(3, len(line_items) + 2)
+        for attempt in range(rounds):
             for _ in range(24):  # ~12s per round for in-flight commits to land
                 settled, total = await self._total_is_settled(expected)
                 if settled:
                     if attempt:
-                        logger.info("Totals committed after %d nudge round(s): total=%.2f",
+                        logger.info("Totals committed after %d repair round(s): total=%.2f",
                                     attempt, total)
                     return
                 await self.page.wait_for_timeout(500)
@@ -1852,14 +1860,14 @@ class SynergixDriver:
             await self.page.wait_for_timeout(3000)
             settled, total = await self._total_is_settled(expected)
             if settled:
-                logger.info("Page total settled on the recheck (%.2f) — was a flicker, not nudging",
+                logger.info("Page total settled on the recheck (%.2f) — was a flicker, not repairing",
                             total)
                 if attempt:
-                    logger.info("Totals committed after %d nudge round(s): total=%.2f", attempt, total)
+                    logger.info("Totals committed after %d repair round(s): total=%.2f", attempt, total)
                 return
             logger.warning(
-                "Page total is %r, expected one of %s — repairing the Details grid (round %d/3)",
-                total, expected or "(nothing to compare against)", attempt + 1)
+                "Page total is %r, expected one of %s — repairing the Details grid (round %d/%d)",
+                total, expected or "(nothing to compare against)", attempt + 1, rounds)
             for i, line_item in enumerate(line_items):
                 qty_target = f"{line_item.quantity:.2f}"
                 price_target = f"{line_item.billed_unit_price:.2f}"
@@ -1885,8 +1893,8 @@ class SynergixDriver:
                     await self._fill_grid_field(i, "Qty", qty_target, r"^qty")
                     await self.page.wait_for_timeout(1500)
         _, final = await self._total_is_settled(expected)
-        logger.warning("Page total still %r after 3 repair rounds — the submit gate will reject this",
-                        final)
+        logger.warning("Page total still %r after %d repair rounds — the submit gate will reject this",
+                        final, rounds)
 
     async def _read_grid_row(self, row_index: int, header_regexes: tuple[str, ...]) -> dict:
         """Read back the CURRENT input values of the given Details-grid row's named columns.

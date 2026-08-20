@@ -113,7 +113,13 @@ class Settings(BaseSettings):
     # proactively start a fresh Synergix session every N WOs, and cap each WO's wall-clock so a
     # wedged session can never hang the batch. 0 disables proactive re-login.
     SYNERGIX_RELOGIN_EVERY: int = 5
-    SYNERGIX_WO_TIMEOUT_S: int = 300   # hard ceiling per WO (seconds)
+    # Hard ceiling per WO (seconds). Raised 300 -> 900 on 2026-08-20: a 2-row WO measured 194-203s
+    # end to end once the Details-grid repair loop has to run (cross-row interference means it
+    # commonly does — see _force_totals_commit), so 300s left almost no headroom and a 3+-row WO
+    # would likely blow through it. That matters because this ceiling is enforced by
+    # asyncio.wait_for in batch.py, which CANCELS write() mid-flight: the draft survives but nothing
+    # is billed, and only reap_incomplete_draft stops it masking the WO from future dedup runs.
+    SYNERGIX_WO_TIMEOUT_S: int = 900
     # A page-level relogin (above) reuses the same browser process — confirmed live (2026-08-16,
     # a 9.5-hour/321-WO unrestricted run) that Synergix itself gets slower/flakier the longer a single
     # browser session stays open under sustained automation, independent of the login session timeout

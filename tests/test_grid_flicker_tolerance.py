@@ -248,6 +248,39 @@ def test_force_totals_commit_nudges_qty_when_the_row_already_reads_correct():
     assert any(c.args == (0, "Qty", "2.00", r"^qty") for c in calls)
 
 
+def test_force_totals_commit_budget_scales_with_row_count():
+    """A 4-row WO must get more repair rounds than a 2-row one.
+
+    Regression guard for the 2026-08-20 finding: roughly one row commits per round, so on the 4-row
+    WO-PO/000079836 the total climbed 33.00 -> 77.00 -> 110.00 and was still converging when a
+    hardcoded 3-round budget cut it off short of 275.00. Budget must be a function of row count.
+    """
+    rounds_seen = {}
+
+    for n_rows in (2, 4):
+        driver = _make_driver()
+        payload = _payload()
+        line_items = [LineItem(quantity=1.0, unit_price=33.0, net_amount=33.0)] * n_rows
+
+        async def _total_is_settled(expected):
+            return False, 33.0  # never settles, so every available round is consumed
+
+        # DOM always reads correct -> the nudge branch, one pair of fills per row per round.
+        driver._total_is_settled = AsyncMock(side_effect=_total_is_settled)
+        driver._read_grid_row = AsyncMock(return_value={"^qty": "1.00", "unit price": "33.00"})
+        driver._fill_grid_field = AsyncMock(return_value=True)
+
+        asyncio.run(driver._force_totals_commit(payload, line_items))
+
+        # 2 fills (0.00 then the target) per row, per round.
+        rounds_seen[n_rows] = len(driver._fill_grid_field.call_args_list) / (2 * n_rows)
+
+    assert rounds_seen[4] > rounds_seen[2], (
+        f"4-row WOs must get more rounds than 2-row ones, got {rounds_seen}")
+    assert rounds_seen[4] >= 4, (
+        f"a 4-row WO needs at least one round per row, got {rounds_seen[4]}")
+
+
 def test_force_totals_commit_repairs_the_field_that_is_actually_short():
     """Total stalled short because row 1's Unit Price is 0.00: the repair must re-fill THAT field.
 
