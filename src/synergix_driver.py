@@ -1810,12 +1810,25 @@ class SynergixDriver:
         any other. With 8 samples that split may well be coincidence; it is recorded as unexplained
         rather than dressed up as a cause.
 
-        So this method is a recovery keyed on the only trustworthy signal rather than a fix for a
-        known mechanism: poll the page total against what the WO authorises, and if it stalls short,
-        re-write every row's Qty (via 0.00 then the real value, so the final write is a change
-        whatever the field currently holds) and poll again. Waiting for the EXPECTED total matters —
-        returning as soon as it went positive stopped at 44.00 on the WO above, which the submit gate
-        then correctly rejected as understated.
+        The actual mechanism, isolated live on 2026-08-20 on a throwaway 2-row draft: writes in one
+        row ZERO OUT numeric cells in the OTHER row. Filling row 0 qty, row 1 qty, row 0 price, row 1
+        price in that order — every one reporting success — ended with row 0 holding qty 1.00 / price
+        0.00 and row 1 holding qty 0.00 / price 55.00. No row ever held qty AND price at the same
+        moment, so the total never left 0.00. The grid's own columns rule out a per-row pricing
+        constraint: "Unit Price/Adjusted Unit Price" is not readOnly, and "Free Balance"/"Total
+        Amount" carry no input at all. So this is cross-row ajax interference — the same class
+        _verify_and_refill_rows was built for, but it does not always converge within its 3 rounds
+        once two or more rows are in play.
+
+        So this method repairs whatever is ACTUALLY short, rather than assuming Qty. Each round
+        re-reads every row and re-fills the specific fields that don't match (Qty and/or Unit Price),
+        one at a time with a settle wait so a repair doesn't immediately knock out the cell it just
+        fixed in another row. Only when every row's DOM already matches yet the total is still short
+        does it fall back to the nudge (0.00 then the real value), which is the DOM-correct-but-
+        server-behind case. Waiting for the EXPECTED total matters throughout — returning as soon as
+        it went positive stopped at 44.00 on WO-PO/000080454, which the submit gate then correctly
+        rejected as understated. Previously this only ever nudged Qty, which could not fix the real
+        problem there (row 1's missing PRICE) and burned all three rounds achieving nothing.
         """
         assert self.page is not None
         expected = self._expected_totals(payload)
@@ -1845,16 +1858,34 @@ class SynergixDriver:
                     logger.info("Totals committed after %d nudge round(s): total=%.2f", attempt, total)
                 return
             logger.warning(
-                "Page total is %r, expected one of %s — re-committing every row's Qty via a nudge "
-                "(round %d/3)", total, expected or "(nothing to compare against)", attempt + 1)
+                "Page total is %r, expected one of %s — repairing the Details grid (round %d/3)",
+                total, expected or "(nothing to compare against)", attempt + 1)
             for i, line_item in enumerate(line_items):
-                target = f"{line_item.quantity:.2f}"
-                if target == "0.00":
-                    continue  # nothing to nudge toward; a zero-qty line is a data problem, not this bug
-                await self._fill_grid_field(i, "Qty", "0.00", r"^qty")
-                await self._fill_grid_field(i, "Qty", target, r"^qty")
+                qty_target = f"{line_item.quantity:.2f}"
+                price_target = f"{line_item.billed_unit_price:.2f}"
+                row = await self._read_grid_row(i, ("^qty", "unit price"))
+                repairs = [
+                    (name, target, regex) for name, target, regex, current in (
+                        ("Qty", qty_target, r"^qty", row.get("^qty")),
+                        ("Unit Price", price_target, "unit price", row.get("unit price")),
+                    ) if current != target
+                ]
+                if repairs:
+                    # Fix what's genuinely wrong, one cell at a time, letting each land before
+                    # touching another — a repair itself can zero a cell in another row.
+                    for name, target, regex in repairs:
+                        logger.warning("Row %d %s is short — re-filling to %s", i, name, target)
+                        await self._fill_grid_field(i, name, target, regex)
+                        await self.page.wait_for_timeout(1500)
+                elif qty_target != "0.00":
+                    # Every cell in this row already reads right, so the server is simply behind:
+                    # nudge Qty so the final write is a real change whatever the field holds. A
+                    # zero-qty line is a data problem, not this bug, so there's nothing to nudge to.
+                    await self._fill_grid_field(i, "Qty", "0.00", r"^qty")
+                    await self._fill_grid_field(i, "Qty", qty_target, r"^qty")
+                    await self.page.wait_for_timeout(1500)
         _, final = await self._total_is_settled(expected)
-        logger.warning("Page total still %r after 3 nudge rounds — the submit gate will reject this",
+        logger.warning("Page total still %r after 3 repair rounds — the submit gate will reject this",
                         final)
 
     async def _read_grid_row(self, row_index: int, header_regexes: tuple[str, ...]) -> dict:

@@ -226,8 +226,9 @@ def test_force_totals_commit_does_not_nudge_a_self_correcting_flicker():
     driver._fill_grid_field.assert_not_called()
 
 
-def test_force_totals_commit_still_nudges_a_confirmed_stall():
-    """A total that's genuinely still unsettled on the recheck must still trigger the Qty nudge."""
+def test_force_totals_commit_nudges_qty_when_the_row_already_reads_correct():
+    """Total stalled short while every cell in the row already reads its target: the server is
+    simply behind, so the Qty nudge (0.00 then the real value) is the right lever."""
     driver = _make_driver()
     payload = _payload()
     line_items = [LineItem(quantity=2.0, unit_price=44.0, net_amount=88.0)]
@@ -236,14 +237,51 @@ def test_force_totals_commit_still_nudges_a_confirmed_stall():
         return False, 0.0  # never settles, including the recheck and every subsequent round
 
     driver._total_is_settled = AsyncMock(side_effect=_total_is_settled)
+    # The DOM is already correct — nothing to repair, so the nudge is the only option left.
+    driver._read_grid_row = AsyncMock(return_value={"^qty": "2.00", "unit price": "44.00"})
     driver._fill_grid_field = AsyncMock(return_value=True)
 
     asyncio.run(driver._force_totals_commit(payload, line_items))
 
-    # Qty gets nudged (0.00 then the real value) at least once across the 3 attempt rounds.
     calls = driver._fill_grid_field.call_args_list
     assert any(c.args == (0, "Qty", "0.00", r"^qty") for c in calls)
     assert any(c.args == (0, "Qty", "2.00", r"^qty") for c in calls)
+
+
+def test_force_totals_commit_repairs_the_field_that_is_actually_short():
+    """Total stalled short because row 1's Unit Price is 0.00: the repair must re-fill THAT field.
+
+    Regression guard for the 2026-08-20 finding — the old version only ever nudged Qty, so on
+    WO-PO/000080454 (row 1's price missing) it burned all three rounds writing Qty and never touched
+    the value that was actually wrong. A Qty-only nudge must NOT be what happens here.
+    """
+    driver = _make_driver()
+    payload = _payload(net_amount=99.0, grand_total=107.91)
+    line_items = [
+        LineItem(quantity=1.0, unit_price=44.0, net_amount=44.0),
+        LineItem(quantity=1.0, unit_price=55.0, net_amount=55.0),
+    ]
+
+    async def _total_is_settled(expected):
+        return False, 44.0  # row 0 committed, row 1 missing — never settles
+
+    async def _read_grid_row(row_index, header_regexes):
+        if row_index == 0:
+            return {"^qty": "1.00", "unit price": "44.00"}       # row 0 is fine
+        return {"^qty": "1.00", "unit price": "0.00"}             # row 1's price is the problem
+
+    driver._total_is_settled = AsyncMock(side_effect=_total_is_settled)
+    driver._read_grid_row = AsyncMock(side_effect=_read_grid_row)
+    driver._fill_grid_field = AsyncMock(return_value=True)
+
+    asyncio.run(driver._force_totals_commit(payload, line_items))
+
+    calls = driver._fill_grid_field.call_args_list
+    # The genuinely-short field is re-filled...
+    assert any(c.args == (1, "Unit Price", "55.00", "unit price") for c in calls)
+    # ...and row 0, which already reads correct, is only ever nudged on Qty — never has its correct
+    # price rewritten, which is what could knock it out via the cross-row interference.
+    assert not any(c.args[0] == 0 and c.args[1] == "Unit Price" for c in calls)
 
 
 # --- P2: _assert_details_filled ------------------------------------------------------------------
