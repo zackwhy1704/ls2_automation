@@ -50,8 +50,13 @@ from dataclasses import dataclass, field
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 
 from config import settings
-from src.models import WOPayload
-from src.synergix_driver import EXTERNAL_REMARK_CODE, PAYMENT_METHOD, SynergixDriver
+from src.models import WOPayload, is_jbtc
+from src.synergix_driver import (
+    EXTERNAL_REMARK_CODE,
+    PAYMENT_METHOD,
+    SKTC_PROJECT_SITE_MATCH,
+    SynergixDriver,
+)
 from src.validator import resolve_project_code
 
 MATCH, MISMATCH, UNREADABLE, INFO = "MATCH", "MISMATCH", "UNREADABLE", "INFO"
@@ -309,7 +314,19 @@ async def audit_one(d, page, payload: WOPayload) -> WOAudit:
         audit.add("external remarks", MISMATCH, f"expected {EXTERNAL_REMARK_CODE}, got {_flat(remarks, 60)!r}")
 
     site = (await d._read_labeled_value("Project Site") or "").strip()
-    want_code = resolve_project_code(payload.job_sheet_number)
+    # Council-aware, exactly as the write path decides it. resolve_project_code() is JBTC-ONLY
+    # (Infigo/Ecocare by job-sheet prefix); Sengkang uses its own Project Sites and
+    # _stage_b_create_quotation/amend_quotation already branch on is_jbtc() to pick
+    # SKTC_PROJECT_SITE_MATCH. Calling resolve_project_code for an SKTC WO returns a JBTC code and
+    # would make every correct SKTC quotation look like a MISMATCH — an auditor that invents
+    # failures is worse than no auditor.
+    if is_jbtc(payload.town_council):
+        try:
+            want_code = resolve_project_code(payload.job_sheet_number)
+        except Exception:
+            want_code = ""
+    else:
+        want_code = SKTC_PROJECT_SITE_MATCH
     if not site:
         audit.add("project site", UNREADABLE, "not readable in this view")
     elif want_code and want_code in site:
@@ -407,5 +424,6 @@ async def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(main()))
+
 
 
