@@ -38,8 +38,14 @@ $cred = Get-Credential -UserName $RunAsUser -Message "Enter the Windows password
 $batchAction = New-ScheduledTaskAction -Execute $pwsh `
     -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$RepoRoot\deploy\windows\run_batch.ps1`""
 $batchTrigger = New-ScheduledTaskTrigger -Daily -At $BatchTime
+# ExecutionTimeLimit raised 3h -> 6h on 2026-08-21. Measured full-list runs over ~306 WOs took
+# 2h20m (live) and 3h22m (DRY_RUN), so a 3h cap would have killed the longer one mid-flight. A
+# Task Scheduler kill is more damaging than the in-app per-WO timeout: nothing gets to clean up, so
+# a half-created quotation can be left behind to mask its WO from every later dedup check. Runtime
+# scales with how many WOs are genuinely new (each create+submit is minutes, each duplicate ~30s),
+# so headroom matters as the un-invoiced backlog grows.
 $batchSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 3) -RestartCount 1 -RestartInterval (New-TimeSpan -Minutes 5)
+    -ExecutionTimeLimit (New-TimeSpan -Hours 6) -RestartCount 1 -RestartInterval (New-TimeSpan -Minutes 5)
 
 Register-ScheduledTask -TaskName "LS2Automation-JBTC-Batch" `
     -Action $batchAction -Trigger $batchTrigger -Settings $batchSettings `
