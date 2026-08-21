@@ -271,6 +271,35 @@ class SynergixDriver:
             return
         raise RuntimeError("could not open Service Quotation list after re-login")
 
+    async def _select_quotation_status_tab(self, tab_title: str) -> bool:
+        """Switch the Service Quotation list to one of its status tabs, by the tab's title attribute.
+
+        The screen's left rail is a set of status-filtered views — measured live (2026-08-20):
+        Draft 446, Pending 0, Under Variation 73, History 5887, All 6406. "Draft" is the DEFAULT,
+        so anything already submitted (status "Pending Confirmation") is invisible unless a tab is
+        selected explicitly. That is not cosmetic: see check_duplicate, where it was a live
+        double-billing hole.
+        """
+        assert self.page is not None
+        tab = self.page.locator(f'[title="{tab_title}"]').first
+        if not await tab.count():
+            logger.warning("Quotation status tab %r not found", tab_title)
+            return False
+        try:
+            await tab.click(timeout=10000)
+            await self.page.wait_for_timeout(6000)
+            # Wait for a VISIBLE Enquiry/Subject header, not just any. Each status tab has its own
+            # copy of the grid, so after switching there are several in the DOM and only the active
+            # tab's is visible — a plain wait_for_selector resolves to the first (the previous tab's,
+            # now hidden) and times out, which is what broke the first version of this fix.
+            await self.page.locator("th:visible", has_text="Enquiry/Subject").first.wait_for(
+                state="visible", timeout=30000)
+            await self.page.wait_for_timeout(2000)
+            return True
+        except Exception:
+            logger.exception("Could not switch to the %r quotation tab", tab_title)
+            return False
+
     async def check_duplicate(self, payload: WOPayload) -> DedupResult:
         """Is this WO already invoiced in Synergix? Returns a three-state, fail-safe result.
 
@@ -280,6 +309,18 @@ class SynergixDriver:
 
         A confirmed NOT_DUPLICATE requires positive evidence of "no records" (the no-result marker),
         not merely the absence of result rows — otherwise a layout change would read as "safe to bill".
+
+        Searches the "All" tab, NOT the list's default view. Confirmed live (2026-08-21) that the
+        default is "Draft", and a SUBMITTED quotation moves to status "Pending Confirmation" which
+        that view excludes — so this check was structurally blind to exactly the records it exists to
+        catch. In the 2026-08-20 sweep both WO-PO/000080321 and WO-PO/000080420 were reported
+        NOT_DUPLICATE despite already having verified submitted quotations (QUO0006664 at 209.00 and
+        QUO0006668 at 88.00), and the drafts that produced would have double-billed both on submit.
+        It only looked sound until now because nearly every historical quotation is still a draft:
+        the hole opens the moment a WO is actually billed, which is the worst possible time.
+
+        If the tab switch fails, this returns UNCERTAIN rather than falling back to the Draft view —
+        a narrower search is precisely what caused the hole, so it must never be the silent default.
         """
         search_value = self._dedup_search_value(payload)
 
@@ -297,10 +338,18 @@ class SynergixDriver:
             await self._open_service_quotation_list()
             assert self.page is not None
 
+            # Must cover submitted quotations too — see this method's docstring. No silent fallback.
+            if not await self._select_quotation_status_tab("All"):
+                logger.warning(
+                    "Dedup %s: UNCERTAIN (could not switch to the 'All' quotation tab; refusing to "
+                    "fall back to the default Draft view, which cannot see submitted quotations)",
+                    search_value)
+                return DedupResult.UNCERTAIN
+
             # Filter the Enquiry/Subject column by the WO-PO. This JSF grid's ids are auto-generated,
             # so target the column by its header text, then the stable filter class within it. The
             # PrimeFaces column filter applies on Enter.
-            header = self.page.locator("th", has_text="Enquiry/Subject").first
+            header = self.page.locator("th:visible", has_text="Enquiry/Subject").first
             filter_input = header.locator("input.ui-column-filter").first
             await filter_input.click()
             await filter_input.fill("")
@@ -311,11 +360,22 @@ class SynergixDriver:
             await self.page.wait_for_timeout(6000)        # PrimeFaces ajax re-filter + settle
 
             # Read the filtered grid body: does it contain the WO-PO, or the "No records found" row?
+            # Scoped to the VISIBLE quotation table specifically. Each status tab has its own copy
+            # (ids differ only by prefix, all ending serviceQuotationTable_data), so the visibility
+            # filter is what picks the active tab's grid. Deliberately NOT a bare [id$="_data"]:
+            # confirmed live (2026-08-21) that also matches the top notification bar
+            # (topBarNotificationBarPanelForm:...:j_idt952_data), and folding unrelated text into the
+            # haystack risks a false DUPLICATE — the one verdict that silently stops a WO being
+            # billed at all.
             grid = await self.page.evaluate(
-                "(wo) => { const t = document.querySelector('[id$=\"serviceQuotationTable_data\"]');"
-                " const txt = t ? t.innerText : '';"
-                " return { present: !!t, empty: /no records found|no data/i.test(txt),"
-                " match: txt.includes(wo) }; }",
+                """(wo) => {
+                    const bodies = [...document.querySelectorAll('[id$="serviceQuotationTable_data"]')]
+                        .filter(b => b.offsetParent !== null);
+                    const txt = bodies.map(b => b.innerText || '').join('\\n');
+                    return { present: bodies.length > 0,
+                             empty: /no records found|no data/i.test(txt),
+                             match: txt.includes(wo) };
+                }""",
                 search_value,
             )
 
