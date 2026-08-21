@@ -418,6 +418,14 @@ class SynergixDriver:
         already set still leaves a (possibly incomplete) draft that has real review value — e.g.
         the 54 partial drafts from tonight's runs — and must NOT be aborted just because one later
         step failed.
+
+        Confirms the target is ACTUALLY blank before aborting it, rather than trusting the id it was
+        handed. Confirmed live (2026-08-20 overnight sweep) that a stale id can reach here and
+        destroy a different WO's fully-filled, gate-verified draft: WO-PO/000081588's failure
+        aborted QUO0006710, which belonged to WO-PO/000080420. The caller now also refuses to pass
+        an id matching the pre-click one, but this is the guard that holds regardless of how the id
+        was obtained — same safety boundary reap_incomplete_draft already applies ("never touch
+        anything that looks legitimately filled").
         """
         if not quo_id:
             logger.warning(
@@ -426,6 +434,17 @@ class SynergixDriver:
                 wo_po_number)
             return
         try:
+            # A genuine blank shell has no Subject and no positive total. Anything else is somebody
+            # else's record (or a partially useful one) and must survive.
+            subject = (await self._read_labeled_value("Enquiry/Subject") or "").strip()
+            total = await self._read_total_after_tax()
+            if subject or (total is not None and total > 0):
+                logger.error(
+                    "REFUSING to abort %s for %s: it is not a blank shell (subject=%r, total=%r). "
+                    "This id is almost certainly stale and belongs to another WO — leaving it "
+                    "untouched. Any real blank shell from this failure needs manual cleanup.",
+                    quo_id, wo_po_number, subject, total)
+                return
             logger.warning("Aborting blank draft %s for %s (failed before Customer was set)",
                             quo_id, wo_po_number)
             await self.abort_quotation(quo_id)
@@ -1292,6 +1311,9 @@ class SynergixDriver:
 
         await self._open_service_quotation_list()
 
+        # Read whatever id is on screen BEFORE creating, so a stale one can be recognised below.
+        pre_click_quo_id = await self._current_quotation_id()
+
         await page.locator("button:has(span.fa-plus)").first.click()
         await page.wait_for_timeout(8000)
         # Captured now, while the freshly-created draft's form is still visibly loaded — used only
@@ -1301,6 +1323,21 @@ class SynergixDriver:
         # stuck blockUI overlay), where _current_quotation_id() would find nothing to abort even
         # though a real empty draft was already created by the "+" click above.
         draft_quo_id = await self._current_quotation_id()
+        # ...but if the "+" click didn't actually open a NEW record, that read returns whatever was
+        # already on screen — the PREVIOUS WO's quotation. Aborting that destroys good work.
+        # Confirmed live (2026-08-20 overnight sweep): WO-PO/000081588 failed before Customer was
+        # set and aborted QUO0006710 — the draft belonging to WO-PO/000080420, created and fully
+        # gate-verified 47 minutes earlier — while its own blank shell (QUO0006711, absent from the
+        # entire run report) was left orphaned. Both halves of that are bad: a correct draft deleted,
+        # and an orphan left to mask its WO from every future dedup check.
+        if draft_quo_id and draft_quo_id == pre_click_quo_id:
+            logger.warning(
+                "Stage B: after the '+' click the form still shows %s — the same id as before it, so "
+                "no new draft id could be established for %s. Not treating it as this WO's draft: "
+                "aborting it would delete another WO's record. Any blank shell the click did create "
+                "is left for manual cleanup rather than risking the wrong one.",
+                draft_quo_id, payload.wo_po_number)
+            draft_quo_id = None
 
         # --- Customer (cascades Address/Contact/Currency/Sales Tax/SBU) ---
         council = payload.town_council.strip() or "Town Council"
