@@ -12,9 +12,24 @@ from src.models import (
     PROJECT_CODE_ECOCARE,
     PROJECT_CODE_INFIGO,
     WOPayload,
+    is_jbtc,
 )
 
 _WO_PO_RE = re.compile(r"^WO-PO/\d+$")
+
+# Sengkang's Synergix Project Site options are "2000073 Pest control" and "2000130 Mosquito", and
+# the driver currently always picks 2000073 (SKTC_PROJECT_SITE_MATCH) for a non-JBTC council. Every
+# real SKTC WO seen so far is pest control — pigeon inspection, rodent treatment — so that default
+# is right for them. What is NOT confirmed is whether Sengkang ever sends mosquito/vector work, and
+# whether such a WO should be billed against 2000130 instead. Rather than leave that as a silent
+# wrong-project-code risk, a non-JBTC WO whose work text looks mosquito-related is withheld from
+# auto-submit and routed to NEEDS_REVIEW for a human to place.
+#
+# Deliberately narrow terms. "Breeding" alone is NOT here: JBTC rodent WOs routinely say "treatment
+# to all breeding habitats of Rodent", so it would fire constantly on pest-control work. "Fogging"
+# is likewise absent — it appears on JBTC thermal-fogging WOs whose project code comes from the job
+# sheet prefix, where this question does not arise.
+_MOSQUITO_TERMS = ("mosquito", "aedes", "dengue", "larvicid", "larvae", "vector control")
 
 # Fields whose extraction being uncertain is billing-critical enough to block auto-submit outright,
 # rather than just being logged. gl_number is the one the extraction prompt itself calls CRITICAL.
@@ -91,7 +106,7 @@ def check_extraction_trust(payload: WOPayload, *, min_confidence: float | None =
     was never on its own enough to justify auto-billing; this is the gate that sits between a clean
     dedup and the actual write.
 
-    Three checks:
+    Four checks:
       1. money consistency — net_amount is already deterministically recomputed by the extractor from
          quantity, unit_price, and discount (the exact sign of the discount adjustment is council-
          specific — see models.is_jbtc), so it can't disagree with those inputs. grand_total and
@@ -100,6 +115,9 @@ def check_extraction_trust(payload: WOPayload, *, min_confidence: float | None =
       2. a CRITICAL field (gl_number, wo_po_number, unit_price, quantity) the model itself flagged as
          low-confidence, even if overall confidence looks fine.
       3. overall extraction_confidence below the configured threshold.
+      4. a non-JBTC (Sengkang) WO that looks like mosquito/vector work, where which Project Site
+         applies is unconfirmed — see _MOSQUITO_TERMS. This one is not about extraction confidence
+         at all: the read may be perfect and the billing destination still wrong.
     """
     threshold = settings.EXTRACTION_CONFIDENCE_THRESHOLD if min_confidence is None else min_confidence
     concerns: list[str] = []
@@ -109,6 +127,19 @@ def check_extraction_trust(payload: WOPayload, *, min_confidence: float | None =
         concerns.append(
             f"model flagged low confidence on critical field(s): {', '.join(sorted(flagged_critical))}"
         )
+
+    if not is_jbtc(payload.town_council):
+        haystack = " ".join(
+            [payload.nature_of_work or "", payload.service_location or ""]
+            + [li.description or "" for li in payload.effective_line_items]
+        ).lower()
+        hits = sorted({t for t in _MOSQUITO_TERMS if t in haystack})
+        if hits:
+            concerns.append(
+                f"non-JBTC WO mentions {', '.join(hits)} — Sengkang bills mosquito work against a "
+                "different Project Site (2000130) than pest control (2000073), and which applies is "
+                "unconfirmed. Place this one by hand rather than auto-billing it to 2000073."
+            )
 
     if payload.extraction_confidence is not None and payload.extraction_confidence < threshold:
         concerns.append(
