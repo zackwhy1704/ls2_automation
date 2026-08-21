@@ -1,12 +1,12 @@
-"""Synergix ERP driver: duplicate check + create/fulfil. DRY_RUN aware.
+﻿"""Synergix ERP driver: duplicate check + create/fulfil. DRY_RUN aware.
 
 In DRY_RUN (the default) every step runs EXCEPT the final submit/confirm clicks, which are logged
 instead of executed. Live submission only happens when DRY_RUN=false is set in .env.
 
 Stages from the workflow doc:
-  B — Create quotation: new quotation -> "Copy From" template -> fill ~8 fields -> submit
-  C — Schedule board update: MOST FRAGILE. Best-effort; failure marks PARTIAL, not FAILED.
-  D — Attach PDF + fulfil service order.
+  B â€” Create quotation: new quotation -> "Copy From" template -> fill ~8 fields -> submit
+  C â€” Schedule board update: MOST FRAGILE. Best-effort; failure marks PARTIAL, not FAILED.
+  D â€” Attach PDF + fulfil service order.
 
 After any WO (success or fail), navigate back to a known home state before the next.
 Browser access is serialised by the caller via an asyncio.Lock (writes run one at a time).
@@ -39,7 +39,7 @@ class DedupResult(str, Enum):
     """Three-state duplicate check. UNCERTAIN is fail-safe: never auto-bill, flag for a human.
 
     Needed because the JBTC "Un-Invoiced WO" list is maintained by hand, so a WO can still appear
-    there after it has actually been invoiced in Synergix. Synergix — not JBTC — is the source of
+    there after it has actually been invoiced in Synergix. Synergix â€” not JBTC â€” is the source of
     truth for whether a WO is already billed. A boolean can't distinguish "confirmed not billed" from
     "couldn't tell" (search error/timeout/ambiguous result); conflating them risks double-billing.
     """
@@ -61,7 +61,7 @@ ITEM_CODE = "SE-400212A"
 ITEM_TYPE = "S"
 
 # Payment Method dropdown target. Confirmed live (2026-08-15) that the previously-targeted
-# "Cheque" does not appear as an option at all for JALAN BESAR TOWN COUNCIL — the only real
+# "Cheque" does not appear as an option at all for JALAN BESAR TOWN COUNCIL â€” the only real
 # (non-placeholder) option offered was "GIRO", which the client confirmed is correct.
 PAYMENT_METHOD = "GIRO"
 
@@ -73,18 +73,18 @@ EXTERNAL_REMARK_CODE = "OCBC BANK DETAIL"
 
 # Project Site search term per council, used to find the right autocomplete row when creating a
 # quotation from scratch (see _select_autocomplete_row). Searching by the bare numeric code is NOT
-# safe — confirmed live that the same code string can match a DIFFERENT council's project (e.g.
+# safe â€” confirmed live that the same code string can match a DIFFERENT council's project (e.g.
 # "2000050" matched a Jalan Besar project first, not Sengkang), so we search by council name instead
 # and let the resolve_project_code()-derived code disambiguate which of the matches to pick.
 _PROJECT_SITE_SEARCH_JBTC = "Jalan Besar"
 _PROJECT_SITE_SEARCH_SKTC = "Sengkang"
 
 # TODO(human): Sengkang's real Project Site options (confirmed live, 2026-08-03) are
-# "2000073-Sengkang Town Council (Pest control)" and "2000130-Sengkang Town Council (Mosquito)" —
+# "2000073-Sengkang Town Council (Pest control)" and "2000130-Sengkang Town Council (Mosquito)" â€”
 # NOT the 2000050/2000069 Ecocare/Infigo codes resolve_project_code() computes from the job-sheet
 # prefix (those are confirmed JBTC-only, per the same live session). Since every SKTC sample we have
 # is adhoc PEST CONTROL work (not mosquito-specific), this defaults every SKTC WO to the "Pest
-# control" project site (2000073) as the reasonable assumption — CONFIRM with the client whether any
+# control" project site (2000073) as the reasonable assumption â€” CONFIRM with the client whether any
 # SKTC WOs should instead map to "Mosquito" (2000130), and whether job_sheet_number's alphabetic/
 # numeric prefix means anything for SKTC at all or if it's purely service-type-based.
 SKTC_PROJECT_SITE_MATCH = "2000073"
@@ -123,13 +123,13 @@ class SynergixDriver:
 
     @property
     def stubbed(self) -> bool:
-        """True when Synergix is not configured yet — driver runs without a browser."""
+        """True when Synergix is not configured yet â€” driver runs without a browser."""
         return not synergix_configured()
 
     async def start(self) -> None:
         if self.stubbed:
             logger.warning(
-                "Synergix not configured (SYNERGIX_BASE_URL empty) — running in STUB mode: "
+                "Synergix not configured (SYNERGIX_BASE_URL empty) â€” running in STUB mode: "
                 "no browser, dedup skipped, writes are simulated. Fill SYNERGIX_* in .env to go live."
             )
             return
@@ -159,7 +159,7 @@ class SynergixDriver:
         # Settle before closing: confirmed live (2026-08-17) that the LAST record touched before a
         # batch ends can silently revert a just-typed value. A field committing in the DOM (what
         # every verify/poll step in this file checks) is the client's own optimistic update, sent
-        # to the server via an async PrimeFaces ajax request — it is not proof the server has
+        # to the server via an async PrimeFaces ajax request â€” it is not proof the server has
         # actually received and saved it yet. Spot-checked 7 records spanning an entire 56-item
         # batch: every one PRIOR to the last-processed record persisted correctly; only the very
         # last one (with no next-item processing to buffer the gap before this close() call) had
@@ -177,14 +177,49 @@ class SynergixDriver:
         if self._pw:
             await self._pw.stop()
 
+    async def _goto_base_with_retry(self, *, attempts: int = 3) -> None:
+        """Navigate to SYNERGIX_BASE_URL, retrying a transient navigation timeout.
+
+        Synergix goes through short unreachable spells. Measured live (2026-08-21): three
+        consecutive pipeline runs died on this one goto at the 30s page default, while a raw curl in
+        the same minutes showed one 40s timeout followed by 200s in 1.7s, and a Playwright probe
+        minutes later completed domcontentloaded in 0.6-1.4s on 6/6 attempts. So the server was
+        briefly stalling, not broken, and a single attempt with no retry turned a few seconds of
+        server wobble into a WO that did not get billed.
+
+        That matters more than it looks: this navigation is on the dedup path for EVERY WO, and a
+        failure there returns UNCERTAIN, which routes the WO to NEEDS_REVIEW. A nightly unattended
+        run would quietly park work for a human instead of billing it, with nothing obviously broken
+        in the report.
+        """
+        assert self.page is not None
+        last: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                # JSF/PrimeFaces app keeps connections open, so wait on DOM content, not networkidle.
+                await self.page.goto(settings.SYNERGIX_BASE_URL, wait_until="domcontentloaded")
+                if attempt > 1:
+                    logger.info("Synergix navigation succeeded on attempt %d", attempt)
+                return
+            except Exception as exc:
+                last = exc
+                logger.warning("Synergix navigation attempt %d/%d failed (%s) â€” retrying",
+                                attempt, attempts, type(exc).__name__)
+                try:
+                    await self.page.wait_for_timeout(5000)
+                except Exception:
+                    pass
+        raise RuntimeError(
+            f"could not load {settings.SYNERGIX_BASE_URL} after {attempts} attempts: {last}"
+        )
+
     async def login(self) -> None:
         if self._logged_in:
             return
         if not settings.SYNERGIX_BASE_URL:
             raise RuntimeError("SYNERGIX_BASE_URL is not set in .env")
         assert self.page is not None
-        # JSF/PrimeFaces app keeps connections open, so wait on DOM content, not networkidle.
-        await self.page.goto(settings.SYNERGIX_BASE_URL, wait_until="domcontentloaded")
+        await self._goto_base_with_retry()
         await self.page.wait_for_timeout(3000)
 
         login_field = self.page.locator(S.require("SYNERGIX_USERNAME_INPUT", S.SYNERGIX_USERNAME_INPUT))
@@ -196,7 +231,7 @@ class SynergixDriver:
             )
             await self.page.click(S.require("SYNERGIX_LOGIN_BUTTON", S.SYNERGIX_LOGIN_BUTTON))
         else:
-            # Persisted session already logged in — we landed straight on the app.
+            # Persisted session already logged in â€” we landed straight on the app.
             logger.info("Synergix session reused (no login form present)")
 
         # Confirm we're on the app: the header home button is always present once authenticated.
@@ -228,7 +263,7 @@ class SynergixDriver:
         """
         assert self.page is not None
         if await self._is_session_expired():
-            logger.warning("Synergix session expired — re-logging in")
+            logger.warning("Synergix session expired â€” re-logging in")
             self._logged_in = False
             await self.login()
 
@@ -248,17 +283,20 @@ class SynergixDriver:
     async def _open_service_quotation_list(self) -> None:
         """Navigate (logged in) to General Service -> Service Quotation - LS2 list view.
 
-        Re-navigates from the base URL each time so the grid is a fresh, unfiltered instance — calling
+        Re-navigates from the base URL each time so the grid is a fresh, unfiltered instance â€” calling
         this twice in one session without the reset can leave a stale/filtered datatable. If the
         session has expired, re-login and retry once (self-healing).
         """
         await self.login()
         assert self.page is not None
         for attempt in (1, 2):
-            await self.page.goto(settings.SYNERGIX_BASE_URL, wait_until="domcontentloaded")
+            # Retrying navigation here too: this existing loop only re-runs on an EXPIRED SESSION, so
+            # a transient nav timeout would propagate straight out and (via check_duplicate) turn a
+            # billable WO into NEEDS_REVIEW. See _goto_base_with_retry.
+            await self._goto_base_with_retry()
             await self.page.wait_for_timeout(4000)
             if await self._is_session_expired():
-                logger.warning("Session expired on nav (attempt %d) — re-logging in", attempt)
+                logger.warning("Session expired on nav (attempt %d) â€” re-logging in", attempt)
                 self._logged_in = False
                 await self.login()
                 continue
@@ -274,7 +312,7 @@ class SynergixDriver:
     async def _select_quotation_status_tab(self, tab_title: str) -> bool:
         """Switch the Service Quotation list to one of its status tabs, by the tab's title attribute.
 
-        The screen's left rail is a set of status-filtered views — measured live (2026-08-20):
+        The screen's left rail is a set of status-filtered views â€” measured live (2026-08-20):
         Draft 446, Pending 0, Under Variation 73, History 5887, All 6406. "Draft" is the DEFAULT,
         so anything already submitted (status "Pending Confirmation") is invisible unless a tab is
         selected explicitly. That is not cosmetic: see check_duplicate, where it was a live
@@ -290,7 +328,7 @@ class SynergixDriver:
             await self.page.wait_for_timeout(6000)
             # Wait for a VISIBLE Enquiry/Subject header, not just any. Each status tab has its own
             # copy of the grid, so after switching there are several in the DOM and only the active
-            # tab's is visible — a plain wait_for_selector resolves to the first (the previous tab's,
+            # tab's is visible â€” a plain wait_for_selector resolves to the first (the previous tab's,
             # now hidden) and times out, which is what broke the first version of this fix.
             await self.page.locator("th:visible", has_text="Enquiry/Subject").first.wait_for(
                 state="visible", timeout=30000)
@@ -305,28 +343,28 @@ class SynergixDriver:
 
         The JBTC "Un-Invoiced WO" list is hand-maintained and can be stale, so Synergix is the source
         of truth. Any error, timeout, or ambiguous page yields UNCERTAIN (not NOT_DUPLICATE), so a WO
-        is NEVER silently billed when we can't confirm it is unbilled — avoiding double invoicing.
+        is NEVER silently billed when we can't confirm it is unbilled â€” avoiding double invoicing.
 
         A confirmed NOT_DUPLICATE requires positive evidence of "no records" (the no-result marker),
-        not merely the absence of result rows — otherwise a layout change would read as "safe to bill".
+        not merely the absence of result rows â€” otherwise a layout change would read as "safe to bill".
 
         Searches the "All" tab, NOT the list's default view. Confirmed live (2026-08-21) that the
         default is "Draft", and a SUBMITTED quotation moves to status "Pending Confirmation" which
-        that view excludes — so this check was structurally blind to exactly the records it exists to
+        that view excludes â€” so this check was structurally blind to exactly the records it exists to
         catch. In the 2026-08-20 sweep both WO-PO/000080321 and WO-PO/000080420 were reported
         NOT_DUPLICATE despite already having verified submitted quotations (QUO0006664 at 209.00 and
         QUO0006668 at 88.00), and the drafts that produced would have double-billed both on submit.
         It only looked sound until now because nearly every historical quotation is still a draft:
         the hole opens the moment a WO is actually billed, which is the worst possible time.
 
-        If the tab switch fails, this returns UNCERTAIN rather than falling back to the Draft view —
+        If the tab switch fails, this returns UNCERTAIN rather than falling back to the Draft view â€”
         a narrower search is precisely what caused the hole, so it must never be the silent default.
         """
         search_value = self._dedup_search_value(payload)
 
         if self.stubbed:
             if settings.DEDUP_STUB_ASSUME_SAFE:
-                logger.warning("[STUB] DEDUP_STUB_ASSUME_SAFE=true — assuming %s NOT invoiced "
+                logger.warning("[STUB] DEDUP_STUB_ASSUME_SAFE=true â€” assuming %s NOT invoiced "
                                "(DEV ONLY; never use with real billing)", search_value)
                 return DedupResult.NOT_DUPLICATE
             # No Synergix yet: we CANNOT verify invoiced status, so this is genuinely uncertain.
@@ -338,7 +376,7 @@ class SynergixDriver:
             await self._open_service_quotation_list()
             assert self.page is not None
 
-            # Must cover submitted quotations too — see this method's docstring. No silent fallback.
+            # Must cover submitted quotations too â€” see this method's docstring. No silent fallback.
             if not await self._select_quotation_status_tab("All"):
                 logger.warning(
                     "Dedup %s: UNCERTAIN (could not switch to the 'All' quotation tab; refusing to "
@@ -365,7 +403,7 @@ class SynergixDriver:
             # filter is what picks the active tab's grid. Deliberately NOT a bare [id$="_data"]:
             # confirmed live (2026-08-21) that also matches the top notification bar
             # (topBarNotificationBarPanelForm:...:j_idt952_data), and folding unrelated text into the
-            # haystack risks a false DUPLICATE — the one verdict that silently stops a WO being
+            # haystack risks a false DUPLICATE â€” the one verdict that silently stops a WO being
             # billed at all.
             grid = await self.page.evaluate(
                 """(wo) => {
@@ -388,11 +426,11 @@ class SynergixDriver:
             if grid["empty"]:
                 logger.info("Dedup %s: NOT_DUPLICATE (Synergix reports 'No records found')", search_value)
                 return DedupResult.NOT_DUPLICATE
-            # Filtered but neither a WO match nor the explicit empty marker — can't be sure. Fail safe.
+            # Filtered but neither a WO match nor the explicit empty marker â€” can't be sure. Fail safe.
             logger.warning("Dedup %s: UNCERTAIN (no WO match and no 'no records' marker)", search_value)
             return DedupResult.UNCERTAIN
         except Exception:
-            logger.exception("Dedup check for %s errored — returning UNCERTAIN (fail-safe)", search_value)
+            logger.exception("Dedup check for %s errored â€” returning UNCERTAIN (fail-safe)", search_value)
             return DedupResult.UNCERTAIN
 
     # ------------------------------------------------------------------ write path
@@ -407,7 +445,7 @@ class SynergixDriver:
             )
             return WriteResult(
                 WOStatus.PROCESSED,
-                "Synergix stubbed — no write performed (SYNERGIX_* not configured). "
+                "Synergix stubbed â€” no write performed (SYNERGIX_* not configured). "
                 f"project_code={project_code}",
             )
         try:
@@ -419,29 +457,29 @@ class SynergixDriver:
                 # Confirmed live (2026-08-19) on WO-PO/000080321 and WO-PO/000080420: when the
                 # Details-grid fill fails this late (Customer/Salesperson/Project Site/Item Code
                 # already set, only Qty/Unit Price never committing) and the WO-level 300s timeout
-                # or this assertion cuts it off, the draft was left behind with NOTHING aborted —
+                # or this assertion cuts it off, the draft was left behind with NOTHING aborted â€”
                 # _abort_blank_draft only covers a failure before Customer is set. That draft (e.g.
                 # QUO0006683/QUO0006684, Total After Tax 0.00, blank Item Code) then permanently
                 # masks the WO from every future run: check_duplicate sees a real quotation exists
                 # and reports DUPLICATE forever, even though nothing was ever actually billed. This
                 # is narrower than the general "later failures keep their draft for review" policy
-                # (see _abort_blank_draft's docstring) — a draft that fails ITS OWN completeness
+                # (see _abort_blank_draft's docstring) â€” a draft that fails ITS OWN completeness
                 # assertion has no review value by definition, unlike e.g. a Payment Method or
                 # Customer Contact miss that still leaves a usable draft.
                 draft_quo_id = await self._current_quotation_id()
                 logger.warning(
-                    "Details grid never became valid for %s — aborting draft %s rather than "
+                    "Details grid never became valid for %s â€” aborting draft %s rather than "
                     "leaving a broken record that would mask this WO from future dedup checks",
                     payload.wo_po_number, draft_quo_id)
                 if draft_quo_id:
                     try:
                         await self.abort_quotation(draft_quo_id)
                     except Exception:
-                        logger.exception("Could not abort incomplete draft %s for %s — may need "
+                        logger.exception("Could not abort incomplete draft %s for %s â€” may need "
                                          "manual cleanup", draft_quo_id, payload.wo_po_number)
                 raise
             quo_id = await self._submit_quotation(payload)
-            # Schedule Board (C) and Fulfil (D) remain manual — done by the team in Synergix.
+            # Schedule Board (C) and Fulfil (D) remain manual â€” done by the team in Synergix.
             if settings.DRY_RUN:
                 return WriteResult(
                     WOStatus.PARTIAL,
@@ -453,7 +491,7 @@ class SynergixDriver:
                 "Schedule board + fulfil still manual.",
             )
         except S.MissingSelectorError as exc:
-            logger.error("MISSING SELECTOR: %s — fill it in config/selectors.py", exc)
+            logger.error("MISSING SELECTOR: %s â€” fill it in config/selectors.py", exc)
             return WriteResult(WOStatus.FAILED, f"missing selector: {exc}")
         except Exception as exc:
             logger.exception("Synergix write failed for %s", payload.wo_po_number)
@@ -467,16 +505,16 @@ class SynergixDriver:
         so a genuinely empty shell (no customer, no subject, nothing a human could act on) doesn't
         linger in Synergix forever.
 
-        Added 2026-08-17 after an independent audit found QUO0006650 — a fresh blank shell dated
+        Added 2026-08-17 after an independent audit found QUO0006650 â€” a fresh blank shell dated
         that same day, created by exactly this failure mode (a Customer-selection crash right after
         the "+" click, from a stuck blockUI overlay). The write() pipeline's normal except handler
         just logs and returns FAILED with no cleanup step, which is how the ORIGINAL 151-empty-
-        quotation incident this whole investigation started from actually happened — this closes
+        quotation incident this whole investigation started from actually happened â€” this closes
         that gap for the specific case where NOTHING useful was captured yet.
 
         Deliberately only called this early. A failure after Customer/Salesperson/Details are
-        already set still leaves a (possibly incomplete) draft that has real review value — e.g.
-        the 54 partial drafts from tonight's runs — and must NOT be aborted just because one later
+        already set still leaves a (possibly incomplete) draft that has real review value â€” e.g.
+        the 54 partial drafts from tonight's runs â€” and must NOT be aborted just because one later
         step failed.
 
         Confirms the target is ACTUALLY blank before aborting it, rather than trusting the id it was
@@ -484,13 +522,13 @@ class SynergixDriver:
         destroy a different WO's fully-filled, gate-verified draft: WO-PO/000081588's failure
         aborted QUO0006710, which belonged to WO-PO/000080420. The caller now also refuses to pass
         an id matching the pre-click one, but this is the guard that holds regardless of how the id
-        was obtained — same safety boundary reap_incomplete_draft already applies ("never touch
+        was obtained â€” same safety boundary reap_incomplete_draft already applies ("never touch
         anything that looks legitimately filled").
         """
         if not quo_id:
             logger.warning(
                 "Stage B failed before Customer was set for %s, and no draft id could be read to "
-                "clean up — a blank shell may have been left behind; check Synergix manually",
+                "clean up â€” a blank shell may have been left behind; check Synergix manually",
                 wo_po_number)
             return
         try:
@@ -501,7 +539,7 @@ class SynergixDriver:
             if subject or (total is not None and total > 0):
                 logger.error(
                     "REFUSING to abort %s for %s: it is not a blank shell (subject=%r, total=%r). "
-                    "This id is almost certainly stale and belongs to another WO — leaving it "
+                    "This id is almost certainly stale and belongs to another WO â€” leaving it "
                     "untouched. Any real blank shell from this failure needs manual cleanup.",
                     quo_id, wo_po_number, subject, total)
                 return
@@ -509,14 +547,14 @@ class SynergixDriver:
                             quo_id, wo_po_number)
             await self.abort_quotation(quo_id)
         except Exception:
-            logger.exception("Could not abort blank draft %s for %s — may need manual cleanup",
+            logger.exception("Could not abort blank draft %s for %s â€” may need manual cleanup",
                               quo_id, wo_po_number)
 
     async def abort_quotation(self, quotation_no: str) -> bool:
         """Admin/cleanup utility, NOT part of the regular write pipeline: open an existing quotation
-        by its number and abort (discard) it — for removing bad/orphaned drafts, e.g. the batch of
+        by its number and abort (discard) it â€” for removing bad/orphaned drafts, e.g. the batch of
         empty quotations a full SOP compliance audit found from before the Details-grid fill was
-        fixed. Only works on an un-submitted draft (Revision 0) — Abort is Synergix's own action for
+        fixed. Only works on an un-submitted draft (Revision 0) â€” Abort is Synergix's own action for
         discarding a draft, distinct from Cancel/Delete on a submitted record.
 
         Returns True if the quotation was found and no longer appears in the list afterward.
@@ -542,7 +580,7 @@ class SynergixDriver:
 
         abort_btn = page.locator("button.abort-button").first
         if not await abort_btn.count():
-            logger.warning("abort_quotation: no Abort button for %s — may already be submitted "
+            logger.warning("abort_quotation: no Abort button for %s â€” may already be submitted "
                             "(Abort only applies to un-submitted drafts)", quotation_no)
             return False
         await abort_btn.click(timeout=10000)
@@ -568,18 +606,18 @@ class SynergixDriver:
 
     async def reap_incomplete_draft(self, wo_po_number: str) -> bool:
         """Find whatever quotation Synergix now has for `wo_po_number` and abort it, but ONLY if
-        it's genuinely incomplete (Total After Tax not positive) — never touches a quotation that
+        it's genuinely incomplete (Total After Tax not positive) â€” never touches a quotation that
         looks legitimately filled, submitted or not.
 
         For a WO whose write() call was cut off by the batch-level SYNERGIX_WO_TIMEOUT_S guardrail
-        (asyncio.wait_for cancels the coroutine — write()'s own except block never runs, so its
+        (asyncio.wait_for cancels the coroutine â€” write()'s own except block never runs, so its
         draft-abort-on-Details-failure handling can't fire either). Confirmed live (2026-08-19) on
         WO-PO/000080321 and WO-PO/000080420: both timed out deep in the Details-grid retry loop and
         left behind a draft (QUO0006683: empty grid; QUO0006684: Item Code/Qty/Unit Price all
-        blank, Total After Tax 0.00) that then permanently masks the WO — check_duplicate finds a
+        blank, Total After Tax 0.00) that then permanently masks the WO â€” check_duplicate finds a
         real quotation and reports DUPLICATE forever, even though nothing was ever actually billed.
 
-        Not part of the regular write() path — call this from the batch loop's timeout handler,
+        Not part of the regular write() path â€” call this from the batch loop's timeout handler,
         same admin-utility spirit as abort_quotation.
         """
         assert self.page is not None
@@ -599,7 +637,7 @@ class SynergixDriver:
             row = page.locator(f"tr:has-text('{wo_po_number}')").first
             quo_link = row.locator("a").first
             if not await quo_link.count():
-                logger.info("reap_incomplete_draft: no quotation found for %s — nothing to reap",
+                logger.info("reap_incomplete_draft: no quotation found for %s â€” nothing to reap",
                             wo_po_number)
                 return False
             quo_id = (await quo_link.inner_text()).strip()
@@ -608,27 +646,27 @@ class SynergixDriver:
 
             total = await self._read_total_after_tax()
             if total is not None and total > 0:
-                logger.info("reap_incomplete_draft: %s (for %s) has Total After Tax %.2f — looks "
+                logger.info("reap_incomplete_draft: %s (for %s) has Total After Tax %.2f â€” looks "
                             "legitimate, leaving it alone", quo_id, wo_po_number, total)
                 return False
 
-            logger.warning("reap_incomplete_draft: %s (for %s) has Total After Tax %r — aborting "
+            logger.warning("reap_incomplete_draft: %s (for %s) has Total After Tax %r â€” aborting "
                             "as an incomplete draft left behind by a timed-out write",
                             quo_id, wo_po_number, total)
             return await self.abort_quotation(quo_id)
         except Exception:
-            logger.exception("reap_incomplete_draft: error while checking %s — leaving as-is",
+            logger.exception("reap_incomplete_draft: error while checking %s â€” leaving as-is",
                               wo_po_number)
             return False
 
     async def _read_labeled_value(self, label: str) -> str:
         """Read the current value of a labeled form field (see _fill_labeled_input) without
-        changing it. Unlike _fill_labeled_input, does not exclude [readonly] — reading should work
+        changing it. Unlike _fill_labeled_input, does not exclude [readonly] â€” reading should work
         regardless of the field's edit state.
 
         Falls back to the label's own parent container if it has no `<tr>` ancestor. Confirmed live
         (2026-08-17) that "External Remarks" uses a div-based grid layout (label + content as
-        sibling divs under a shared `grid-item-column` parent), not a table row — `closest('tr')`
+        sibling divs under a shared `grid-item-column` parent), not a table row â€” `closest('tr')`
         found nothing, so this always silently returned '' for that field regardless of its real
         value, masking whether a fix actually worked or not.
         """
@@ -649,15 +687,15 @@ class SynergixDriver:
 
     async def amend_quotation(self, quotation_no: str, payload: WOPayload) -> dict:
         """Admin/cleanup utility, NOT part of the regular write pipeline: open an existing,
-        incomplete quotation (Customer/Subject/GL/Project Site already correct, Details grid empty —
+        incomplete quotation (Customer/Subject/GL/Project Site already correct, Details grid empty â€”
         the shape every quotation from before the 2026-08-14 fill fix came out in) and fill in
         whatever's missing, reusing the same fixed logic _stage_b_create_quotation uses. Does NOT
-        touch Customer/Salesperson/Project Site (already correct) or Subject/Reference No. — only
+        touch Customer/Salesperson/Project Site (already correct) or Subject/Reference No. â€” only
         adds Details rows, sets Payment Method, and fills Project Site if it was left blank.
 
         `payload` must already have the correct wo_po_number/line_items/job_sheet_number/etc. for
         this quotation (the caller is expected to have matched it up, e.g. via the Subject field).
-        Leaves the quotation as an un-submitted draft either way — never submits.
+        Leaves the quotation as an un-submitted draft either way â€” never submits.
 
         Returns a dict: {"quo": ..., "wo_po": ..., "assertion": "ok"|<error message>}.
         """
@@ -694,14 +732,14 @@ class SynergixDriver:
             if payload.property_officer.strip().upper() not in current_contact.strip().upper():
                 if not await self._try_set_customer_contact(payload.property_officer):
                     logger.warning(
-                        "amend_quotation: no registered Customer Contact matches %r for %s — left as %r",
+                        "amend_quotation: no registered Customer Contact matches %r for %s â€” left as %r",
                         payload.property_officer, quotation_no, current_contact)
 
         # Project Site, only if currently blank (don't disturb an already-correct value). Must run
         # BEFORE Payment Method: confirmed live (2026-08-17) that Payment Method's tab-activation
         # (see _ensure_tab_active) switches away from the "General" tab Project Site lives on and
         # never switches back, so filling Payment Method first leaves Project Site's own input
-        # genuinely not visible — a Locator.click on it then times out for the full 30s rather than
+        # genuinely not visible â€” a Locator.click on it then times out for the full 30s rather than
         # failing fast. _stage_b_create_quotation already does Project Site before Payment Method
         # for the same reason; this just matches that proven order.
         project_site_value = await self._read_labeled_value("Project Site")
@@ -726,7 +764,7 @@ class SynergixDriver:
         if not await self._select_dropdown_option("Payment Method", PAYMENT_METHOD):
             logger.warning("amend_quotation: could not set Payment Method for %s", quotation_no)
 
-        # Details rows: add rows only up to the target count — idempotent, so re-running this on a
+        # Details rows: add rows only up to the target count â€” idempotent, so re-running this on a
         # quotation from a prior partially-failed attempt doesn't pile on duplicate rows.
         line_items = payload.effective_line_items
         remarks = build_remarks(payload)
@@ -746,7 +784,9 @@ class SynergixDriver:
         if added:
             await self._verify_and_refill_rows(line_items[:min(added, len(line_items))], remarks)
             await self._force_totals_commit(payload, line_items[:min(added, len(line_items))])
-        # Monitoring only — see the matching log line in _stage_b_create_quotation for why.
+
+            await self._ensure_remarks_intact(payload, line_items[:min(added, len(line_items))], remarks)
+        # Monitoring only â€” see the matching log line in _stage_b_create_quotation for why.
         logger.info("amend_quotation: Details-grid fill took %.1fs for %s",
                      time.monotonic() - fill_started_at, quotation_no)
 
@@ -772,7 +812,7 @@ class SynergixDriver:
 
         Added 2026-08-17 after a live run hit a 30s Locator.click timeout on the Customer field
         with the call log showing `<div class="blockUI blockOverlay"></div> intercepts pointer
-        events` on every retry — the exact failure mode the client's own audit already identified
+        events` on every retry â€” the exact failure mode the client's own audit already identified
         as the root cause of the original 151-empty-quotation incident (see
         _abort_blank_draft's docstring). That incident's fix (_abort_blank_draft) cleans up the
         orphaned draft AFTER the failure; this addresses the failure itself by waiting for the
@@ -783,14 +823,14 @@ class SynergixDriver:
         overlay_wait_ms widened from 8s to 30s (2026-08-18) after a live batch run hit this exact
         failure again on the Customer field right after quotation creation, with the overlay still
         blocking after the full original 8s+10s (18s) budget. Measured live immediately after: 5
-        fresh back-to-back draft creations in the same session all cleared in 2.2-2.9s — the slow
+        fresh back-to-back draft creations in the same session all cleared in 2.2-2.9s â€” the slow
         case is a genuine occasional server-side spike on an operation that reliably does complete,
         not a permanently-stuck state (unlike the unrelated TCMS grid-scoping bug this was once
-        confused with) — so more patience here is the right fix, not a guess.
+        confused with) â€” so more patience here is the right fix, not a guess.
 
         Bounded: if the overlay never clears within overlay_wait_ms, proceeds to the click attempt
         anyway (the ordinary Locator timeout/error still applies) rather than hanging indefinitely
-        — a genuinely stuck overlay must still surface as a clear failure, not a silent hang. The
+        â€” a genuinely stuck overlay must still surface as a clear failure, not a silent hang. The
         existing _abort_blank_draft safety net still cleans up if it does.
         """
         assert self.page is not None
@@ -799,20 +839,20 @@ class SynergixDriver:
             await page.locator(".blockUI.blockOverlay").first.wait_for(
                 state="detached", timeout=overlay_wait_ms)
         except Exception:
-            pass  # no overlay was showing, or it didn't clear in time — either way, try the click
+            pass  # no overlay was showing, or it didn't clear in time â€” either way, try the click
         await locator.click(timeout=timeout_ms)
 
     async def _fill_labeled_input(self, label: str, value: str, *, timeout_ms: int = 4000) -> None:
         """Fill the input/textarea belonging to a form field identified by its on-screen label.
 
         Synergix's JSF ids are auto-generated, so we anchor on the (stable) label text and take the
-        input in the same table row. Raises if the field can't be found — the caller marks FAILED.
+        input in the same table row. Raises if the field can't be found â€” the caller marks FAILED.
 
-        Returns a Locator built from the input's own `id` — NOT an ElementHandle from
+        Returns a Locator built from the input's own `id` â€” NOT an ElementHandle from
         `evaluate_handle()`. Confirmed live (2026-08-15) that an ElementHandle is a frozen reference
         to one specific DOM node: Customer selection cascades an ajax update (Address/Contact/
         Currency/Sales Tax/SBU all re-render), and if that cascade replaces this field's node between
-        grabbing the handle and clicking it, the click raises "Element is not attached to the DOM" —
+        grabbing the handle and clicking it, the click raises "Element is not attached to the DOM" â€”
         confirmed live on the Customer Contact field, which is filled right after Customer's cascade.
         A Locator re-resolves the id at click time instead of clicking a stale reference, and its
         ids are stable across a PrimeFaces re-render even though the DOM node object is replaced.
@@ -821,7 +861,7 @@ class SynergixDriver:
         live (2026-08-17, per a client SOP review) that Customer Contact was failing with "could not
         locate the input" on effectively every WO all night: it's filled immediately after Customer's
         own cascade, and a one-shot check right after that cascade starts can run before the
-        cascade-rendered row exists yet — the same ajax-timing class of bug already fixed elsewhere
+        cascade-rendered row exists yet â€” the same ajax-timing class of bug already fixed elsewhere
         in this file (_click_panel_row_by_text, _select_dropdown_option's option match).
         """
         assert self.page is not None
@@ -861,7 +901,7 @@ class SynergixDriver:
         textarea and fires a PrimeFaces ajax update) lives on an `<a>` INSIDE the row's first cell,
         not on the `<tr>` itself. Confirmed live (2026-08-17) that clicking the row the usual way
         (a Locator built on the `<tr>`, which Playwright clicks at its bounding-box center) landed
-        on empty cell space next to the link and left the textarea untouched, with no error — the
+        on empty cell space next to the link and left the textarea untouched, with no error â€” the
         same silent-failure shape documented throughout this file, just with the wrong element
         being the row instead of the link inside it.
         """
@@ -927,11 +967,11 @@ class SynergixDriver:
         activate it first.
 
         Confirmed live (2026-08-15) via direct DOM inspection that Payment Method/Payment Term
-        live on a SEPARATE tab (icon-only header, no visible text — matched by position among
+        live on a SEPARATE tab (icon-only header, no visible text â€” matched by position among
         sibling tabs, not label) from the "General" tab that's active when a quotation draft is
         first created. Every earlier fix attempt at "could not set Payment Method" (coordinate
         click, then marker-Locator click, then polling) missed this because the trigger really was
-        `display: none` the whole time — not a timing race or wrong-element click, a genuinely
+        `display: none` the whole time â€” not a timing race or wrong-element click, a genuinely
         inactive tab. `computedStyle(el).display === 'none'` on every ancestor check confirmed this.
         """
         assert self.page is not None
@@ -971,18 +1011,18 @@ class SynergixDriver:
     async def _select_dropdown_option(self, label: str, option_text: str) -> bool:
         """Select an option from a plain PrimeFaces `ui-selectonemenu` dropdown by its label.
 
-        Unlike Customer/Salesperson/Project Site (live-search autocompletes — _select_autocomplete_row)
+        Unlike Customer/Salesperson/Project Site (live-search autocompletes â€” _select_autocomplete_row)
         this is a closed, fixed-option dropdown (role=combobox, aria-haspopup=listbox): click the
         trigger to open its panel, then click the matching `<li>` by text.
 
         The option `<li>` is clicked via a real Playwright Locator built from a marker attribute
-        stamped onto that exact element, polling for the panel to render — NOT a raw
+        stamped onto that exact element, polling for the panel to render â€” NOT a raw
         `page.mouse.click(x, y)` at a computed bounding-box center. Confirmed live (2026-08-15) that
         this dropdown (used for Payment Method) was failing on almost every WO in a full batch run
         with "could not set Payment Method"; the coordinate click is the same silent-failure class
         documented on _grid_cell_locator and _click_panel_row_by_text.
 
-        Also activates the field's tab first if it's hidden — see _ensure_tab_active's docstring
+        Also activates the field's tab first if it's hidden â€” see _ensure_tab_active's docstring
         for the real root cause this addresses (Payment Method/Term live on a non-default tab).
         """
         assert self.page is not None
@@ -1052,15 +1092,15 @@ class SynergixDriver:
         Synergix's Customer/Salesperson/Project Site fields are all the same PrimeFaces pattern: a
         plain input that, once focused and typed into, ajax-populates a floating panel of matching
         rows (NOT a modal). Confirmed live (2026-08-01/03) that clicking via generic text-locator
-        matching is unreliable — with many near-identical rows, Playwright's own visibility check on
+        matching is unreliable â€” with many near-identical rows, Playwright's own visibility check on
         the matched text node intermittently reports it as hidden even though it's visibly on screen.
 
         The row is located via JS (by text match within the visible panel), then clicked through a
-        real Playwright Locator built from a marker attribute stamped onto that exact element — NOT
+        real Playwright Locator built from a marker attribute stamped onto that exact element â€” NOT
         raw `page.mouse.click(x, y)` at its computed bounding-box coordinates. Confirmed live
         (2026-08-14) that coordinate clicks in this app can silently land on an unrelated overlapping
         element (`document.elementFromPoint()` at the computed point returned a different container
-        entirely) with no error and no visible symptom besides the selection never taking — the exact
+        entirely) with no error and no visible symptom besides the selection never taking â€” the exact
         bug that left the Details grid empty on 151 production quotations; see _grid_cell_locator's
         docstring for the full story. A stamped-attribute Locator gets Playwright's own actionability
         checks (auto-scroll, and a real thrown error if something intercepts the click).
@@ -1068,13 +1108,13 @@ class SynergixDriver:
         The FIELD's own input is now located the same way (host label -> its <tr> -> the real
         <input>), not the offset-coordinate click used here previously. Confirmed live (2026-08-15,
         the full-batch rerun) that the previous `page.mouse.click(box.x + box.width + 80, box.y + 8)`
-        guess intermittently missed the actual input — same silent-failure shape as the grid-cell bug
-        — showing up as flaky "no Customer match found" / "could not select a Salesperson" despite
+        guess intermittently missed the actual input â€” same silent-failure shape as the grid-cell bug
+        â€” showing up as flaky "no Customer match found" / "could not select a Salesperson" despite
         the exact same council/name working moments earlier or later in the same run.
 
         The input is a Locator built from its own `id`, NOT an ElementHandle from
         `evaluate_handle()`. Confirmed live (2026-08-15, immediately after the fix above) that an
-        ElementHandle is a frozen reference to one specific DOM node — Customer's own selection
+        ElementHandle is a frozen reference to one specific DOM node â€” Customer's own selection
         cascades an ajax update that re-renders several nearby fields (including Salesperson/Project
         Site), and clicking a handle grabbed just before that cascade lands can raise "Element is not
         attached to the DOM". A Locator re-resolves the id at click time instead.
@@ -1102,7 +1142,7 @@ class SynergixDriver:
         field_input = page.locator(f'[id="{input_id}"]')
         await self._click_when_clear(field_input)
         await page.wait_for_timeout(300)
-        # Clear any existing text before typing — confirmed live (2026-08-17) that calling this
+        # Clear any existing text before typing â€” confirmed live (2026-08-17) that calling this
         # twice on the same field (e.g. a failed search followed by restoring the original value)
         # otherwise inserts the new text into the middle of whatever was already there instead of
         # replacing it, since a plain click() only focuses the field without selecting its content.
@@ -1126,9 +1166,9 @@ class SynergixDriver:
         Confirmed live (2026-08-17, per a client SOP review flagging Customer Contact stuck on
         "Account Department" on every quotation) that this field is a real PrimeFaces autoComplete
         with its own hidden id field (`{"party_code":...,"party_contact_code":...}`) backing a
-        CLOSED list of contacts registered against the customer in Synergix — not a free-text field.
+        CLOSED list of contacts registered against the customer in Synergix â€” not a free-text field.
         Blindly `.fill()`-ing the visible input (the previous approach) would show the officer's
-        name in the box while the hidden field silently kept pointing at the old contact — a
+        name in the box while the hidden field silently kept pointing at the old contact â€” a
         display/data mismatch, not a fix. So: try the real search-and-select; if nothing matches,
         re-search-and-reselect the ORIGINAL value to restore a consistent state instead of leaving
         whatever text the failed search typed in.
@@ -1136,7 +1176,7 @@ class SynergixDriver:
         Search by the officer's FIRST word only, not the full name. Confirmed live (2026-08-17) that
         Synergix's ajax search appears to filter on a single name field: searching "NURUL" (one
         word) returned the real contact row ("BUYER35 | Nurul Hasanah"), but searching the full
-        "NURUL HASANAH" returned zero rows for that contact at all — a multi-word query the server
+        "NURUL HASANAH" returned zero rows for that contact at all â€” a multi-word query the server
         itself can't satisfy, not a client-side matching problem. The remaining word(s) are instead
         required (case-insensitively) to also appear in whichever row the first word turns up, so a
         first-name collision with an unrelated contact doesn't get picked by mistake.
@@ -1164,22 +1204,22 @@ class SynergixDriver:
     ) -> str | None:
         """Find a visible autocomplete-panel row containing `needle` (and, if given, every one of
         `extra_needles` too) and click it, returning its text (or None if no match). Clicks via a
-        real Playwright Locator built from a marker attribute stamped onto the matched row — NOT raw
+        real Playwright Locator built from a marker attribute stamped onto the matched row â€” NOT raw
         `page.mouse.click(x, y)` at its computed bounding-box coordinates. Confirmed live
         (2026-08-14) that coordinate clicks in this app can silently land on an unrelated overlapping
         element (`document.elementFromPoint()` at the computed point returned a different container
-        entirely) with no error and no visible symptom besides the selection never taking — the exact
+        entirely) with no error and no visible symptom besides the selection never taking â€” the exact
         bug that left the Details grid empty on 151 production quotations; see _grid_cell_locator's
         docstring for the full story.
 
         Polls for the match to appear (up to timeout_ms) instead of trusting a single check right
         after a fixed sleep. Confirmed live (2026-08-15, the full-batch rerun) that the ajax panel's
-        populate time varies with server load — a one-shot check after a fixed wait intermittently
+        populate time varies with server load â€” a one-shot check after a fixed wait intermittently
         ran before the panel had rendered, which read as "no match" even though the same search
         would have succeeded a second or two later.
 
         Match is case-insensitive. Confirmed live (2026-08-17, Customer Contact mapping) that a
-        case-sensitive `.includes()` silently missed a real, currently-displayed match — the panel
+        case-sensitive `.includes()` silently missed a real, currently-displayed match â€” the panel
         row read "Nurul Hasanah" (Synergix's own Title Case) while the caller's needle was the
         TCMS-scraped ALL-CAPS "NURUL HASANAH", so the exact same bug shape (looks empty, isn't) that
         _read_labeled_value already hit for External Remarks.
@@ -1234,12 +1274,12 @@ class SynergixDriver:
     async def _grid_cell_locator(self, row_index: int, header_regex: str):
         """Locator for a Details-grid cell's input, found by (row_index, column header).
 
-        Returns a Playwright Locator built from the input's own `id` attribute — NOT raw pixel
+        Returns a Playwright Locator built from the input's own `id` attribute â€” NOT raw pixel
         coordinates. Confirmed live (2026-08-14) that `getBoundingClientRect()`-based coordinates for
         this grid do not correspond to the actual clickable point: `document.elementFromPoint()` at
         those exact coordinates returned an unrelated `.ui-tabs-panel` container, not the input. A
-        `page.mouse.click(x, y)` at such coordinates clicks whatever is really there — silently, no
-        error — which is why every previous fill attempt (both synthetic-event and real-keyboard
+        `page.mouse.click(x, y)` at such coordinates clicks whatever is really there â€” silently, no
+        error â€” which is why every previous fill attempt (both synthetic-event and real-keyboard
         typing) "succeeded" with no exception while the value never moved. This is the same class of
         bug the JBTC/TCMS row-selection fix hit earlier: trust Playwright's own actionability-checked
         `.click()`, which auto-scrolls into view and raises a clear error if something intercepts the
@@ -1276,13 +1316,13 @@ class SynergixDriver:
 
     async def _select_item_code(self, item_code: str, row_index: int = 0) -> bool:
         """Type into the Details row's Item Code/Desc cell (a table cell input, NOT a labeled form
-        field like Customer/Salesperson/Project Site — _select_autocomplete_row's label-based click
+        field like Customer/Salesperson/Project Site â€” _select_autocomplete_row's label-based click
         doesn't apply here) and click the matching autocomplete row, same panel-locate pattern.
 
-        `row_index` selects which Details row to fill when the WO has more than one line item — each
+        `row_index` selects which Details row to fill when the WO has more than one line item â€” each
         "Add Row" click appends a new row, so index 0 is the first-added row, 1 the second, etc.
 
-        This cell is a PrimeFaces `<p:autoComplete>` (`role="application"`), not a plain input —
+        This cell is a PrimeFaces `<p:autoComplete>` (`role="application"`), not a plain input â€”
         confirmed live (2026-08-14) that it swallows real keyboard events entirely: neither
         `page.keyboard.type()` nor a real keypress after `insertText()` ever changed its value, with
         no error and no visible symptom (the same silent-failure shape as the Details-grid bug).
@@ -1321,9 +1361,9 @@ class SynergixDriver:
             return False
 
         # The Details grid itself is a .ui-datatable and stays visible throughout, so it can wrongly
-        # be picked as "the last visible panel" — exclude it explicitly (it's the only candidate with
+        # be picked as "the last visible panel" â€” exclude it explicitly (it's the only candidate with
         # column headers) and only consider panels whose rows actually contain item_code as a match.
-        # Polls (see _click_panel_row_by_text) rather than a single fixed-wait check — confirmed live
+        # Polls (see _click_panel_row_by_text) rather than a single fixed-wait check â€” confirmed live
         # (2026-08-15) that a one-shot check right after a blind sleep intermittently missed a panel
         # that just hadn't finished its ajax populate yet, reported as "leaving row's item blank",
         # which then left a half-open autocomplete panel that could block the row's next cell click.
@@ -1357,7 +1397,7 @@ class SynergixDriver:
 
         Replaces the earlier Copy From-based flow: Copy From only lists quotations still in Synergix
         "New" status, which made it fail whenever no draft happened to exist for a given council (this
-        blocked EVERY SKTC WO — see project memory synergix-dedup-verified). Building from scratch has
+        blocked EVERY SKTC WO â€” see project memory synergix-dedup-verified). Building from scratch has
         no such dependency: it works identically for JBTC and SKTC.
 
         Confirmed live (2026-08-01/03) that Customer, Salesperson, and Project Site are all live
@@ -1382,7 +1422,7 @@ class SynergixDriver:
         #     while orphaning its own blank shell QUO0006711), and
         #   - _select_autocomplete_row("Customer", ...) matched the LIST's "Customer" COLUMN FILTER
         #     (id ...serviceQuotationTable:...:filter) instead of the form's Customer field, then
-        #     timed out clicking it — the failure that read as a "blockUI flake" for days.
+        #     timed out clicking it â€” the failure that read as a "blockUI flake" for days.
         # So: confirm a NEW draft id actually appeared before proceeding, retry the click if not, and
         # fail with a diagnosable error rather than acting on the wrong page.
         draft_quo_id = None
@@ -1401,14 +1441,14 @@ class SynergixDriver:
                 break
             logger.warning(
                 "Stage B: the '+' click did not open a new quotation form for %s (still showing %r) "
-                "— retrying (attempt %d/3)",
+                "â€” retrying (attempt %d/3)",
                 payload.wo_po_number, pre_click_quo_id, attempt)
             await self._open_service_quotation_list()
         if not draft_quo_id:
             raise RuntimeError(
                 f"the New-quotation form never opened for {payload.wo_po_number} after 3 '+' clicks "
                 f"(page still showing {pre_click_quo_id!r}). Refusing to continue: every later step "
-                "would target the quotation LIST instead of the form — which is how a previous run "
+                "would target the quotation LIST instead of the form â€” which is how a previous run "
                 "aborted another WO's draft and how the 'Customer field' click timeouts arose.")
         await page.wait_for_timeout(3000)  # let the freshly-opened form settle before filling
 
@@ -1424,22 +1464,22 @@ class SynergixDriver:
             raise RuntimeError(f"no Customer match found in Synergix for {council!r}")
 
         # --- Customer Contact: override the cascaded default with the real TC officer who raised
-        # the WO, if TCMS scraping captured one (JBTC/TCMS flow only — unset for SKTC/email WOs,
+        # the WO, if TCMS scraping captured one (JBTC/TCMS flow only â€” unset for SKTC/email WOs,
         # which have no TCMS page to scrape it from). Best-effort: a full SOP audit found this stuck
         # on a generic "Account Department" default on every quotation (MAJOR finding 4.3).
         if payload.property_officer:
             if not await self._try_set_customer_contact(payload.property_officer):
                 logger.warning(
-                    "Stage B: no registered Customer Contact matches %r for %s — left at the "
+                    "Stage B: no registered Customer Contact matches %r for %s â€” left at the "
                     "cascaded default", payload.property_officer, payload.wo_po_number)
 
         # --- Salesperson ---
         # TODO(human): "TAN WEI YING" is the salesperson seen on every real quotation observed so
-        # far (both councils), suggesting it's a fixed default rather than per-WO — confirm with the
+        # far (both councils), suggesting it's a fixed default rather than per-WO â€” confirm with the
         # client whether this should ever vary.
         salesperson_ok = await self._select_autocomplete_row("Salesperson", "Tan Wei", "TAN WEI YING")
         if not salesperson_ok:
-            logger.warning("Stage B: could not select a Salesperson for %s — leaving blank",
+            logger.warning("Stage B: could not select a Salesperson for %s â€” leaving blank",
                             payload.wo_po_number)
 
         # --- Project Site (cascades Project In-Charge/Portfolio) ---
@@ -1452,7 +1492,7 @@ class SynergixDriver:
         project_site_ok = await self._select_autocomplete_row("Project Site", search_term, match_fragment)
         if not project_site_ok:
             logger.warning(
-                "Stage B: no Project Site match for %s (searched %r, expected %r) — leaving blank, "
+                "Stage B: no Project Site match for %s (searched %r, expected %r) â€” leaving blank, "
                 "human must set it before Submit", payload.wo_po_number, search_term, match_fragment)
 
         # --- Subject + Reference No. ---
@@ -1460,19 +1500,19 @@ class SynergixDriver:
         await self._fill_labeled_input("Reference No.", payload.gl_number)
         logger.info("Stage B: filled Subject + Reference No. for %s", payload.wo_po_number)
 
-        # --- External Remarks (before Payment Method — same tab-hiding reason as Project Site) ---
+        # --- External Remarks (before Payment Method â€” same tab-hiding reason as Project Site) ---
         if not await self._select_external_remark(EXTERNAL_REMARK_CODE):
             logger.warning("Stage B: no External Remarks match for %r on %s",
                             EXTERNAL_REMARK_CODE, payload.wo_po_number)
 
         # --- Payment Method (left at the "Sel" placeholder if the target option isn't found) ---
         if not await self._select_dropdown_option("Payment Method", PAYMENT_METHOD):
-            logger.warning("Stage B: could not set Payment Method for %s — leaving as placeholder",
+            logger.warning("Stage B: could not set Payment Method for %s â€” leaving as placeholder",
                             payload.wo_po_number)
 
         # --- Line items: add one Details row per WO line item, then fill each ---
         # A WO with N "Job Sheet:" rows in its Description of Work table needs N Synergix rows, or
-        # the quotation silently bills only the first line — see WOPayload.line_items's docstring.
+        # the quotation silently bills only the first line â€” see WOPayload.line_items's docstring.
         line_items = payload.effective_line_items
         remarks = build_remarks(payload)
         fill_started_at = time.monotonic()
@@ -1483,17 +1523,23 @@ class SynergixDriver:
             added += 1
         if added < len(line_items):
             logger.warning(
-                "Stage B: could only add %d/%d Details line item row(s) for %s — human must add the "
+                "Stage B: could only add %d/%d Details line item row(s) for %s â€” human must add the "
                 "rest before Submit", added, len(line_items), payload.wo_po_number)
         for i in range(added):
             await self._fill_line_item_row(i, line_items[i], remarks)
         if added:
             await self._verify_and_refill_rows(line_items[:added], remarks)
             # The rows can all read back correctly while the server is still short of the authorised
-            # total — only the page total exposes that. See _force_totals_commit.
+            # total â€” only the page total exposes that. See _force_totals_commit.
             await self._force_totals_commit(payload, line_items[:added])
+
+            # The totals repair only touches Qty/Unit Price and stops when the total matches, which it can
+
+            # do with Remarks wiped. See _ensure_remarks_intact.
+
+            await self._ensure_remarks_intact(payload, line_items[:added], remarks)
         # Monitoring only: the flicker-tolerance fix (see _fill_grid_field) widened per-cell
-        # patience from ~2.4s to ~15s to correctly ride out the grid's own re-render — worst case
+        # patience from ~2.4s to ~15s to correctly ride out the grid's own re-render â€” worst case
         # that's real time added per field, not just per WO. Logging how long the whole Details
         # fill actually took makes a real slowdown visible in logs rather than only discovered when
         # a batch job runs unexpectedly long.
@@ -1502,12 +1548,12 @@ class SynergixDriver:
 
     async def _assert_details_filled(self, payload: WOPayload) -> None:
         """Raise if any Details row is missing Item Code/Qty/Unit Price/Remarks, or Total After Tax
-        is not positive. Called before Submit — never submit (or report success for) an incomplete
+        is not positive. Called before Submit â€” never submit (or report success for) an incomplete
         quotation just because no exception happened to fire while filling it.
 
         Added 2026-08-14 after a full SOP compliance audit found that ALL 151 quotations from an
         earlier production run had silently empty Details rows (Item Code/Qty/Unit Price/Remarks all
-        blank, Total 0.00) despite every fill step logging success — the fill mechanism reported
+        blank, Total 0.00) despite every fill step logging success â€” the fill mechanism reported
         {priceOk: true, ...} while the value never actually committed. This assertion is the fail-safe
         the audit itself recommended: catch that class of failure explicitly rather than trusting the
         fill code's own optimistic return values.
@@ -1537,7 +1583,7 @@ class SynergixDriver:
                 if not is_bad(value):
                     continue
                 # Re-check the SAME field once more after a short wait before treating it as a real
-                # problem — confirmed live (2026-08-19) the grid can transiently blank/zero an
+                # problem â€” confirmed live (2026-08-19) the grid can transiently blank/zero an
                 # already-correct, untouched cell for several seconds during its own re-render. This
                 # function is the last gate before a WO is trusted (added after the 151-empty-
                 # quotation incident), so a false positive here wrongly routes a genuinely fine WO to
@@ -1547,7 +1593,7 @@ class SynergixDriver:
                 recheck_value = recheck.get(header_regex)
                 if not is_bad(recheck_value):
                     logger.info(
-                        "_assert_details_filled: row %d %s read %r once but %r on recheck — a "
+                        "_assert_details_filled: row %d %s read %r once but %r on recheck â€” a "
                         "flicker, not a real problem, not reporting it", i, header_regex, value,
                         recheck_value)
                     row[header_regex] = recheck_value  # keep `rows` consistent for the reconciliation below
@@ -1557,7 +1603,7 @@ class SynergixDriver:
         # Standing control added 2026-08-17 per a client SOP review of 54 live quotations: every
         # single one was under-billed by exactly the JBTC 10% SOR uplift because the grid was being
         # filled with the gross unit_price instead of the WO-authorised net figure (see
-        # LineItem.billed_unit_price). Each row individually looked "filled" the whole time — only a
+        # LineItem.billed_unit_price). Each row individually looked "filled" the whole time â€” only a
         # reconciliation against the WO's own net_amount actually catches a wrong-but-nonzero value.
         # Only meaningful once every row is individually clean; skip if the payload has no
         # net_amount to reconcile against (e.g. an unstructured free-text WO).
@@ -1588,7 +1634,7 @@ class SynergixDriver:
             }"""
         total_after_tax = await self.page.evaluate(total_js)
         # Total After Tax is a separate PrimeFaces aggregate recalculation, not part of any single
-        # cell's own commit — confirmed live (2026-08-15) that every individual row can already read
+        # cell's own commit â€” confirmed live (2026-08-15) that every individual row can already read
         # back correct while this summary field still lags at 0.00 for a moment. Only worth polling
         # when the rows themselves are already clean; if a row still has a real problem, that recalc
         # would show 0.00 anyway and there's nothing to wait for.
@@ -1616,14 +1662,14 @@ class SynergixDriver:
             # 2026-08-18 after finding that a row the server never committed (see
             # _force_totals_commit) leaves the OTHER rows' amounts summing to a positive but
             # understated total, which this gate used to accept. Concretely, WO-PO/000080321 (rows
-            # 1x33.00 + 4x44.00 = 209.00) could submit at 176.00 — the qty-1 row silently missing —
+            # 1x33.00 + 4x44.00 = 209.00) could submit at 176.00 â€” the qty-1 row silently missing â€”
             # because every per-row DOM check passed and the total was merely "> 0". That is the same
             # under-billing class this file's billed_unit_price fix exists to prevent, reached by a
             # different route, so it gets the same standing reconciliation.
             #
             # Which figure this field holds is not assumed: measured live at 44.00 for a single
             # 1 x 44.00 line (i.e. pre-GST there), but the label reads "Total After Tax", so both the
-            # pre-GST net and the GST-inclusive grand total are accepted and the match is logged —
+            # pre-GST net and the GST-inclusive grand total are accepted and the match is logged â€”
             # real runs will show which it actually is without risking a false rejection now.
             candidates = {"net_amount": payload.net_amount, "grand_total": payload.grand_total}
             known = {name: v for name, v in candidates.items() if v is not None}
@@ -1635,13 +1681,13 @@ class SynergixDriver:
                 else:
                     problems.append(
                         f"Total After Tax {total_value:.2f} matches neither the WO's net amount "
-                        f"({payload.net_amount}) nor its grand total ({payload.grand_total}) — a row "
+                        f"({payload.net_amount}) nor its grand total ({payload.grand_total}) â€” a row "
                         "the server never committed would look exactly like this"
                     )
 
         if problems:
             raise RuntimeError(
-                f"Details grid incomplete for {payload.wo_po_number} — refusing to submit: "
+                f"Details grid incomplete for {payload.wo_po_number} â€” refusing to submit: "
                 + "; ".join(problems)
             )
 
@@ -1660,7 +1706,7 @@ class SynergixDriver:
 
         await page.locator("button:has(span.fa-vote-yea)").first.click()
         await page.wait_for_timeout(3000)
-        # A confirm dialog may appear (Yes/OK) — click it if present.
+        # A confirm dialog may appear (Yes/OK) â€” click it if present.
         for label in ("Yes", "OK", "Confirm"):
             btn = page.get_by_role("button", name=label)
             if await btn.count() and await btn.first.is_visible():
@@ -1685,25 +1731,25 @@ class SynergixDriver:
 
         Unlike the old Copy From flow (where the copied row already had Item Code/Type/Qty from the
         template, and only Unit Price/Remarks needed overwriting), a from-scratch row starts fully
-        blank — Item Code must be looked up via its own autocomplete (see _select_item_code; it's a
+        blank â€” Item Code must be looked up via its own autocomplete (see _select_item_code; it's a
         table-cell input, not a labeled form field, so the generic _select_autocomplete_row doesn't
         apply) before Unit Price/Remarks can be set. `row_index` picks which row among possibly
-        several (one per WO line item) — see _stage_b_create_quotation.
+        several (one per WO line item) â€” see _stage_b_create_quotation.
         """
         assert self.page is not None
         label = f"row {row_index}"
 
         item_ok = await self._select_item_code(ITEM_CODE, row_index)
         if not item_ok:
-            logger.warning("Stage B: could not select Item Code %s for %s — leaving %s's item blank",
+            logger.warning("Stage B: could not select Item Code %s for %s â€” leaving %s's item blank",
                             ITEM_CODE, label, label)
 
         # Qty/Unit Price/Remarks: click each cell via Playwright's own actionability-checked
         # `.click()` (see _grid_cell_locator's docstring for why NOT raw coordinates), then type via
         # real keyboard input and Tab to commit. Verified + retried, not fire-and-forget: confirmed
         # live (2026-08-14) that typing into one cell right after another can silently not stick
-        # (Tab likely kicks off a PrimeFaces AJAX recalculation — Total Amount depends on Qty * Unit
-        # Price — and moving to the next cell before it settles interrupts that cell's own commit).
+        # (Tab likely kicks off a PrimeFaces AJAX recalculation â€” Total Amount depends on Qty * Unit
+        # Price â€” and moving to the next cell before it settles interrupts that cell's own commit).
         for field_name, value, header_regex in (
             ("Qty", f"{line_item.quantity:.2f}", r"^qty"),
             ("Unit Price", f"{line_item.billed_unit_price:.2f}", "unit price"),
@@ -1718,17 +1764,17 @@ class SynergixDriver:
     async def _fill_grid_field(
         self, row_index: int, field_name: str, value: str, header_regex: str, *, attempts: int = 3
     ) -> bool:
-        """Fill one Details-grid cell and poll to confirm it stuck — retrying up to `attempts` times.
+        """Fill one Details-grid cell and poll to confirm it stuck â€” retrying up to `attempts` times.
         Returns whether it ultimately committed.
 
         Uses Locator.fill(), NOT click + Control+A + keyboard.type() + Tab. Confirmed live
         (2026-08-19), directly prompted by the user manually typing into a stuck cell and having it
         commit instantly: 6 different keystroke-simulation commit strategies (Tab, Enter, click-away,
         explicit Tab down/up, human-cadence typed delay) were tested head-to-head against fill() on
-        the same cell — every keystroke-simulation method failed (0/6 across two full test runs,
+        the same cell â€” every keystroke-simulation method failed (0/6 across two full test runs,
         including the exact production sequence used here before this fix), while fill() stuck 5/5.
         fill() sets the value and dispatches real input/change events directly, bypassing individual
-        key events entirely — whatever server-side listener this PrimeFaces cell binds its commit to
+        key events entirely â€” whatever server-side listener this PrimeFaces cell binds its commit to
         is apparently keyed off input/change, not the keydown/keyup sequence Playwright's
         keyboard.type() produces, which is why a real human's native browser keystrokes worked all
         along while the automated equivalent did not.
@@ -1736,14 +1782,14 @@ class SynergixDriver:
         The bigger finding (2026-08-19, from watching the user type manually into a live cell with
         5s polling): the grid RE-RENDERS ITSELF independently of any write in flight, and can
         transiently blank out an already-committed, untouched cell for several seconds before it
-        recovers on its own — observed directly on Qty while the user was typing into an unrelated
+        recovers on its own â€” observed directly on Qty while the user was typing into an unrelated
         Unit Price cell. The old 2.4s patience window (8 x 300ms) is shorter than that recovery
         window, so it was reading a mid-flicker blank as "genuinely failed" and immediately
-        overwriting — an overwrite landing mid-re-render is a plausible way to actually corrupt what
+        overwriting â€” an overwrite landing mid-re-render is a plausible way to actually corrupt what
         would otherwise have recovered fine on its own. Two changes address this directly:
           1. The window is now much longer (up to ~15s) before giving up on one attempt.
           2. A read is only trusted once it's STABLE across two consecutive checks (not just present
-             once) — a single matching read can itself be a flicker artifact on its way to something
+             once) â€” a single matching read can itself be a flicker artifact on its way to something
              else, same as a single blank read can be.
         This is deliberately defensive: it costs a little time on the (common) fast-committing case,
         but a slow, correct commit is far cheaper than a fast, wrong retry that corrupts a good value.
@@ -1768,7 +1814,7 @@ class SynergixDriver:
             await cell.fill(value)
 
             # Require the target value to read back correctly on TWO CONSECUTIVE polls, not just
-            # one — a single matching read can itself be a transient state on its way to reverting,
+            # one â€” a single matching read can itself be a transient state on its way to reverting,
             # same as a single non-matching read can be on its way to recovering. See docstring.
             previously_matched = False
             for _ in range(max_polls):
@@ -1786,27 +1832,27 @@ class SynergixDriver:
                 if matched and previously_matched:
                     return True
                 previously_matched = matched
-            logger.warning("Stage B: %s for row %d did not stick (attempt %d) — retrying",
+            logger.warning("Stage B: %s for row %d did not stick (attempt %d) â€” retrying",
                             field_name, row_index, attempt + 1)
         return False
 
     async def _verify_and_refill_rows(self, line_items: list[LineItem], remarks: str) -> None:
         """After every Details row has been filled once, re-read ALL rows and re-fill any field
-        that doesn't match its target — repeating a few rounds until everything holds or the
+        that doesn't match its target â€” repeating a few rounds until everything holds or the
         attempt budget runs out.
 
         Confirmed live (2026-08-15) that a row already read back correctly right after being filled
         can later revert to blank/0.00 once a SUBSEQUENT row's edits fire their own PrimeFaces ajax
-        recalculation — a server-side ordering race (the earlier row's commit hadn't landed
+        recalculation â€” a server-side ordering race (the earlier row's commit hadn't landed
         server-side yet when the later row's request went out), not a client-side click/typing bug.
         _fill_line_item_row's own per-cell retry only checks immediately after typing that cell, so
         it can't catch a value reverted by a LATER row's edit. This re-checks everything at the end.
 
         Confirmed live (2026-08-19) that the grid can also transiently blank out an already-correct,
-        untouched cell for several seconds during its own re-render, unrelated to any write — a
+        untouched cell for several seconds during its own re-render, unrelated to any write â€” a
         single read here is not proof of a real problem. Before treating a mismatch as real (and
         triggering a re-fill, which risks overwriting mid-flicker), re-checks that SAME cell once
-        more after a short wait — only acts if it's still wrong on the second look.
+        more after a short wait â€” only acts if it's still wrong on the second look.
         """
         assert self.page is not None
         for round_num in range(3):
@@ -1823,7 +1869,7 @@ class SynergixDriver:
                     row = await self._read_grid_row(i, ("item code",))
                     if not (row.get("item code") or "").strip():
                         any_problem = True
-                        logger.warning("Verify pass %d: row %d Item Code reverted — re-selecting",
+                        logger.warning("Verify pass %d: row %d Item Code reverted â€” re-selecting",
                                         round_num + 1, i)
                         if not await self._select_item_code(ITEM_CODE, i):
                             logger.warning("Verify pass %d: could not re-select Item Code for row %d",
@@ -1831,19 +1877,19 @@ class SynergixDriver:
                 for field_name, target_value, header_regex, current_value in targets:
                     if current_value == target_value:
                         continue
-                    # Double-check before acting — confirmed live this can be a transient re-render
+                    # Double-check before acting â€” confirmed live this can be a transient re-render
                     # flicker, not a real reversion.
                     await self.page.wait_for_timeout(2000)
                     recheck = await self._read_grid_row(i, (header_regex,))
                     recheck_value = recheck.get(header_regex)
                     if recheck_value == target_value:
-                        logger.info("Verify pass %d: row %d %s read %r once but %r on recheck — "
+                        logger.info("Verify pass %d: row %d %s read %r once but %r on recheck â€” "
                                     "a flicker, not a real reversion, leaving it alone",
                                     round_num + 1, i, field_name, current_value, recheck_value)
                         continue
                     any_problem = True
                     logger.warning("Verify pass %d: row %d %s reverted (%r != %r, confirmed on "
-                                    "recheck) — re-filling",
+                                    "recheck) â€” re-filling",
                                     round_num + 1, i, field_name, recheck_value, target_value)
                     await self._fill_grid_field(i, field_name, target_value, header_regex)
             if not any_problem:
@@ -1862,11 +1908,11 @@ class SynergixDriver:
             }"""
 
     async def _read_total_after_tax(self) -> float | None:
-        """The page's own total aggregate, parsed — or None if absent/unparseable.
+        """The page's own total aggregate, parsed â€” or None if absent/unparseable.
 
         This is the ONLY signal that reflects what the server actually committed. Every per-cell and
         per-row check in this file reads the DOM, which can show correct values for a row the server
-        never recorded — see _force_totals_commit.
+        never recorded â€” see _force_totals_commit.
         """
         assert self.page is not None
         raw = await self.page.evaluate(self._TOTAL_AFTER_TAX_JS)
@@ -1880,7 +1926,7 @@ class SynergixDriver:
     @staticmethod
     def _expected_totals(payload: WOPayload) -> list[float]:
         """The figures the page total may legitimately equal: the WO's pre-GST net and its
-        GST-inclusive grand total. Which one this field holds isn't assumed — see the reconciliation
+        GST-inclusive grand total. Which one this field holds isn't assumed â€” see the reconciliation
         in _assert_details_filled."""
         return [v for v in (payload.net_amount, payload.grand_total) if v is not None]
 
@@ -1911,22 +1957,22 @@ class SynergixDriver:
           That case is loud, and the submit gate already rejects it correctly.
         - Sometimes the DOM reads back CORRECT while the server has not caught up: on
           WO-PO/000080454 (rows 1x44.00 + 1x55.00) both rows read qty 1.00 with prices 44.00/55.00
-          while the page total sat at 44.00 — row 1's amount simply missing. This is the dangerous
+          while the page total sat at 44.00 â€” row 1's amount simply missing. This is the dangerous
           shape, because every per-row DOM check passes and only the total exposes it.
 
         Deliberately NOT claimed here: that quantity=1 causes this. Every all-qty-1 WO failed and
         every WO with a qty>1 row succeeded (5 and 3 respectively on 2026-08-18), but a same-value
-        no-op cannot be the mechanism — the default is 0.00, so writing 1.00 is a genuine change like
+        no-op cannot be the mechanism â€” the default is 0.00, so writing 1.00 is a genuine change like
         any other. With 8 samples that split may well be coincidence; it is recorded as unexplained
         rather than dressed up as a cause.
 
         The actual mechanism, isolated live on 2026-08-20 on a throwaway 2-row draft: writes in one
         row ZERO OUT numeric cells in the OTHER row. Filling row 0 qty, row 1 qty, row 0 price, row 1
-        price in that order — every one reporting success — ended with row 0 holding qty 1.00 / price
+        price in that order â€” every one reporting success â€” ended with row 0 holding qty 1.00 / price
         0.00 and row 1 holding qty 0.00 / price 55.00. No row ever held qty AND price at the same
         moment, so the total never left 0.00. The grid's own columns rule out a per-row pricing
         constraint: "Unit Price/Adjusted Unit Price" is not readOnly, and "Free Balance"/"Total
-        Amount" carry no input at all. So this is cross-row ajax interference — the same class
+        Amount" carry no input at all. So this is cross-row ajax interference â€” the same class
         _verify_and_refill_rows was built for, but it does not always converge within its 3 rounds
         once two or more rows are in play.
 
@@ -1935,7 +1981,7 @@ class SynergixDriver:
         one at a time with a settle wait so a repair doesn't immediately knock out the cell it just
         fixed in another row. Only when every row's DOM already matches yet the total is still short
         does it fall back to the nudge (0.00 then the real value), which is the DOM-correct-but-
-        server-behind case. Waiting for the EXPECTED total matters throughout — returning as soon as
+        server-behind case. Waiting for the EXPECTED total matters throughout â€” returning as soon as
         it went positive stopped at 44.00 on WO-PO/000080454, which the submit gate then correctly
         rejected as understated. Previously this only ever nudged Qty, which could not fix the real
         problem there (row 1's missing PRICE) and burned all three rounds achieving nothing.
@@ -1948,7 +1994,7 @@ class SynergixDriver:
         # time, and was still converging when a hardcoded 3-round budget cut it off short of 275.00.
         # The 3-row WO-PO/000081257 passed the same day needing only one round. So the budget has to
         # scale with row count, not sit at a constant: one round per row, plus headroom for rows that
-        # need a second attempt. Still bounded — a genuinely stuck grid must fail, not spin forever.
+        # need a second attempt. Still bounded â€” a genuinely stuck grid must fail, not spin forever.
         rounds = max(3, len(line_items) + 2)
         for attempt in range(rounds):
             for _ in range(24):  # ~12s per round for in-flight commits to land
@@ -1960,23 +2006,23 @@ class SynergixDriver:
                     return
                 await self.page.wait_for_timeout(500)
             # Confirmed live (2026-08-19) that the grid can transiently show a stale/blank total
-            # during its own re-render, unrelated to any real problem — a single "still unsettled"
+            # during its own re-render, unrelated to any real problem â€” a single "still unsettled"
             # read after the wait above is not proof nudging is actually needed. Re-check once more
             # after a short pause before nudging, same defensive pattern as _fill_grid_field and
             # _verify_and_refill_rows: a nudge that lands mid-flicker is a plausible way to corrupt
-            # an otherwise-fine row (this method only re-writes Qty — a wrong nudge risks knocking
+            # an otherwise-fine row (this method only re-writes Qty â€” a wrong nudge risks knocking
             # out Unit Price via the same server-side ordering race _verify_and_refill_rows guards
             # against elsewhere).
             await self.page.wait_for_timeout(3000)
             settled, total = await self._total_is_settled(expected)
             if settled:
-                logger.info("Page total settled on the recheck (%.2f) — was a flicker, not repairing",
+                logger.info("Page total settled on the recheck (%.2f) â€” was a flicker, not repairing",
                             total)
                 if attempt:
                     logger.info("Totals committed after %d repair round(s): total=%.2f", attempt, total)
                 return
             logger.warning(
-                "Page total is %r, expected one of %s — repairing the Details grid (round %d/%d)",
+                "Page total is %r, expected one of %s â€” repairing the Details grid (round %d/%d)",
                 total, expected or "(nothing to compare against)", attempt + 1, rounds)
             for i, line_item in enumerate(line_items):
                 qty_target = f"{line_item.quantity:.2f}"
@@ -1990,9 +2036,9 @@ class SynergixDriver:
                 ]
                 if repairs:
                     # Fix what's genuinely wrong, one cell at a time, letting each land before
-                    # touching another — a repair itself can zero a cell in another row.
+                    # touching another â€” a repair itself can zero a cell in another row.
                     for name, target, regex in repairs:
-                        logger.warning("Row %d %s is short — re-filling to %s", i, name, target)
+                        logger.warning("Row %d %s is short â€” re-filling to %s", i, name, target)
                         await self._fill_grid_field(i, name, target, regex)
                         await self.page.wait_for_timeout(1500)
                 elif qty_target != "0.00":
@@ -2003,14 +2049,58 @@ class SynergixDriver:
                     await self._fill_grid_field(i, "Qty", qty_target, r"^qty")
                     await self.page.wait_for_timeout(1500)
         _, final = await self._total_is_settled(expected)
-        logger.warning("Page total still %r after %d repair rounds — the submit gate will reject this",
+        logger.warning("Page total still %r after %d repair rounds â€” the submit gate will reject this",
                         final, rounds)
+
+    async def _ensure_remarks_intact(self, payload: WOPayload, line_items: list[LineItem],
+                                      remarks: str) -> None:
+        """Re-check every row's Remarks AFTER the totals repair, and re-fill any that went blank.
+
+        _force_totals_commit only ever touches Qty and Unit Price, and it stops as soon as the page
+        total matches â€” which it can, correctly, while Remarks has been wiped, because Remarks does
+        not contribute to the total. So the repair loop exits satisfied and _assert_details_filled
+        then refuses to submit on "Remarks is blank".
+
+        Confirmed live (2026-08-21) on WO-PO/000061116, the first SKTC WO through Synergix: Remarks
+        was demonstrably filled (logged in full mid-fill), the total settled correctly at 27.00
+        matching the WO, and the submit gate still rejected the record because Remarks had reverted
+        to blank by the time it was checked. Everything else on that quotation was right.
+
+        Same shape as the bug where a Qty-only nudge could never fix a missing Unit Price: a repair
+        pass that cannot touch the field that is actually broken. Re-verifies the total afterwards,
+        since re-filling Remarks fires its own ajax and can in turn disturb the numbers.
+        """
+        assert self.page is not None
+        if not line_items:
+            return
+        repaired = False
+        for i, _ in enumerate(line_items):
+            row = await self._read_grid_row(i, ("remarks",))
+            current = (row.get("remarks") or "").strip()
+            if current == remarks.strip():
+                continue
+            # Re-check once before acting: the grid re-renders on its own and a single blank read can
+            # be a flicker, the same defensive pattern _verify_and_refill_rows uses.
+            await self.page.wait_for_timeout(2000)
+            row = await self._read_grid_row(i, ("remarks",))
+            current = (row.get("remarks") or "").strip()
+            if current == remarks.strip():
+                continue
+            logger.warning(
+                "Row %d Remarks did not survive the totals repair (%s) â€” re-filling", i,
+                "blank" if not current else "differs")
+            await self._fill_grid_field(i, "Remarks", remarks, "remarks")
+            repaired = True
+            await self.page.wait_for_timeout(1500)
+        if repaired:
+            # Re-filling Remarks can knock the numbers about, so settle the total again.
+            await self._force_totals_commit(payload, line_items)
 
     async def _read_grid_row(self, row_index: int, header_regexes: tuple[str, ...]) -> dict:
         """Read back the CURRENT input values of the given Details-grid row's named columns.
 
         Used to confirm a fill actually committed, since dispatching input/change events on an input
-        can silently fail to persist (see _fill_line_item_row's docstring) — reading the live DOM
+        can silently fail to persist (see _fill_line_item_row's docstring) â€” reading the live DOM
         value after the fact is the only reliable signal.
         """
         assert self.page is not None
@@ -2044,14 +2134,14 @@ class SynergixDriver:
             return
         # Settle before navigating away: confirmed live (2026-08-17, an independent audit) that
         # this is the SAME class of bug as close()'s pre-close wait, just triggered by navigation
-        # instead of closing the browser — a page.goto() abandons any in-flight PrimeFaces ajax
+        # instead of closing the browser â€” a page.goto() abandons any in-flight PrimeFaces ajax
         # request the moment it starts, before the server has necessarily processed/saved it. Since
         # _back_to_home() runs after EVERY record in a batch (write()'s finally, and the end of
         # amend_quotation), not just the very last one, this explains a wider pattern than close()
         # alone covered: 5 of ~20 multi-line quotations in one run had their unit price commit
-        # correctly but a quantity field on one row silently revert to 0 afterward — the pricing
+        # correctly but a quantity field on one row silently revert to 0 afterward â€” the pricing
         # value settled before this navigation, the quantity value (written later, per-field) did
-        # not. The wait must happen BEFORE goto(), not after — the in-flight request is abandoned
+        # not. The wait must happen BEFORE goto(), not after â€” the in-flight request is abandoned
         # the instant navigation starts, so waiting only after wait_for_load_state is too late.
         try:
             await self.page.wait_for_timeout(4000)
@@ -2073,3 +2163,4 @@ class SynergixDriver:
             logger.info("Saved error screenshot: %s", path)
         except Exception:
             logger.exception("Could not capture error screenshot")
+

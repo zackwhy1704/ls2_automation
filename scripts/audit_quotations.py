@@ -250,12 +250,35 @@ async def audit_one(d, page, payload: WOPayload) -> WOAudit:
         audit.add("subject", MISMATCH, f"{subject!r} does not reference {wo}")
 
     # --- Details rows: count, qty, unit price ---
-    grid_rows = []
-    for i in range(len(line_items) + 2):  # look past the expected count to catch extras
-        r = await d._read_grid_row(i, ("^qty", "unit price"))
-        if not r or not any((r or {}).values()):
-            break
-        grid_rows.append(r)
+    async def read_rows() -> list[dict]:
+        out = []
+        for i in range(len(line_items) + 2):  # look past the expected count to catch extras
+            r = await d._read_grid_row(i, ("^qty", "unit price"))
+            if not r or not any((r or {}).values()):
+                break
+            out.append(r)
+        return out
+
+    grid_rows = await read_rows()
+    total_probe = await d._read_total_after_tax()
+
+    # A record page that simply did not render looks, field by field, exactly like a catastrophically
+    # empty quotation: no rows, no total, nothing readable. Grading that as MISMATCH is a false
+    # alarm, and a false alarm here is worse than no audit at all. Confirmed live (2026-08-21):
+    # QUO0006725 — submitted and independently verified at 99.00 hours earlier — came back as
+    # "quotation has 0 rows" as item [1/292] of a sweep, immediately after browser launch, purely
+    # because the page had not settled. A genuinely empty quotation reads differently: its Subject
+    # and Project Site ARE readable and its rows ARE present, just holding 0.00 (see QUO0006450).
+    # So retry once, and if the page is still blank in every respect, report it as UNREADABLE.
+    if not grid_rows and total_probe is None and not subject:
+        await page.wait_for_timeout(4000)
+        grid_rows = await read_rows()
+        total_probe = await d._read_total_after_tax()
+        if not grid_rows and total_probe is None:
+            audit.add("record page", UNREADABLE,
+                      "no rows, no total and no subject — the record page did not render, which is "
+                      "NOT evidence the quotation is empty. Re-check this WO individually.")
+            return audit
 
     if len(grid_rows) != len(line_items):
         audit.add("row count", MISMATCH,
@@ -284,7 +307,8 @@ async def audit_one(d, page, payload: WOPayload) -> WOAudit:
                 audit.add(f"row {i} {name}", MISMATCH, f"expected {float(want):.2f}, got {actual:.2f}")
 
     # --- Total: the only value reflecting what the SERVER committed ---
-    total = await d._read_total_after_tax()
+
+    total = total_probe if total_probe is not None else await d._read_total_after_tax()
     expected = d._expected_totals(payload)
     if total is None:
         audit.add("total", UNREADABLE, "no total on the page")
@@ -424,6 +448,7 @@ async def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(main()))
+
 
 
 
