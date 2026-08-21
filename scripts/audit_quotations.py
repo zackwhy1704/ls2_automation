@@ -348,7 +348,34 @@ async def main() -> int:
     await d.start()
     try:
         for n, payload in enumerate(payloads, 1):
-            a = await audit_one(d, d.page, payload)
+            # Session guardrails, mirroring batch.run_batch_from_tcms. Synergix degrades under
+            # sustained automation: a first attempt at this sweep died at WO 24 on a 30s
+            # Page.goto timeout, which is the same decay the batch pipeline already defends
+            # against with a periodic re-login and a full browser recycle.
+            every = settings.SYNERGIX_RELOGIN_EVERY
+            if every and n > 1 and (n - 1) % every == 0:
+                try:
+                    await d.relogin()
+                except Exception as exc:
+                    say(f"      (re-login before {payload.wo_po_number} failed: {exc})")
+            fresh = settings.SYNERGIX_FRESH_BROWSER_EVERY
+            if fresh and n > 1 and (n - 1) % fresh == 0:
+                say(f"      (recycling the Synergix browser after {n - 1} WOs)")
+                try:
+                    await d.close()
+                    d = SynergixDriver()
+                    await d.start()
+                except Exception as exc:
+                    say(f"      (browser recycle failed: {exc})")
+
+            # Per-WO isolation: an audit is a diagnostic, so one unreachable record must never
+            # cost the other 291 results. Without this the first navigation timeout ended the
+            # whole run and discarded everything after it.
+            try:
+                a = await audit_one(d, d.page, payload)
+            except Exception as exc:
+                a = WOAudit(wo=payload.wo_po_number)
+                a.add("audit", UNREADABLE, f"errored: {type(exc).__name__}: {exc}".split("\n")[0][:160])
             audits.append(a)
             bad, gaps = a.mismatches, a.unreadable
             flag = "FAIL" if bad else ("gaps" if gaps else "ok")
@@ -358,7 +385,10 @@ async def main() -> int:
                     continue
                 say(f"      {f.verdict:<10} {f.field}: {f.detail}")
     finally:
-        await d.close()
+        try:
+            await d.close()
+        except Exception:
+            pass
 
     failed = [a for a in audits if a.mismatches]
     gapped = [a for a in audits if not a.mismatches and a.unreadable]
