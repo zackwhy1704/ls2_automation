@@ -1374,30 +1374,43 @@ class SynergixDriver:
         # Read whatever id is on screen BEFORE creating, so a stale one can be recognised below.
         pre_click_quo_id = await self._current_quotation_id()
 
-        await page.locator("button:has(span.fa-plus)").first.click()
-        await page.wait_for_timeout(8000)
-        # Captured now, while the freshly-created draft's form is still visibly loaded — used only
-        # to clean up a genuinely blank shell if Customer selection fails below. Capturing it here
-        # (rather than re-reading it at failure time) matters because the failure mode this guards
-        # against can leave the page stuck on an unrelated view (e.g. still the list page behind a
-        # stuck blockUI overlay), where _current_quotation_id() would find nothing to abort even
-        # though a real empty draft was already created by the "+" click above.
-        draft_quo_id = await self._current_quotation_id()
-        # ...but if the "+" click didn't actually open a NEW record, that read returns whatever was
-        # already on screen — the PREVIOUS WO's quotation. Aborting that destroys good work.
-        # Confirmed live (2026-08-20 overnight sweep): WO-PO/000081588 failed before Customer was
-        # set and aborted QUO0006710 — the draft belonging to WO-PO/000080420, created and fully
-        # gate-verified 47 minutes earlier — while its own blank shell (QUO0006711, absent from the
-        # entire run report) was left orphaned. Both halves of that are bad: a correct draft deleted,
-        # and an orphan left to mask its WO from every future dedup check.
-        if draft_quo_id and draft_quo_id == pre_click_quo_id:
+        # The "+" click does not always open the new-quotation form, and EVERYTHING after this point
+        # assumes it did. Confirmed live (2026-08-21) on WO-PO/000080322, reproducibly across two
+        # runs: the click left the page on the LIST, and then
+        #   - _current_quotation_id() returned the previous record's id (which is how the
+        #     2026-08-20 sweep aborted QUO0006710, a fully-filled draft belonging to a different WO,
+        #     while orphaning its own blank shell QUO0006711), and
+        #   - _select_autocomplete_row("Customer", ...) matched the LIST's "Customer" COLUMN FILTER
+        #     (id ...serviceQuotationTable:...:filter) instead of the form's Customer field, then
+        #     timed out clicking it — the failure that read as a "blockUI flake" for days.
+        # So: confirm a NEW draft id actually appeared before proceeding, retry the click if not, and
+        # fail with a diagnosable error rather than acting on the wrong page.
+        draft_quo_id = None
+        for attempt in range(1, 4):
+            await page.locator("button:has(span.fa-plus)").first.click()
+            for _ in range(16):  # up to ~8s for the form (and its new id) to render
+                await page.wait_for_timeout(500)
+                candidate = await self._current_quotation_id()
+                if candidate and candidate != pre_click_quo_id:
+                    draft_quo_id = candidate
+                    break
+            if draft_quo_id:
+                if attempt > 1:
+                    logger.info("Stage B: new draft %s opened on '+' attempt %d for %s",
+                                draft_quo_id, attempt, payload.wo_po_number)
+                break
             logger.warning(
-                "Stage B: after the '+' click the form still shows %s — the same id as before it, so "
-                "no new draft id could be established for %s. Not treating it as this WO's draft: "
-                "aborting it would delete another WO's record. Any blank shell the click did create "
-                "is left for manual cleanup rather than risking the wrong one.",
-                draft_quo_id, payload.wo_po_number)
-            draft_quo_id = None
+                "Stage B: the '+' click did not open a new quotation form for %s (still showing %r) "
+                "— retrying (attempt %d/3)",
+                payload.wo_po_number, pre_click_quo_id, attempt)
+            await self._open_service_quotation_list()
+        if not draft_quo_id:
+            raise RuntimeError(
+                f"the New-quotation form never opened for {payload.wo_po_number} after 3 '+' clicks "
+                f"(page still showing {pre_click_quo_id!r}). Refusing to continue: every later step "
+                "would target the quotation LIST instead of the form — which is how a previous run "
+                "aborted another WO's draft and how the 'Customer field' click timeouts arose.")
+        await page.wait_for_timeout(3000)  # let the freshly-opened form settle before filling
 
         # --- Customer (cascades Address/Contact/Currency/Sales Tax/SBU) ---
         council = payload.town_council.strip() or "Town Council"
