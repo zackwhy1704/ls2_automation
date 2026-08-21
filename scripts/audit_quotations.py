@@ -66,6 +66,14 @@ def _flat(text: str, limit: int = 90) -> str:
     return " ".join((text or "").split())[:limit]
 
 
+def say(*parts: object) -> None:
+    """print(), but flushed. A full sweep is ~40s per WO and hours long overall; with Python's
+    default block buffering on a redirected stdout, a run piped to a log file (which is exactly how
+    run_batch.ps1 invokes things) shows NOTHING until it exits — and shows nothing at all if it is
+    killed or the host reboots partway. Progress on a long audit has to be visible as it happens."""
+    print(*parts, flush=True)
+
+
 @dataclass
 class Finding:
     field: str
@@ -331,9 +339,9 @@ async def main() -> int:
     settings.configure_logging()
     payloads = load_payloads(args.wo, args.limit, args.all_statuses)
     if not payloads:
-        print("no WOs to audit")
+        say("no WOs to audit")
         return 0
-    print(f"auditing {len(payloads)} WO(s) against Synergix\n")
+    say(f"auditing {len(payloads)} WO(s) against Synergix\n")
 
     audits: list[WOAudit] = []
     d = SynergixDriver()
@@ -344,29 +352,30 @@ async def main() -> int:
             audits.append(a)
             bad, gaps = a.mismatches, a.unreadable
             flag = "FAIL" if bad else ("gaps" if gaps else "ok")
-            print(f"[{n}/{len(payloads)}] {a.wo}  {flag}  {a.quotation_ids}")
+            say(f"[{n}/{len(payloads)}] {a.wo}  {flag}  {a.quotation_ids}")
             for f in a.findings:
                 if args.quiet and f.verdict in (MATCH, INFO):
                     continue
-                print(f"      {f.verdict:<10} {f.field}: {f.detail}")
+                say(f"      {f.verdict:<10} {f.field}: {f.detail}")
     finally:
         await d.close()
 
     failed = [a for a in audits if a.mismatches]
     gapped = [a for a in audits if not a.mismatches and a.unreadable]
-    print("\n" + "=" * 78)
-    print(f"audited {len(audits)} WO(s): {len(audits) - len(failed) - len(gapped)} clean, "
+    say("\n" + "=" * 78)
+    say(f"audited {len(audits)} WO(s): {len(audits) - len(failed) - len(gapped)} clean, "
           f"{len(gapped)} with unreadable fields, {len(failed)} with MISMATCHES")
     for a in failed:
-        print(f"\n  FAIL {a.wo} ({', '.join(a.quotation_ids) or 'no quotation'})")
+        say(f"\n  FAIL {a.wo} ({', '.join(a.quotation_ids) or 'no quotation'})")
         for f in a.mismatches:
-            print(f"      {f.field}: {f.detail}")
+            say(f"      {f.field}: {f.detail}")
     if gapped and not failed:
-        print("\n  (unreadable fields are a coverage gap, not a defect â€” submitted quotations render "
+        say("\n  (unreadable fields are a coverage gap, not a defect â€” submitted quotations render "
               "read-only in the All tab and some labelled fields cannot be read there)")
     return 1 if failed else 0
 
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(main()))
+
 
