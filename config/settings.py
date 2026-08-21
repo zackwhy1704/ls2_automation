@@ -1,6 +1,6 @@
-"""Central configuration. Loads `.env` into a typed `Settings` class.
+﻿"""Central configuration. Loads `.env` into a typed `Settings` class.
 
-Nothing else in the codebase should read environment variables directly — import from here.
+Nothing else in the codebase should read environment variables directly â€” import from here.
 
 A single instance is created as `settings` (alias of `get_settings()`), and the most-used
 fields are re-exported as module-level constants so existing `settings.ATTR` access keeps
@@ -69,12 +69,15 @@ class Settings(BaseSettings):
     # that's resolved, a Power Automate flow drops WO PDFs (+ a sidecar JSON per email, for sender
     # verification) into a OneDrive/SharePoint folder synced locally. "folder" and "imap" are both
     # always available; this only selects which one `run_batch(..., poll=True)` uses.
-    SKTC_INTAKE_MODE: str = "imap"       # "folder" | "imap"
+    # "outlook" reads the mailbox through classic Outlook via COM (recommended: no admin, no cloud
+    # flow, no OneDrive sync -- see src/sktc_outlook_intake.py). "folder" reads a Power
+    # Automate-populated OneDrive folder. "imap" is unusable on LS2's tenant (Basic Auth disabled).
+    SKTC_INTAKE_MODE: str = "imap"       # "outlook" | "folder" | "imap"
     SKTC_INTAKE_FOLDER: str = ""         # local synced path, e.g. "C:\Users\<user>\OneDrive - LS2\SKTC-WO-Intake"
     SKTC_INTAKE_PROCESSED_SUBFOLDER: str = "processed"
     SKTC_INTAKE_SIDECAR_WAIT_SECONDS: int = 30
     # Comma-separated sender addresses/substrings this adapter trusts, independent of whatever Power
-    # Automate's own trigger filter is configured to do — see docs/power_automate_sktc_setup.md.
+    # Automate's own trigger filter is configured to do â€” see docs/power_automate_sktc_setup.md.
     SKTC_SENDER_ALLOWLIST: str = ""
 
     # --- Batch report ---
@@ -102,10 +105,10 @@ class Settings(BaseSettings):
     SYNERGIX_PASSWORD: str = ""
     # Which WO field to search Synergix on when checking "already invoiced?". The JBTC un-invoiced
     # list is maintained by hand and can be stale, so this check is what actually prevents double
-    # billing. "wo_po" | "job_sheet" — confirm against the real Synergix records.
+    # billing. "wo_po" | "job_sheet" â€” confirm against the real Synergix records.
     SYNERGIX_DEDUP_KEY: str = "wo_po"
     # Synergix is fronted by Cloudflare that GEO-blocks overseas IPs (client policy) and rate-blocks
-    # rapid bursts — NOT headless detection. From a Singapore IP, headless works fine, so default true.
+    # rapid bursts â€” NOT headless detection. From a Singapore IP, headless works fine, so default true.
     # (A persistent context + realistic UA are still used to minimise repeated hits.) Set false only if
     # a future protection change starts challenging headless specifically.
     SYNERGIX_HEADLESS: bool = True
@@ -115,12 +118,12 @@ class Settings(BaseSettings):
     SYNERGIX_RELOGIN_EVERY: int = 5
     # Hard ceiling per WO (seconds). Raised 300 -> 900 on 2026-08-20: a 2-row WO measured 194-203s
     # end to end once the Details-grid repair loop has to run (cross-row interference means it
-    # commonly does — see _force_totals_commit), so 300s left almost no headroom and a 3+-row WO
+    # commonly does â€” see _force_totals_commit), so 300s left almost no headroom and a 3+-row WO
     # would likely blow through it. That matters because this ceiling is enforced by
     # asyncio.wait_for in batch.py, which CANCELS write() mid-flight: the draft survives but nothing
     # is billed, and only reap_incomplete_draft stops it masking the WO from future dedup runs.
     SYNERGIX_WO_TIMEOUT_S: int = 900
-    # A page-level relogin (above) reuses the same browser process — confirmed live (2026-08-16,
+    # A page-level relogin (above) reuses the same browser process â€” confirmed live (2026-08-16,
     # a 9.5-hour/321-WO unrestricted run) that Synergix itself gets slower/flakier the longer a single
     # browser session stays open under sustained automation, independent of the login session timeout
     # relogin already guards against. Every N WOs, close the browser entirely and launch a brand new
@@ -129,11 +132,11 @@ class Settings(BaseSettings):
     SYNERGIX_FRESH_BROWSER_EVERY: int = 40
 
     # --- Behaviour ---
-    DRY_RUN: bool = True          # defaults to True — never default to live
+    DRY_RUN: bool = True          # defaults to True â€” never default to live
     # DEV ONLY. When Synergix is not configured, the dedup check can't verify invoiced status, so it
     # returns UNCERTAIN (fail-safe) and WOs land in NEEDS_REVIEW. Set true to instead assume
     # NOT_DUPLICATE in stub mode, so the approval flow can be demoed locally. NEVER true with real
-    # billing — it defeats the double-invoice guard.
+    # billing â€” it defeats the double-invoice guard.
     DEDUP_STUB_ASSUME_SAFE: bool = False
     HEADLESS: bool = False
     TIMEZONE: str = "Asia/Singapore"
@@ -274,3 +277,4 @@ def configure_logging() -> None:
 def summary() -> str:
     """Module-level shim delegating to the Settings instance."""
     return settings.summary()
+

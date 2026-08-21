@@ -306,16 +306,29 @@ async def run_batch(
 
     intake_review: list = []
     if poll and not source:
-        if settings.SKTC_INTAKE_MODE == "folder":
+        mode = (settings.SKTC_INTAKE_MODE or "imap").strip().lower()
+        # "outlook" and "folder" share a contract: (pdf_paths, review_items), PDFs written into
+        # INCOMING_EMAIL_DIR, and an exception on an unreachable source rather than a quiet zero.
+        # Both are handled identically here so the report reads the same whichever is configured.
+        intake = None
+        if mode == "outlook":
+            from src.sktc_outlook_intake import poll_outlook_once
+            intake = ("outlook", poll_outlook_once)
+        elif mode == "folder":
             from src.sktc_folder_intake import poll_folder_once
+            intake = ("folder", poll_folder_once)
+
+        if intake:
+            label, poll_fn = intake
             try:
-                _pdfs, review_items = await asyncio.to_thread(poll_folder_once)
+                _pdfs, review_items = await asyncio.to_thread(poll_fn)
             except Exception as exc:
-                # Loud, not swallowed: an unreachable/misconfigured intake folder must not look like
-                # "ran fine, found 0 WOs" — see sktc_folder_intake.poll_folder_once's docstring.
-                logger.exception("SKTC folder intake failed")
+                # Loud, not swallowed: an unreachable intake source must not look like "ran fine,
+                # found 0 WOs". For Outlook that means a signed-out or closed Outlook; for the
+                # folder, a paused OneDrive sync. Either would otherwise stop billing silently.
+                logger.exception("SKTC %s intake failed", label)
                 intake_review.append(
-                    WOOutcome("SKTC-INTAKE", WOStatus.FAILED, f"folder intake failed: {exc}")
+                    WOOutcome("SKTC-INTAKE", WOStatus.FAILED, f"{label} intake failed: {exc}")
                 )
             else:
                 intake_review.extend(
