@@ -1996,11 +1996,18 @@ class SynergixDriver:
         # loop re-asserts Employee is active on every poll, not just once up front, rather than
         # trying to pin the exact moment/cause of the reset. Same ajax-timing tolerance pattern
         # already applied throughout this file (e.g. _click_panel_row_by_text).
-        recheck_employee_js = """() => {
+        #
+        # Confirmed live (2026-08-26) that even with Employee correctly active the whole time, the
+        # checklist itself can stay genuinely empty for the full ~8s poll window on some runs -- a
+        # separate failure mode from the toggle-state bug above, still unexplained. As a recovery
+        # attempt (not a confirmed fix), periodically toggle to Work Team and back to Employee to
+        # force a fresh ajax repopulate, since the toggle's own onchange is the only known trigger
+        # for this list to (re)render at all.
+        click_button_js = """(label) => {
                 const btn = [...document.querySelectorAll('div.ui-button')]
-                  .find(b => b.textContent.trim() === 'Employee' &&
+                  .find(b => b.textContent.trim() === label &&
                              b.getBoundingClientRect().width > 0);
-                if (btn && !btn.classList.contains('ui-state-active')) btn.click();
+                if (btn) btn.click();
             }"""
         employee_checkbox_js = """(name) => {
                 const label = [...document.querySelectorAll('label')]
@@ -2008,15 +2015,57 @@ class SynergixDriver:
                 return label ? label.getAttribute('for') : null;
             }"""
         employee_checkbox_id = None
-        for _ in range(16):  # ~8s
-            await page.evaluate(recheck_employee_js)
+        for attempt in range(24):  # ~20s, with forced refreshes every ~5s
+            if attempt > 0 and attempt % 6 == 0:
+                logger.warning("Stage C: employee checklist still empty after %.1fs for %s -- "
+                                "forcing a refresh via Work Team -> Employee", attempt * 0.8, wo)
+                await page.evaluate(click_button_js, "Work Team")
+                await page.wait_for_timeout(1000)
+                await page.evaluate(click_button_js, "Employee")
+                await page.wait_for_timeout(1500)
+            else:
+                await page.evaluate(
+                    """() => {
+                        const btn = [...document.querySelectorAll('div.ui-button')]
+                          .find(b => b.textContent.trim() === 'Employee' &&
+                                     b.getBoundingClientRect().width > 0);
+                        if (btn && !btn.classList.contains('ui-state-active')) btn.click();
+                    }"""
+                )
             employee_checkbox_id = await page.evaluate(employee_checkbox_js, SCHEDULE_EMPLOYEE)
             if employee_checkbox_id:
                 break
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(300)
+        if not employee_checkbox_id:
+            # Last resort: a full re-navigation, not just re-toggling within the same page load.
+            # Confirmed live (2026-08-26) that toggling Work Team<->Employee repeatedly within one
+            # page load did NOT recover an empty checklist -- unlike the Stage B.5 Confirm-button
+            # gap, this has not been proven to be helped by a reload either, but it costs one extra
+            # nav + re-select before giving up entirely.
+            logger.warning("Stage C: employee checklist still empty for %s after in-page retries -- "
+                            "trying a full re-navigation", wo)
+            await self._open_schedule_board()
+            await filter_input.click()
+            await filter_input.fill(council_search)
+            await filter_input.press("Enter")
+            await page.wait_for_timeout(3000)
+            order_row3 = page.locator("tr", has_text=wo.replace("WO-PO/", "")).locator("visible=true").first
+            if await order_row3.count():
+                await order_row3.click(timeout=10000)
+                await page.wait_for_timeout(2000)
+                await page.evaluate(click_button_js, "Employee")
+                await page.wait_for_timeout(1500)
+                filter_link2 = page.get_by_text("Filter", exact=True).locator("visible=true").first
+                await filter_link2.click(timeout=10000)
+                await page.wait_for_timeout(2000)
+                for _ in range(10):  # ~5s more after the reload
+                    employee_checkbox_id = await page.evaluate(employee_checkbox_js, SCHEDULE_EMPLOYEE)
+                    if employee_checkbox_id:
+                        break
+                    await page.wait_for_timeout(500)
         if not employee_checkbox_id:
             logger.warning("Stage C: employee %r not found in the Filter checklist for %s "
-                            "after waiting", SCHEDULE_EMPLOYEE, wo)
+                            "after waiting, forced refreshes, and a re-navigation", SCHEDULE_EMPLOYEE, wo)
             await self._screenshot(f"stage_c_no_employee_{wo.replace('/', '-')}")
             return False
         await page.locator(f'label[for="{employee_checkbox_id}"]').click(timeout=10000)
