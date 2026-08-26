@@ -533,10 +533,26 @@ class SynergixDriver:
                     "confirmed, but Stage C (Schedule Board) scheduling failed or was skipped -- "
                     "human must schedule it manually in Synergix. Fulfil still manual.",
                 )
+            # Stage D: Fulfil the now-scheduled Service Order for billing -- see _fulfil_stage_d's
+            # docstring. Best-effort, same reasoning as B.5/C: a failure here still leaves a real,
+            # scheduled Service Order, just requiring a human to Fulfil it manually in Synergix.
+            fulfilled = False
+            try:
+                fulfilled = await self._fulfil_stage_d(payload)
+            except Exception:
+                logger.exception("Stage D fulfil failed for %s (quotation %s)",
+                                  payload.wo_po_number, quo_id)
+            if not fulfilled:
+                return WriteResult(
+                    WOStatus.PARTIAL,
+                    f"Quotation {quo_id or '(id unread)'} created, submitted, Variation Order "
+                    "confirmed, and Schedule Board (Stage C) completed, but Stage D (Fulfil) failed "
+                    "or was skipped -- human must fulfil it manually in Synergix.",
+                )
             return WriteResult(
                 WOStatus.PROCESSED,
                 f"Quotation {quo_id or '(id unread)'} created, submitted, Variation Order confirmed, "
-                "and Schedule Board (Stage C) completed. Fulfil (Stage D) still manual.",
+                "Schedule Board (Stage C) completed, and Fulfil (Stage D) submitted for billing.",
             )
         except S.MissingSelectorError as exc:
             logger.error("MISSING SELECTOR: %s â€” fill it in config/selectors.py", exc)
@@ -2247,6 +2263,21 @@ class SynergixDriver:
         if not await submit_btn.count():
             logger.warning("Stage C: no Submit button found on Order Details for %s", wo)
             return False
+
+        async def _tick_row_checkbox() -> bool:
+            # Confirmed live (2026-08-26): clicking the row or its link text does NOT enable Submit --
+            # only the row's own ui-chkbox does, since its onchange explicitly ajax-updates
+            # "@(.pfs-all-selected) @(.submit-button)". Isolated via the discovery REPL's `js` command,
+            # watching document.querySelector("[id*=submitButton]")?.disabled flip True -> False only
+            # after this specific checkbox (not the row) was clicked.
+            checkbox = order_row2.locator(".ui-chkbox-box").locator("visible=true").first
+            if not await checkbox.count():
+                return False
+            await checkbox.click(timeout=10000)
+            await page.wait_for_timeout(1500)
+            return True
+
+        await _tick_row_checkbox()
         # Confirmed live (2026-08-26) that this button can still read disabled right after
         # re-selecting the order row -- poll for it to actually enable before giving up, same
         # ajax-timing tolerance pattern used throughout this file.
@@ -2258,10 +2289,11 @@ class SynergixDriver:
             await page.wait_for_timeout(500)
         if not enabled:
             logger.warning("Stage C: Submit button stayed disabled for %s -- re-selecting the order "
-                            "row once more", wo)
+                            "row and its checkbox once more", wo)
             if await order_row2.count():
                 await order_row2.click(timeout=10000)
                 await page.wait_for_timeout(2000)
+                await _tick_row_checkbox()
             for _ in range(10):
                 if await submit_btn.is_enabled():
                     enabled = True
@@ -2290,6 +2322,198 @@ class SynergixDriver:
             logger.warning("Stage C: %s (%s) not found in Upcoming Service after submit", wo, order_no)
             return False
         logger.info("Stage C scheduled and submitted for %s (%s)", wo, order_no)
+        return True
+
+    async def _open_service_order_performance(self) -> None:
+        """Navigate (logged in) to General Service -> Service Order Performance - LS2.
+
+        Same re-navigate-fresh pattern as _open_service_quotation_list/_open_schedule_board.
+        Confirmed live (2026-08-26) this page's own datatable takes noticeably longer to render than
+        Service Quotation's or Schedule Board's -- callers should not assume the grid is ready
+        immediately after this returns; the wait below already accounts for that.
+        """
+        await self.login()
+        assert self.page is not None
+        for attempt in (1, 2):
+            await self._goto_base_with_retry()
+            await self.page.wait_for_timeout(4000)
+            if await self._is_session_expired():
+                logger.warning("Session expired on nav (attempt %d) â€” re-logging in", attempt)
+                self._logged_in = False
+                await self.login()
+                continue
+            await self.page.get_by_text("General Service", exact=False).first.click()
+            await self.page.wait_for_timeout(3000)
+            await self.page.get_by_text("Service Order Performance", exact=False).first.click()
+            await self.page.wait_for_selector("th:has-text('Order No')", timeout=30000)
+            await self.page.wait_for_timeout(6000)
+            return
+        raise RuntimeError("could not open Service Order Performance after re-login")
+
+    async def _fulfil_stage_d(self, payload: WOPayload) -> bool:
+        """Stage D: find the WO's Service Order in Service Order Performance, set each Billables
+        row's Actual Qty to match its Quoted Qty, attach the WO PDF (best-effort), and Submit for
+        billing -- workflow-doc step 28, the literal end of the whole pipeline.
+
+        Discovered live (2026-08-26) on SV00008852 (WO-PO/000076625): Actual Qty defaults to 0.00
+        even when Quoted Qty is correct, and every Billables total (Total/Sales Tax/Total After Tax
+        Amount) reads 0.00 until it is set -- Fulfilling without this step would bill the customer
+        $0.00, not the WO's authorised amount. Setting Actual Qty = Quoted Qty and pressing Enter (to
+        fire the recalculation ajax) correctly recomputes the totals; confirmed live this exactly
+        reproduces the WO's authorised net/grand total.
+
+        The Submit button (title="Submit", id ending "submitButton", icon fa-vote-yea -- the SAME
+        icon class used at every other stage-ending confirm in this app) triggers the usual
+        PrimeFaces.confirm "Are you sure?" Yes/No dialog. Confirmed live that after a real Yes, the
+        record disappears from Service Order Performance's own list ENTIRELY (searched with the
+        Service Order Status filter set to "All" -- "No records found"), not just changes status
+        within it -- that is the verification signal used here, since there is no confirmation toast
+        captured live to key off instead.
+
+        Attachments: confirmed live (2026-08-26) the Attachments panel's own file input
+        (input[type=file], id ending "..._input", onchange="SynFaces.fileUpload.checkFileSize...")
+        is already present in the DOM once the tab is opened -- no button click is needed to spawn
+        it. The visible "+" icon next to it is actually "New Folder" (confirmed live: clicking it
+        opens an inline folder-rename row, not a file picker) and must NOT be clicked when the goal
+        is a file upload -- an earlier attempt did exactly that and got stuck on an unrelated rename
+        row. set_input_files() on the existing hidden input is the correct, and only tested, path.
+        Still best-effort -- a failure here is logged and does NOT block Submit, since the workflow
+        doc's own step ordering (Billables -> Attachments -> Fulfil) treats it as a per-record filing
+        step, not a hard gate the way Actual Qty defaulting to 0.00 is.
+
+        Returns whether the Fulfil was confirmed to have gone through (the order no longer appearing
+        anywhere in Service Order Performance's list, status filter "All").
+        """
+        assert self.page is not None
+        page = self.page
+        wo = payload.wo_po_number
+
+        if _dry_guard(f"fulfil Stage D for {wo}"):
+            return True
+
+        await self._open_service_order_performance()
+
+        # Match the order row by its Enquiry/Subject text containing the WO-PO number -- same
+        # matching strategy as Stage C's order lookup on Schedule Board.
+        order_row = page.locator("tr", has_text=wo.replace("WO-PO/", "")).locator("visible=true").first
+        if not await order_row.count():
+            logger.warning("Stage D: no Service Order Performance order found for %s", wo)
+            return False
+        order_no_cell = order_row.locator("td").nth(5)  # Order No column
+        order_no = (await order_no_cell.inner_text()).strip()
+        fulfil_btn = order_row.get_by_text("Fulfil", exact=True).locator("visible=true").first
+        if not await fulfil_btn.count():
+            logger.warning("Stage D: no Fulfil button on %s's row for %s", order_no, wo)
+            return False
+        await fulfil_btn.click(timeout=10000)
+        await page.wait_for_timeout(6000)
+
+        billables_tab = page.get_by_text("Billables", exact=True).locator("visible=true").first
+        if not await billables_tab.count():
+            logger.warning("Stage D: no Billables tab found for %s (%s)", wo, order_no)
+            return False
+        await billables_tab.click(timeout=10000)
+        await page.wait_for_timeout(2000)
+
+        # Set Actual Qty = Quoted Qty for every Billables row -- relationally, NOT by a fixed id
+        # fragment count, so this holds for a WO with more than one line item. Confirmed live that
+        # the Quoted Qty cell (readonly) and Actual Qty cell (editable) sit in the same <tr>, in that
+        # column order, and are visually near-identical otherwise.
+        billables_rows = await page.evaluate(
+            """() => {
+                const rows = [...document.querySelectorAll('table')]
+                  .flatMap(t => [...t.querySelectorAll('tbody > tr')])
+                  .filter(tr => tr.querySelector('input.qty[readonly], input.qty:not([readonly])'));
+                return rows.map(tr => {
+                    const inputs = [...tr.querySelectorAll('input.qty')];
+                    const quoted = inputs.find(i => i.readOnly);
+                    const actual = inputs.find(i => !i.readOnly);
+                    return quoted && actual ? [quoted.value, actual.id] : null;
+                }).filter(Boolean);
+            }"""
+        )
+        if not billables_rows:
+            logger.warning("Stage D: no Billables rows found for %s (%s)", wo, order_no)
+            return False
+        for quoted_value, actual_id in billables_rows:
+            actual_field = page.locator(f'[id="{actual_id}"]')
+            await actual_field.fill(quoted_value)
+            await actual_field.press("Enter")
+            await page.wait_for_timeout(1500)
+
+        # Verify the totals actually recalculated off of 0.00 -- same reconciliation spirit as
+        # Stage B's _assert_details_filled: a per-cell value looking right is not proof the page
+        # total (the only server-reflected signal) actually moved.
+        total_after_tax = await page.evaluate(
+            """() => {
+                const label = [...document.querySelectorAll('.price-summary-label')]
+                  .find(l => l.textContent.trim() === 'Total After Tax Amount');
+                const value = label && label.parentElement.querySelector('.price-summary-value');
+                return value ? value.textContent.trim() : null;
+            }"""
+        )
+        if not total_after_tax or total_after_tax in ("0.00", ""):
+            logger.warning("Stage D: Total After Tax still %r after setting Actual Qty for %s (%s)",
+                            total_after_tax, wo, order_no)
+            await self._screenshot(f"stage_d_zero_total_{wo.replace('/', '-')}")
+            return False
+
+        # Attachments: best-effort, not a hard gate -- see docstring. Do NOT click the "+" icon --
+        # confirmed live it is "New Folder", not an upload trigger. The file input is already in the
+        # DOM once the tab is open.
+        try:
+            attachments_tab = page.locator('[title="Attachments"]').locator("visible=true").first
+            if await attachments_tab.count():
+                await attachments_tab.click(timeout=10000)
+                await page.wait_for_timeout(2000)
+                file_input = page.locator('input[type="file"]').first
+                if await file_input.count():
+                    await file_input.set_input_files(payload.source_path)
+                    await page.wait_for_timeout(3000)
+                    logger.info("Stage D: attached %s for %s", payload.source_path, wo)
+                else:
+                    logger.warning("Stage D: no file input found on Attachments tab for %s "
+                                    "-- skipping attachment", wo)
+        except Exception:
+            logger.exception("Stage D: attaching the WO PDF failed for %s -- continuing without it "
+                              "(best-effort, not a hard gate)", wo)
+
+        submit_btn = page.locator('[id*="submitButton"]').locator("visible=true").first
+        if not await submit_btn.count():
+            submit_btn = page.locator('button:has(span.fa-vote-yea)').locator("visible=true").first
+        if not await submit_btn.count():
+            logger.warning("Stage D: no Submit button found for %s (%s)", wo, order_no)
+            return False
+        await submit_btn.click(timeout=10000)
+        await page.wait_for_timeout(1500)
+        yes_btn = page.get_by_role("button", name="Yes").locator("visible=true")
+        if await yes_btn.count():
+            await yes_btn.first.click(timeout=10000)
+        # Confirmed live (2026-08-26) that this ajax round-trip can take longer than most other
+        # confirms in this file -- an earlier attempt hit "session expired" from waiting too briefly
+        # here before checking the result.
+        await page.wait_for_timeout(8000)
+
+        # Verify via ground truth: search Service Order Performance directly for this order number
+        # with the Service Order Status filter left at "All" -- confirmed live this is the strongest
+        # available signal (the order disappears from the list ENTIRELY once Fulfilled, not just
+        # changes status within it). The Order No filter input has an accessible label ("Filter by
+        # Order No") -- confirmed live this is more reliable than th-then-descendant lookup, which
+        # timed out (30s) matching the wrong/no input on this page's datatable header.
+        await self._open_service_order_performance()
+        order_no_filter = page.get_by_label("Filter by Order No").locator("visible=true").first
+        if await order_no_filter.count():
+            await order_no_filter.click()
+            await order_no_filter.fill(order_no)
+            await order_no_filter.press("Enter")
+            await page.wait_for_timeout(3000)
+        still_present = await page.locator("tr", has_text=order_no).locator("visible=true").count() > 0
+        if still_present:
+            logger.warning("Stage D: %s (%s) still present in Service Order Performance after "
+                            "Submit+Yes", wo, order_no)
+            await self._screenshot(f"stage_d_still_present_{wo.replace('/', '-')}")
+            return False
+        logger.info("Stage D fulfilled and submitted for %s (%s)", wo, order_no)
         return True
 
     async def _submit_quotation(self, payload: WOPayload) -> str | None:

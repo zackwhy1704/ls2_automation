@@ -64,6 +64,7 @@ def test_write_reports_processed_when_vo_confirm_succeeds():
     d = _driver_with_mocked_stage_b()
     d._confirm_variation_order = AsyncMock(return_value=True)
     d._schedule_stage_c = AsyncMock(return_value=True)  # Stage C is tested separately
+    d._fulfil_stage_d = AsyncMock(return_value=True)  # Stage D is tested separately
     with patch("src.synergix_driver.settings.DRY_RUN", False):
         result = asyncio.run(d.write(_payload()))
     assert result.status is WOStatus.PROCESSED

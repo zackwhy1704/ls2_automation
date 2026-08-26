@@ -14,7 +14,7 @@ from config import settings
 from src.extractor import extract_from_pdf
 from src.synergix_driver import SynergixDriver
 
-PDF_PATH = "data/samples/JBTC/76640.pdf"
+PDF_PATH = "data/samples/JBTC/76627.pdf"
 
 
 async def main() -> None:

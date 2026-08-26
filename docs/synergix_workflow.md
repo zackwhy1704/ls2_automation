@@ -770,3 +770,45 @@ directly whether Synergix's Schedule Board is known internally to be slow/flaky 
 manual use -- if their own staff also see this, it may not be fixable from the automation side at
 all, and Stage C may need to stay a manual, best-effort step indefinitely (matching the original
 work order's own description of it as "most fragile").
+
+## Session 6 continued: Stage C checkbox fix + Stage D live end-to-end success
+
+While manually driving toward a real Stage D submit (since Stage C's automation could not be relied
+upon that day), found that `SV00008856` (WO-PO/000076627) had been left in a real, partially
+scheduled state (`800SUPER`, 23/04/2026) by an earlier aborted "wrong employee" attempt -- a
+previously undocumented gap: the abort path returns `False` but does not roll back whatever the
+Synergix backend already committed server-side. Not fixed this session, only noted here for
+whoever picks up Stage C's abort-cleanup next.
+
+Manually completed `SV00008856`'s Stage C submit live, discovering along the way (via the discovery
+REPL's `js` command, watching `document.querySelector("[id*=submitButton]")?.disabled` flip
+`True` -> `False`) that clicking the order row's own `ui-chkbox` checkbox -- NOT the row or its link
+text -- is what actually enables the Order Details Submit button. This is now fixed in
+`_schedule_stage_c` (`src/synergix_driver.py`): the re-selection step ticks the row's checkbox via
+`.ui-chkbox-box`, both on the first attempt and the retry-once-more fallback.
+
+Then drove `SV00008856` through a full, real Stage D Fulfil live: Billables' Actual Qty defaulted to
+0.00 (same as `SV00008852` earlier), filled to match Quoted Qty (1.00), Total After Tax Amount
+recalculated correctly to 47.96. Attachments: found the "+" icon next to the file panel is actually
+"New Folder" (clicking it opens an inline rename row, NOT a file picker) -- confirmed the real
+upload path is the panel's own `input[type=file]`, already present in the DOM once the Attachments
+tab opens, usable directly via `set_input_files()` with no button click needed at all. Clicked
+Submit, confirmed "Are you sure?" with Yes, and verified via ground truth: filtering Service Order
+Performance's Order No column for `SV00008856` with Service Order Status left at "All" returned "No
+records found" -- the strongest available signal, since the record disappears from the list
+entirely once Fulfilled rather than merely changing status within it.
+
+**Both fixes are now committed** in `_fulfil_stage_d` and `_schedule_stage_c`
+(`src/synergix_driver.py`), and Stage D is wired into `write()`'s call chain after Stage C succeeds
+-- `write()` no longer stops at "Fulfil still manual"; a fully successful WO now returns
+`WOStatus.PROCESSED` only after Stage D's own Submit is confirmed via the same ground-truth check.
+The Order No filter lookup used for that ground-truth check was also fixed: the original
+`th:visible has-text("Order No")` -> descendant-input lookup timed out live (30s, no match); fixed
+to `page.get_by_label("Filter by Order No")`, which matches the input's real accessible label and is
+more robust to this datatable's specific header markup.
+
+Net result this session: full pipeline A -> B -> B.5 -> C -> D proven live end-to-end on a real
+Service Order (`SV00008856` / `SV00008852` earlier), not a draft, with every step's completion
+verified via ground truth rather than an absence of errors. Stage C's underlying flakiness
+(documented above) is unchanged and still best-effort; the checkbox fix here only addresses the
+Submit-button-stays-disabled failure mode, not the checklist/calendar-row rendering intermittency.

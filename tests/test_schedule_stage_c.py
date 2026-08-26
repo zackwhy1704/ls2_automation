@@ -63,10 +63,11 @@ def test_dry_run_skips_schedule_stage_c_entirely():
 def test_write_reports_processed_when_stage_c_succeeds():
     d = _driver_ready_for_stage_c()
     d._schedule_stage_c = AsyncMock(return_value=True)
+    d._fulfil_stage_d = AsyncMock(return_value=True)  # Stage D is tested separately
     with patch("src.synergix_driver.settings.DRY_RUN", False):
         result = asyncio.run(d.write(_payload()))
     assert result.status is WOStatus.PROCESSED
-    assert "Schedule Board (Stage C) completed" in result.detail
+    assert "Fulfil (Stage D) submitted" in result.detail
     d._schedule_stage_c.assert_awaited_once()
 
 
