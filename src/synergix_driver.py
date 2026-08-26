@@ -1952,25 +1952,72 @@ class SynergixDriver:
         await order_row.click(timeout=10000)
         await page.wait_for_timeout(2000)
 
-        # Employee view (NOT Work Team -- that list is empty; see docstring point 2).
-        employee_toggle = page.get_by_text("Employee", exact=True).locator("visible=true").first
-        await employee_toggle.click(timeout=10000)
-        await page.wait_for_timeout(2000)
+        # Employee view (NOT Work Team -- that list is empty; see docstring point 2). Confirmed live
+        # (2026-08-26) that a Playwright Locator click here (both get_by_text(exact=True) and the
+        # generic text= form) can report success while the toggle visibly stays on "Work Team" --
+        # repeated across multiple fresh sessions, not a one-off. Clicking the underlying radio
+        # input directly via JS .click() (bypassing Playwright's actionability + event simulation
+        # entirely) is what the live discovery session actually used successfully; verify the button
+        # went active (ui-state-active) afterward and retry if not.
+        employee_active = False
+        for _ in range(3):
+            await page.evaluate(
+                """() => {
+                    const btn = [...document.querySelectorAll('div.ui-button')]
+                      .find(b => b.textContent.trim() === 'Employee' &&
+                                 b.getBoundingClientRect().width > 0);
+                    if (btn) btn.click();
+                }"""
+            )
+            await page.wait_for_timeout(1500)
+            employee_active = await page.evaluate(
+                """() => {
+                    const btn = [...document.querySelectorAll('div.ui-button')]
+                      .find(b => b.textContent.trim() === 'Employee' &&
+                                 b.getBoundingClientRect().width > 0);
+                    return btn ? btn.classList.contains('ui-state-active') : false;
+                }"""
+            )
+            if employee_active:
+                break
+        if not employee_active:
+            logger.warning("Stage C: could not switch to Employee view for %s", wo)
+            await self._screenshot(f"stage_c_no_employee_toggle_{wo.replace('/', '-')}")
+            return False
         filter_link = page.get_by_text("Filter", exact=True).locator("visible=true").first
         await filter_link.click(timeout=10000)
         await page.wait_for_timeout(2000)
 
-        employee_checkbox_id = await page.evaluate(
-            """(name) => {
+        # Confirmed live (2026-08-26) that the checkbox list can still be genuinely empty in the DOM
+        # several seconds after the Filter panel visibly opens -- a fixed 2s wait was not enough on a
+        # retest, even though the exact same sequence had worked moments earlier in the same session.
+        # ALSO confirmed live, separately, that the Employee/Work Team toggle can drift back to "Work
+        # Team" between here and the earlier check with no single action caught doing it -- so this
+        # loop re-asserts Employee is active on every poll, not just once up front, rather than
+        # trying to pin the exact moment/cause of the reset. Same ajax-timing tolerance pattern
+        # already applied throughout this file (e.g. _click_panel_row_by_text).
+        recheck_employee_js = """() => {
+                const btn = [...document.querySelectorAll('div.ui-button')]
+                  .find(b => b.textContent.trim() === 'Employee' &&
+                             b.getBoundingClientRect().width > 0);
+                if (btn && !btn.classList.contains('ui-state-active')) btn.click();
+            }"""
+        employee_checkbox_js = """(name) => {
                 const label = [...document.querySelectorAll('label')]
                   .find(l => l.textContent.trim() === name);
                 return label ? label.getAttribute('for') : null;
-            }""",
-            SCHEDULE_EMPLOYEE,
-        )
+            }"""
+        employee_checkbox_id = None
+        for _ in range(16):  # ~8s
+            await page.evaluate(recheck_employee_js)
+            employee_checkbox_id = await page.evaluate(employee_checkbox_js, SCHEDULE_EMPLOYEE)
+            if employee_checkbox_id:
+                break
+            await page.wait_for_timeout(500)
         if not employee_checkbox_id:
-            logger.warning("Stage C: employee %r not found in the Filter checklist for %s",
-                            SCHEDULE_EMPLOYEE, wo)
+            logger.warning("Stage C: employee %r not found in the Filter checklist for %s "
+                            "after waiting", SCHEDULE_EMPLOYEE, wo)
+            await self._screenshot(f"stage_c_no_employee_{wo.replace('/', '-')}")
             return False
         await page.locator(f'label[for="{employee_checkbox_id}"]').click(timeout=10000)
         await page.wait_for_timeout(2000)
@@ -2016,15 +2063,22 @@ class SynergixDriver:
         # (_fill_grid_field's docstring) that PrimeFaces cells can silently ignore a value set via a
         # synthetic event and only reliably commit through Playwright's own fill().
         for date_value, time_value in (("From", "08:00"), ("To", "08:30")):
+            # Scoped to inside the Event Details dialog (same reasoning as the confirm button fix
+            # below): querying the whole document risks matching a same-named label/field belonging
+            # to an unrelated, hidden element elsewhere on the page.
             time_input_id = await page.evaluate(
                 """(label) => {
+                    const dialog = [...document.querySelectorAll('[role="dialog"]')]
+                      .find(d => d.textContent.includes('Event Details') &&
+                                 d.getBoundingClientRect().width > 0);
+                    if (!dialog) return null;
                     const norm = s => (s||'').replace(/\\s+/g,' ').trim();
-                    const host = [...document.querySelectorAll('td,div,span,label')]
+                    const host = [...dialog.querySelectorAll('td,div,span,label')]
                       .find(e => e.children.length === 0 && norm(e.textContent) === label);
                     const item = host && host.closest('.synfaces-grid-item');
                     if (!item) return null;
                     const inputs = [...item.querySelectorAll('input:not([type=hidden])')];
-                    const timeInput = inputs.find(i => !/\\//.test(i.value));
+                    const timeInput = inputs.find(i => /^\\d{1,2}:\\d{2}$/.test(i.value));
                     return timeInput ? timeInput.id : null;
                 }""",
                 date_value,
@@ -2035,12 +2089,36 @@ class SynergixDriver:
             await page.locator(f'[id="{time_input_id}"]').fill(time_value)
             await page.wait_for_timeout(500)
 
-        confirm_btn = page.locator('button:has(span.fa-check)').first
+        # Scoped to the Event Details dialog itself, not a bare button:has(span.fa-check) --
+        # confirmed live (2026-08-26) that a generic fa-check search can resolve to an unrelated,
+        # hidden confirm-dialog's own "Yes" button elsewhere on the page (id="j_idt969", a
+        # PrimeFaces-generated id that recurs across different dialogs) and hang forever waiting for
+        # it to become visible. role="dialog" + its own title text is a stable, structural anchor.
+        event_dialog = page.locator('[role="dialog"]:has-text("Event Details")').locator("visible=true").first
+        confirm_btn = event_dialog.locator('button:has(span.fa-check)').first
         if not await confirm_btn.count():
             logger.warning("Stage C: no Event Details confirm button found for %s", wo)
             return False
         await confirm_btn.click(timeout=10000)
         await page.wait_for_timeout(4000)
+        # Confirmed live (2026-08-26) that this click can leave the dialog (and its modal overlay)
+        # still open, which then blocks every subsequent click with "<div class=ui-dialog-mask>
+        # intercepts pointer events" for a full 30s timeout. Wait for it to actually close, retrying
+        # the confirm click once if it hasn't.
+        try:
+            await event_dialog.wait_for(state="hidden", timeout=8000)
+        except Exception:
+            logger.warning("Stage C: Event Details dialog still open after Confirm for %s -- "
+                            "retrying the click", wo)
+            if await confirm_btn.count():
+                await confirm_btn.click(timeout=10000)
+                await page.wait_for_timeout(4000)
+            try:
+                await event_dialog.wait_for(state="hidden", timeout=8000)
+            except Exception:
+                logger.warning("Stage C: Event Details dialog would not close for %s", wo)
+                await self._screenshot(f"stage_c_dialog_stuck_{wo.replace('/', '-')}")
+                return False
 
         # The grid/selection can reset after the popup's ajax refresh -- re-select the order before
         # looking for the (now separately-appearing) Submit action.
@@ -2056,6 +2134,30 @@ class SynergixDriver:
         submit_btn = page.locator('button:has(span.fa-vote-yea)').locator("visible=true").first
         if not await submit_btn.count():
             logger.warning("Stage C: no Submit button found on Order Details for %s", wo)
+            return False
+        # Confirmed live (2026-08-26) that this button can still read disabled right after
+        # re-selecting the order row -- poll for it to actually enable before giving up, same
+        # ajax-timing tolerance pattern used throughout this file.
+        enabled = False
+        for _ in range(10):  # ~5s
+            if await submit_btn.is_enabled():
+                enabled = True
+                break
+            await page.wait_for_timeout(500)
+        if not enabled:
+            logger.warning("Stage C: Submit button stayed disabled for %s -- re-selecting the order "
+                            "row once more", wo)
+            if await order_row2.count():
+                await order_row2.click(timeout=10000)
+                await page.wait_for_timeout(2000)
+            for _ in range(10):
+                if await submit_btn.is_enabled():
+                    enabled = True
+                    break
+                await page.wait_for_timeout(500)
+        if not enabled:
+            logger.warning("Stage C: Submit button never enabled for %s", wo)
+            await self._screenshot(f"stage_c_submit_disabled_{wo.replace('/', '-')}")
             return False
         await submit_btn.click(timeout=10000)
         await page.wait_for_timeout(1500)

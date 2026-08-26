@@ -214,6 +214,12 @@ async def main() -> None:
                 await loc.click()
                 await loc.fill(value)
                 print(f"filled css={sel!r} = {value!r}")
+            elif cmd == "js":
+                if not arg:
+                    print("usage: js <expression, e.g. document.title>")
+                    continue
+                result = await page.evaluate(f"() => {{ return {arg}; }}")
+                print(f"js result: {result!r}")
             elif cmd == "css":
                 if not arg:
                     print("usage: css <css selector>")
