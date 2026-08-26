@@ -60,6 +60,12 @@ class DedupResult(str, Enum):
 ITEM_CODE = "SE-400212A"
 ITEM_TYPE = "S"
 
+# Schedule Board (Stage C) employee. Same fixed value already used as the Stage B Salesperson (see
+# _stage_b_create_quotation) -- "TAN WEI YING" is the only person seen assigned on every real
+# quotation/schedule observed so far, both councils. See that TODO(human) for the same open question
+# (confirm with the client whether this should ever vary per-WO).
+SCHEDULE_EMPLOYEE = "TAN WEI YING"
+
 # Payment Method dropdown target. Confirmed live (2026-08-15) that the previously-targeted
 # "Cheque" does not appear as an option at all for JALAN BESAR TOWN COUNCIL â€” the only real
 # (non-placeholder) option offered was "GIRO", which the client confirmed is correct.
@@ -147,6 +153,13 @@ class SynergixDriver:
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
             ),
+            # Schedule Board (Stage C) needs a wide viewport: confirmed live (2026-08-25) that at the
+            # Playwright default (1280x720) the calendar's per-cell "add event" click silently fails
+            # ("<td> intercepts pointer events") because the right-side info panel narrows the
+            # calendar too much. Widening the viewport reproduces the same effect as collapsing that
+            # panel by hand, without depending on that panel's own toggle control (which two separate
+            # automated attempts -- plain and forced click -- both failed to actually trigger).
+            viewport={"width": 1920, "height": 1080},
             args=["--disable-blink-features=AutomationControlled"],
         )
         self.page = self._context.pages[0] if self._context.pages else await self._context.new_page()
@@ -479,16 +492,51 @@ class SynergixDriver:
                                          "manual cleanup", draft_quo_id, payload.wo_po_number)
                 raise
             quo_id = await self._submit_quotation(payload)
-            # Schedule Board (C) and Fulfil (D) remain manual â€” done by the team in Synergix.
             if settings.DRY_RUN:
+                # Schedule Board (C) and Fulfil (D) remain manual â€” done by the team in Synergix.
                 return WriteResult(
                     WOStatus.PARTIAL,
                     f"DRY_RUN: quotation draft {quo_id or '(id unread)'} created + filled, NOT submitted.",
                 )
+            # Stage B.5: a submitted quotation sits in "Under Variation" and is NOT yet a schedulable
+            # Service Order until this is confirmed -- see _confirm_variation_order's docstring.
+            # Best-effort: a failure here still leaves a real, submitted quotation (just requires a
+            # human to confirm the VO manually), not a lost WO.
+            vo_confirmed = False
+            if quo_id:
+                try:
+                    vo_confirmed = await self._confirm_variation_order(quo_id)
+                except Exception:
+                    logger.exception("Variation Order confirm failed for %s (quotation %s)",
+                                      payload.wo_po_number, quo_id)
+            if not vo_confirmed:
+                return WriteResult(
+                    WOStatus.PARTIAL,
+                    f"Quotation {quo_id or '(id unread)'} created + submitted, but Variation Order "
+                    "confirm failed or was skipped -- human must confirm it in Synergix before it "
+                    "becomes a schedulable Service Order. Schedule board + fulfil still manual.",
+                )
+            # Stage C: schedule the new Service Order (assign SCHEDULE_EMPLOYEE at the WO's job
+            # date) and submit it -- see _schedule_stage_c's docstring. Best-effort, same reasoning
+            # as Stage B.5: a failure here still leaves a real, confirmed quotation + Service Order,
+            # just requiring a human to finish scheduling manually in Synergix.
+            scheduled = False
+            try:
+                scheduled = await self._schedule_stage_c(payload)
+            except Exception:
+                logger.exception("Stage C scheduling failed for %s (quotation %s)",
+                                  payload.wo_po_number, quo_id)
+            if not scheduled:
+                return WriteResult(
+                    WOStatus.PARTIAL,
+                    f"Quotation {quo_id or '(id unread)'} created, submitted, and Variation Order "
+                    "confirmed, but Stage C (Schedule Board) scheduling failed or was skipped -- "
+                    "human must schedule it manually in Synergix. Fulfil still manual.",
+                )
             return WriteResult(
                 WOStatus.PROCESSED,
-                f"Quotation {quo_id or '(id unread)'} created + submitted. "
-                "Schedule board + fulfil still manual.",
+                f"Quotation {quo_id or '(id unread)'} created, submitted, Variation Order confirmed, "
+                "and Schedule Board (Stage C) completed. Fulfil (Stage D) still manual.",
             )
         except S.MissingSelectorError as exc:
             logger.error("MISSING SELECTOR: %s â€” fill it in config/selectors.py", exc)
@@ -866,13 +914,20 @@ class SynergixDriver:
         """
         assert self.page is not None
         page = self.page
+        # Scoped to .synfaces-grid-item first, falling back to the classic <tr>: confirmed live
+        # (2026-08-25) that the Schedule Board Event Details popup uses the div-based
+        # "synfaces-grid-label"/"synfaces-grid-item" layout (same family as External Remarks, see
+        # _select_external_remark) for From/To/Remarks, which has no <tr> ancestor at all -- the
+        # original <tr>-only lookup would raise "could not locate the input" for every field in that
+        # popup. Additive: every existing <tr>-based caller (Enquiry/Subject, Reference No.) still
+        # matches via the fallback, unchanged.
         js = """(label) => {
                 const norm = s => (s||'').replace(/\\s+/g,' ').trim();
                 const host = [...document.querySelectorAll('td,div,span,label')]
                   .find(e => e.children.length === 0 && norm(e.textContent) === label);
                 if (!host) return null;
-                const tr = host.closest('tr');
-                const input = tr && tr.querySelector('input:not([type=hidden]):not([readonly]), textarea');
+                const scope = host.closest('.synfaces-grid-item') || host.closest('tr');
+                const input = scope && scope.querySelector('input:not([type=hidden]):not([readonly]), textarea');
                 return input ? input.id : null;
             }"""
         input_id = None
@@ -1690,6 +1745,338 @@ class SynergixDriver:
                 f"Details grid incomplete for {payload.wo_po_number} â€” refusing to submit: "
                 + "; ".join(problems)
             )
+
+    async def _confirm_variation_order(self, quotation_no: str) -> bool:
+        """Stage B.5: retrieve a just-submitted quotation from "Under Variation" and click Confirm.
+
+        Discovered live (2026-08-25): a submitted quotation does NOT immediately become a
+        schedulable Service Order. It lands in the "Under Variation" status tab first (this file's
+        own docstrings already named this step -- "Go to Variation Order, retrieve the same service
+        quotation, click it, and Confirm the VO" -- but it had never been automated, and Schedule
+        Board's Unscheduled Service Orders grid has nothing to show without it). Confirmed live on
+        QUO0006749: opening it from "Under Variation" and clicking its Confirm button (title="Confirm",
+        icon fa-check-double) raises a "Are you sure?" dialog; clicking Yes produced
+        "SA0005: Service Order No.: SV00008852 is created successfully." and the new Service Order
+        immediately appeared in Schedule Board's Unscheduled Service Orders grid (count 44 -> 45).
+
+        Without this step, Stage C automation has nothing to act on -- there is no Service Order to
+        schedule. Returns whether the confirm was observed to succeed (the info-banner toast, or the
+        quotation no longer appearing under "Under Variation" afterward).
+        """
+        assert self.page is not None
+        page = self.page
+
+        if _dry_guard(f"confirm Variation Order for {quotation_no}"):
+            return True  # DRY_RUN: leave it sitting in Under Variation
+
+        await self._open_service_quotation_list()
+        if not await self._select_quotation_status_tab("Under Variation"):
+            logger.warning("_confirm_variation_order: could not switch to 'Under Variation' tab "
+                            "for %s", quotation_no)
+            return False
+
+        # Scope to the VISIBLE "Quotation No." header, not just the first in DOM order -- confirmed
+        # live (2026-08-25) that each status tab keeps its own hidden/shown copy of the same grid
+        # (the exact issue check_duplicate's docstring already documents), so a plain .first grabbed
+        # the Draft tab's hidden filter input and every click on it timed out waiting for visibility.
+        header = page.locator("th:visible", has_text="Quotation No.").first
+        filter_input = header.locator("input.ui-column-filter").first
+        await filter_input.click()
+        await filter_input.fill(quotation_no)
+        await filter_input.press("Enter")
+        await page.wait_for_timeout(3000)
+
+        link = page.get_by_role("link", name=quotation_no, exact=True).locator("visible=true")
+        if not await link.count():
+            # Confirmed live (2026-08-25): calling this twice on the same quotation (e.g. a retry
+            # after a transient error elsewhere) is not a failure the second time -- it means the
+            # first call's Confirm click already succeeded and the quotation has moved out of
+            # "Under Variation" already. Treat "not found here" as already-done, not broken.
+            logger.info("_confirm_variation_order: %s not under 'Under Variation' (already "
+                        "confirmed, or never got this far) -- treating as already done",
+                        quotation_no)
+            return True
+        await link.first.click(timeout=10000)
+        await page.wait_for_timeout(4000)
+
+        # The Confirm button is sometimes absent even on a fully-filled, otherwise-normal-looking
+        # record -- confirmed live (2026-08-25) on two separate quotations (QUO0006761, QUO0006769),
+        # comparing every visible field against a working record with no difference found. Root
+        # cause unknown; reloading the record fresh a couple of times before giving up costs little
+        # and has not yet been ruled out as fixing it (a longer in-place wait alone did NOT help).
+        confirm_btn = page.locator('[title="Confirm"]').first
+        for reload_attempt in range(3):
+            if await confirm_btn.count():
+                break
+            if reload_attempt == 2:
+                break
+            logger.warning("_confirm_variation_order: no Confirm button on %s (attempt %d/3) -- "
+                            "reloading and retrying", quotation_no, reload_attempt + 1)
+            await self._open_service_quotation_list()
+            if not await self._select_quotation_status_tab("Under Variation"):
+                break
+            await filter_input.click()
+            await filter_input.fill(quotation_no)
+            await filter_input.press("Enter")
+            await page.wait_for_timeout(3000)
+            link2 = page.get_by_role("link", name=quotation_no, exact=True).locator("visible=true")
+            if not await link2.count():
+                break
+            await link2.first.click(timeout=10000)
+            await page.wait_for_timeout(4000)
+            confirm_btn = page.locator('[title="Confirm"]').first
+        if not await confirm_btn.count():
+            logger.warning("_confirm_variation_order: no Confirm button on %s after retries "
+                            "(on-screen title: %r)", quotation_no, await page.title())
+            await self._screenshot(f"vo_confirm_missing_button_{quotation_no}")
+            return False
+        await confirm_btn.click(timeout=10000)
+        await page.wait_for_timeout(2000)
+        yes_btn = page.get_by_role("button", name="Yes").locator("visible=true")
+        if await yes_btn.count():
+            await yes_btn.first.click(timeout=10000)
+        else:
+            logger.warning("_confirm_variation_order: no visible 'Yes' button after Confirm on %s",
+                            quotation_no)
+            await self._screenshot(f"vo_confirm_no_yes_button_{quotation_no}")
+        await page.wait_for_timeout(6000)
+
+        # Verify: the quotation should no longer be sitting under "Under Variation".
+        await self._open_service_quotation_list()
+        if not await self._select_quotation_status_tab("Under Variation"):
+            logger.warning("_confirm_variation_order: could not re-open 'Under Variation' to "
+                            "verify %s", quotation_no)
+            return False
+        header2 = page.locator("th:visible", has_text="Quotation No.").first
+        filter_input2 = header2.locator("input.ui-column-filter").first
+        await filter_input2.click()
+        await filter_input2.fill(quotation_no)
+        await filter_input2.press("Enter")
+        await page.wait_for_timeout(3000)
+        still_there = await page.get_by_text(quotation_no, exact=True).locator("visible=true").count() > 0
+        if still_there:
+            # Recheck once before declaring failure -- confirmed live (2026-08-25) that this list
+            # can take longer than the wait above to drop a just-confirmed record, and re-opening the
+            # list too early read a stale grid. Same defensive pattern as _verify_and_refill_rows.
+            await page.wait_for_timeout(4000)
+            await filter_input2.click()
+            await filter_input2.fill(quotation_no)
+            await filter_input2.press("Enter")
+            await page.wait_for_timeout(3000)
+            still_there = await page.get_by_text(quotation_no, exact=True).locator("visible=true").count() > 0
+        if still_there:
+            logger.warning("_confirm_variation_order: %s still under 'Under Variation' after "
+                            "Confirm+Yes (confirmed on recheck)", quotation_no)
+            await self._screenshot(f"vo_confirm_still_present_{quotation_no}")
+            return False
+        logger.info("Confirmed Variation Order for %s -- Service Order created", quotation_no)
+        return True
+
+    async def _open_schedule_board(self) -> None:
+        """Navigate (logged in) to General Service -> Schedule Board - LS2.
+
+        Same re-navigate-fresh pattern as _open_service_quotation_list, for the same reason (a
+        stale/filtered grid left over from a previous visit).
+        """
+        await self.login()
+        assert self.page is not None
+        for attempt in (1, 2):
+            await self._goto_base_with_retry()
+            await self.page.wait_for_timeout(4000)
+            if await self._is_session_expired():
+                logger.warning("Session expired on nav (attempt %d) â€” re-logging in", attempt)
+                self._logged_in = False
+                await self.login()
+                continue
+            await self.page.get_by_text("General Service", exact=False).first.click()
+            await self.page.wait_for_timeout(3000)
+            await self.page.get_by_text("Schedule Board - LS2", exact=False).first.click()
+            await self.page.wait_for_selector("th:has-text('Enquiry/Subject')", timeout=30000)
+            await self.page.wait_for_timeout(4000)
+            return
+        raise RuntimeError("could not open Schedule Board after re-login")
+
+    async def _schedule_stage_c(self, payload: WOPayload) -> bool:
+        """Stage C: find the WO's Service Order on Schedule Board, assign SCHEDULE_EMPLOYEE at the
+        WO's job date, and submit.
+
+        Discovered live (2026-08-25): a confirmed Variation Order (Stage B.5) creates a Service Order
+        that appears in Schedule Board's "Unscheduled Service Orders" grid, but scheduling it needs a
+        specific sequence found only by watching the user do it by hand -- see docs/synergix_workflow.md
+        ("Stage C completed end-to-end") for the full narrative. Summary of the non-obvious parts:
+          1. The order's ROW must be selected first (click it) -- clicking the calendar with no order
+             selected does nothing at all, no error, no popup.
+          2. The Employee filter's checkboxes are the ONLY way to make an employee's calendar row
+             appear; "Work Team" (a separate toggle) is a different, unrelated list.
+          3. The actual click target for "add an event" is a fully-transparent overlay button
+             (`[id*="newEventButton"]`), NOT the visible cell div underneath it -- the click failed
+             with a "<td> intercepts pointer events" error until this was found, because Playwright
+             was (correctly) reporting that invisible overlay as the interceptor.
+          4. The Event Details popup's time sub-fields reset to 00:00 every time a DIFFERENT field in
+             the same popup is edited (a whole-form ajax re-render) -- so times must be set LAST,
+             immediately before submitting, or they get silently wiped by a later edit.
+          5. After the popup's own checkmark, a SECOND, separate "Submit" action appears on the
+             underlying Order Details panel -- both must be clicked; the popup's checkmark alone does
+             not finish Stage C.
+
+        Returns whether the schedule was confirmed to have taken (checked via the "Upcoming Service"
+        panel showing a new dated entry -- the only signal confirmed live to actually reflect
+        server-side persistence, not just a client-side form state).
+        """
+        assert self.page is not None
+        page = self.page
+        wo = payload.wo_po_number
+
+        if _dry_guard(f"schedule Stage C for {wo}"):
+            return True
+
+        await self._open_schedule_board()
+
+        council_search = _PROJECT_SITE_SEARCH_JBTC if is_jbtc(payload.town_council) else _PROJECT_SITE_SEARCH_SKTC
+        header = page.locator("th:visible", has_text="Customer").first
+        filter_input = header.locator("input.ui-column-filter").first
+        await filter_input.click()
+        await filter_input.fill(council_search)
+        await filter_input.press("Enter")
+        await page.wait_for_timeout(3000)
+
+        # Match the order row by its Enquiry/Subject text containing the WO-PO number -- the same
+        # text Stage B wrote into the quotation's Subject, carried through to the Service Order.
+        order_row = page.locator("tr", has_text=wo.replace("WO-PO/", "")).locator("visible=true").first
+        if not await order_row.count():
+            logger.warning("Stage C: no Schedule Board order found for %s (searched customer %r)",
+                            wo, council_search)
+            return False
+        order_no_cell = order_row.locator("td").nth(1)
+        order_no = (await order_no_cell.inner_text()).strip()
+        await order_row.click(timeout=10000)
+        await page.wait_for_timeout(2000)
+
+        # Employee view (NOT Work Team -- that list is empty; see docstring point 2).
+        employee_toggle = page.get_by_text("Employee", exact=True).locator("visible=true").first
+        await employee_toggle.click(timeout=10000)
+        await page.wait_for_timeout(2000)
+        filter_link = page.get_by_text("Filter", exact=True).locator("visible=true").first
+        await filter_link.click(timeout=10000)
+        await page.wait_for_timeout(2000)
+
+        employee_checkbox_id = await page.evaluate(
+            """(name) => {
+                const label = [...document.querySelectorAll('label')]
+                  .find(l => l.textContent.trim() === name);
+                return label ? label.getAttribute('for') : null;
+            }""",
+            SCHEDULE_EMPLOYEE,
+        )
+        if not employee_checkbox_id:
+            logger.warning("Stage C: employee %r not found in the Filter checklist for %s",
+                            SCHEDULE_EMPLOYEE, wo)
+            return False
+        await page.locator(f'label[for="{employee_checkbox_id}"]').click(timeout=10000)
+        await page.wait_for_timeout(2000)
+        # Verify the checkbox actually toggled -- confirmed live (2026-08-25) that a text-based click
+        # here can report success while the box stays unchecked.
+        checked = await page.evaluate(
+            "(id) => document.getElementById(id)?.parentElement?.parentElement?"
+            ".querySelector('.ui-chkbox-icon')?.classList.contains('ui-icon-check')",
+            employee_checkbox_id,
+        )
+        if not checked:
+            logger.warning("Stage C: clicking %s's checkbox did not actually check it for %s",
+                            SCHEDULE_EMPLOYEE, wo)
+            return False
+        await filter_link.click(timeout=10000)
+        await page.wait_for_timeout(2000)
+
+        new_event_btn = page.locator('[id*="newEventButton"]').first
+        if not await new_event_btn.count():
+            logger.warning("Stage C: no 'add event' cell found for %s's row (%s)", SCHEDULE_EMPLOYEE, wo)
+            return False
+        await new_event_btn.click(timeout=10000)
+        await page.wait_for_timeout(3000)
+
+        job_date_str = payload.job_date.strftime("%d/%m/%Y")
+        remarks = f"{payload.nature_of_work} - {wo}"
+        await self._fill_labeled_input("From", job_date_str)
+        await page.wait_for_timeout(500)
+        await page.locator('button:has-text("Close")').first.click(timeout=5000)
+        await page.wait_for_timeout(1000)
+        await self._fill_labeled_input("To", job_date_str)
+        await page.wait_for_timeout(500)
+        await page.locator('button:has-text("Close")').first.click(timeout=5000)
+        await page.wait_for_timeout(1000)
+        await self._fill_labeled_input("Remarks", remarks)
+        await page.wait_for_timeout(1000)
+
+        # Time sub-fields last -- see docstring point 4. Located relationally: each date/time pair
+        # lives together in one .synfaces-grid-item (the div-based layout confirmed for this popup,
+        # NOT a <td> -- there is no <tr>/<td> anywhere in this dialog's markup). The date input
+        # (DD/MM/YYYY) and its sibling time input (HH:MM) share that same grid-item container.
+        # Uses Locator.fill(), not a raw JS value-setter -- confirmed elsewhere in this file
+        # (_fill_grid_field's docstring) that PrimeFaces cells can silently ignore a value set via a
+        # synthetic event and only reliably commit through Playwright's own fill().
+        for date_value, time_value in (("From", "08:00"), ("To", "08:30")):
+            time_input_id = await page.evaluate(
+                """(label) => {
+                    const norm = s => (s||'').replace(/\\s+/g,' ').trim();
+                    const host = [...document.querySelectorAll('td,div,span,label')]
+                      .find(e => e.children.length === 0 && norm(e.textContent) === label);
+                    const item = host && host.closest('.synfaces-grid-item');
+                    if (!item) return null;
+                    const inputs = [...item.querySelectorAll('input:not([type=hidden])')];
+                    const timeInput = inputs.find(i => !/\\//.test(i.value));
+                    return timeInput ? timeInput.id : null;
+                }""",
+                date_value,
+            )
+            if not time_input_id:
+                logger.warning("Stage C: could not locate the %s time field for %s", date_value, wo)
+                continue
+            await page.locator(f'[id="{time_input_id}"]').fill(time_value)
+            await page.wait_for_timeout(500)
+
+        confirm_btn = page.locator('button:has(span.fa-check)').first
+        if not await confirm_btn.count():
+            logger.warning("Stage C: no Event Details confirm button found for %s", wo)
+            return False
+        await confirm_btn.click(timeout=10000)
+        await page.wait_for_timeout(4000)
+
+        # The grid/selection can reset after the popup's ajax refresh -- re-select the order before
+        # looking for the (now separately-appearing) Submit action.
+        await filter_input.click()
+        await filter_input.fill(council_search)
+        await filter_input.press("Enter")
+        await page.wait_for_timeout(3000)
+        order_row2 = page.locator("tr", has_text=wo.replace("WO-PO/", "")).locator("visible=true").first
+        if await order_row2.count():
+            await order_row2.click(timeout=10000)
+            await page.wait_for_timeout(2000)
+
+        submit_btn = page.locator('button:has(span.fa-vote-yea)').locator("visible=true").first
+        if not await submit_btn.count():
+            logger.warning("Stage C: no Submit button found on Order Details for %s", wo)
+            return False
+        await submit_btn.click(timeout=10000)
+        await page.wait_for_timeout(1500)
+        yes_btn = page.get_by_role("button", name="Yes").locator("visible=true")
+        if await yes_btn.count():
+            await yes_btn.first.click(timeout=10000)
+        await page.wait_for_timeout(5000)
+
+        # Verify via "Upcoming Service" showing a new entry -- confirmed live this is the only signal
+        # that reflects real server-side persistence; the "not submitted" warning disappearing alone
+        # is NOT sufficient (it disappears one step earlier, at the popup's own checkmark).
+        upcoming = await page.locator("text=Upcoming Service").locator("visible=true").count()
+        if not upcoming:
+            logger.warning("Stage C: could not find 'Upcoming Service' panel to verify %s", wo)
+            return False
+        confirmed = await page.get_by_text(order_no, exact=False).locator("visible=true").count() > 0
+        if not confirmed:
+            logger.warning("Stage C: %s (%s) not found in Upcoming Service after submit", wo, order_no)
+            return False
+        logger.info("Stage C scheduled and submitted for %s (%s)", wo, order_no)
+        return True
 
     async def _submit_quotation(self, payload: WOPayload) -> str | None:
         """Submit the filled draft (DRY_RUN-gated). Returns the quotation ID if it can be read.
