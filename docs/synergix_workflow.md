@@ -621,3 +621,69 @@ finance-notification email, still correctly gated on a real, successful Fulfil a
 `QUO0006749`-`QUO0006753` confirmed → `SV00008852`-`SV00008855` (unscheduled, real). `QUO0006761`
 (`WO-PO/000076646`) submitted but NOT confirmed — missing Confirm button, needs the investigation
 above before it can be retried.
+
+## Session 5 (2026-08-26): re-testing the committed Stage C code found real bugs; one genuine
+## intermittent Synergix widget issue remains open
+
+Per the user's request, re-ran the newly-committed `_schedule_stage_c` end to end against real WOs
+(`scripts/run_stage_c_direct_test.py`, calling the driver method directly against an already
+Variation-Order-confirmed Service Order) to verify the code actually works, not just that it was
+written correctly from session notes. It did not, on the first attempt — writing the function from
+memory of the live discovery session had drifted from what actually worked. Nine live iterations
+found and fixed the following real bugs, each confirmed against actual DOM captures rather than
+guessed:
+
+1. **`_fill_labeled_input`'s `<tr>`-only lookup couldn't find the Event Details popup's fields at
+   all** (it uses a div-based `.synfaces-grid-item` layout, no `<tr>` ancestor exists in that
+   dialog). Fixed by widening the shared helper to try `.synfaces-grid-item` first, falling back to
+   `<tr>` — additive, the two pre-existing `<tr>`-based callers (Enquiry/Subject, Reference No.) are
+   unaffected.
+2. **The time-sub-field JS used `.closest('td')`**, but the popup has no `<td>` at all (same
+   div-based layout as #1). Rewritten to use `Locator.fill()` (not a raw JS value-setter — this
+   file's own established rule, see `_fill_grid_field`'s docstring) scoped to `.synfaces-grid-item`.
+3. **The Employee/Work Team toggle click can report success via a Playwright Locator while the
+   button visibly stays on "Work Team"** — confirmed repeatedly, not a one-off, across both
+   `get_by_text(exact=True)` and generic `text=` forms. Fixed by clicking the underlying `.ui-button`
+   div via `page.evaluate(...).click()` directly (bypassing Playwright's click/event simulation
+   entirely) and verifying `ui-state-active` before proceeding, retrying up to 3 times.
+4. **The toggle can drift back to "Work Team" between passing that check and the checkbox lookup**,
+   with no single action caught doing it. Fixed by re-asserting Employee is active on every poll
+   iteration of the checkbox search, not just once up front.
+5. **The Event Details popup's own confirm button (`button:has(span.fa-check)`) and the time-field
+   lookup both queried the WHOLE page**, and `fa-check`/label-text can collide with an unrelated,
+   hidden dialog's own button elsewhere on the page (confirmed live: a real crash where Playwright
+   waited 10s for a hidden `id="j_idt969"` "Yes" button from a completely different confirm dialog to
+   become visible). Both are now scoped to inside the Event Details dialog specifically, found via
+   `[role="dialog"]:has-text("Event Details")`.
+6. **The confirm click can leave the dialog open** (its modal overlay then blocks every subsequent
+   click for a full 30s timeout each). Now waits for the dialog to actually close, retrying the
+   confirm click once before giving up.
+7. **The Order Details "Submit" button can stay `disabled` immediately after re-selecting the order
+   row.** Now polls for it to become enabled, re-selecting the row once more if it doesn't.
+
+After all seven fixes, a live run got all the way through Employee-toggle, checklist, calendar
+click, and Event Details fill/confirm on `WO-PO/000076627` — the one failure at that point was
+Synergix's OWN validation, correctly rejecting a double-booking ("SV9104: 800SUPER: You can only
+book one task on the same Timeslot 23/04/2026 under current service order") against an
+already-scheduled record left over from an earlier session. That is the pipeline working correctly,
+not a bug.
+
+**One genuine, still-open issue**: re-testing immediately afterward against a completely clean WO
+(`WO-PO/000078228`, no prior booking on its date) failed again at the SAME employee-checklist step
+— this time with the Employee toggle correctly active (confirmed via screenshot) but the checklist
+itself still rendering empty. This means fix #3/#4 (verifying/re-asserting the TOGGLE's active
+state) is necessary but not sufficient — the checklist's own population is a separate, apparently
+still-intermittent failure mode not yet fixed. It has now been observed empty in at least four
+distinct live sessions across this project (session 2, session 4, and twice in session 5), each time
+resolving eventually after some combination of waiting, re-toggling, or a fresh page load, without a
+single reliable trigger identified. This is the same category of unexplained intermittency as
+Stage B.5's missing Confirm button (see above) — both are now known, open, safely-contained gaps
+(the pipeline reports PARTIAL with a clear reason rather than silently failing or crashing) rather
+than fully solved.
+
+**Not yet done**: root-cause the checklist-population intermittency (candidates: a slower ajax
+backend call than any wait tried so far, a session/browser-state factor, or a genuine Synergix
+front-end bug); retry Stage D's Fulfil submit (still untouched from the prior session, per the
+"Ground truth" note above); wire up the Attachments upload; write Stage D into `synergix_driver.py`
+as committed code once Stage C's remaining gap is resolved or explicitly accepted as a known
+limit.
