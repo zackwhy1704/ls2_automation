@@ -717,3 +717,56 @@ user's earlier explicit sign-off to test Fulfil without them first; write Stage 
 `synergix_driver.py` as committed driver code (this was manual discovery-script commands only, same
 gap noted for Stage C before it was committed); confirm exactly which downstream screen/status
 `SV00008852` landed in after leaving Service Order Performance's own list.
+
+## Session 6 (2026-08-26): Stage C fails 8/9 live attempts across 4 different WOs -- root cause is
+## deeper than any single selector
+
+Attempting to get a SECOND WO through Stage C (to unblock testing Stage D on a fresh order rather
+than the one already-completed `SV00008852`) surfaced that the employee-checklist/calendar issue is
+far more persistent than session 5's fixes addressed. Across `WO-PO/000078228`, `000076639`,
+`000076640` (multiple attempts each) and a re-run of `000078228`, only ONE Stage C attempt has ever
+succeeded in this project's history (`WO-PO/000076625`, the very first one tried). All 8 further
+attempts today failed, in three distinct failure shapes -- fixing each one uncovered the next:
+
+1. **Checklist stays empty** even through the forced Work-Team<->Employee refresh and a full
+   re-navigation (session 5's fixes) -- confirmed this is not always transient; it can persist
+   through the ENTIRE ~20s+ retry budget on a given attempt.
+2. Once the checklist error was fixed to move past that: the click on `[id*="newEventButton"]`
+   (unscoped, `.first`) was found to land on a DIFFERENT employee's row than the one just checked
+   (confirmed live via a "SV9104: 800SUPER: You can only book one task..." Synergix validation error
+   naming the wrong employee). Fixed by scoping the click to the specific `<tr>`s under the checked
+   employee's own `rowspan`-ed name cell, plus a new post-click check that the popup's own "Assigned"
+   dropdown actually shows the target employee, aborting cleanly (closing the dialog, returning
+   `False`) if not.
+3. Even with that fix in place: found live that the "Service Personnel" calendar section can render
+   with literally NO rows at all -- not even the wrong employee's row, nothing -- while the Employee
+   toggle sits correctly active and the checkbox search successfully finds and checks the target
+   employee. This is a THIRD, independent ajax call (checklist population, row rendering, and
+   apparently a click target that can still resolve to something even when no row is visibly
+   present) that can fail on its own. Added a dedicated poll for the employee's name cell to actually
+   appear in the calendar DOM before attempting any click on it.
+
+After all three fixes, re-tested three more times across two different WOs: one attempt still hit
+the original "wrong employee" abort (meaning the row-scoping fix's own row-boundary detection is
+not yet fully reliable either), and one hit the original empty-checklist failure again. **Net
+result: 0 successful Stage C completions in 9 live attempts this session**, despite each fix being a
+real, verifiable improvement over what came before (confirmed via distinct failure signatures at
+each stage, not the same crash recurring).
+
+**Conclusion**: this is very likely a genuine, non-deterministic issue in Synergix's own Schedule
+Board widget -- three separate, independently-flaky ajax populations (checklist, calendar rows, and
+whatever the click handler resolves to) stacked in sequence, each with its own failure window. No
+amount of additional client-side polling/retry logic tried so far has converged on a reliable fix.
+Per the user's explicit decision this session, further live debugging of Stage C was paused here in
+favour of writing Stage D as committed code and verifying it standalone (against the one Service
+Order that IS confirmed scheduled, `SV00008852`, already fulfilled -- so a fresh target will be
+needed) rather than continuing to burn time on Stage C convergence.
+
+**Recommendation for whoever picks this up next**: consider whether Stage C should have a
+much longer overall timeout with fewer, larger-grained retries (e.g. re-navigate + wait 15-20s
+fresh, rather than many short polls within one page load), since the fresh-navigation fallback was
+only tried ONCE per failure in this session's code, not looped. Also worth asking the client
+directly whether Synergix's Schedule Board is known internally to be slow/flaky under their own
+manual use -- if their own staff also see this, it may not be fixable from the automation side at
+all, and Stage C may need to stay a manual, best-effort step indefinitely (matching the original
+work order's own description of it as "most fragile").

@@ -2084,12 +2084,75 @@ class SynergixDriver:
         await filter_link.click(timeout=10000)
         await page.wait_for_timeout(2000)
 
-        new_event_btn = page.locator('[id*="newEventButton"]').first
-        if not await new_event_btn.count():
-            logger.warning("Stage C: no 'add event' cell found for %s's row (%s)", SCHEDULE_EMPLOYEE, wo)
+        # Confirmed live (2026-08-26) that the checkbox itself being checked does NOT guarantee the
+        # calendar's own "Service Personnel" rows have rendered yet -- these are separate ajax calls
+        # that can be independently slow/stuck. Poll for the employee's name cell to actually appear
+        # in the calendar before touching it; without this, the row-scoped click below finds nothing
+        # and either fails cleanly or (worse, seen live) matches stale content from a previous render.
+        calendar_row_ready = False
+        for _ in range(20):  # ~10s
+            calendar_row_ready = await page.evaluate(
+                "(name) => [...document.querySelectorAll('td.first_col')]"
+                ".some(td => td.textContent.trim() === name)",
+                SCHEDULE_EMPLOYEE,
+            )
+            if calendar_row_ready:
+                break
+            await page.wait_for_timeout(500)
+        if not calendar_row_ready:
+            logger.warning("Stage C: %s's row never appeared on the calendar for %s",
+                            SCHEDULE_EMPLOYEE, wo)
+            await self._screenshot(f"stage_c_no_calendar_row_{wo.replace('/', '-')}")
             return False
+
+        # Scoped to the employee's OWN row -- confirmed live (2026-08-26) that a bare
+        # [id*="newEventButton"] .first can land on a DIFFERENT employee's cell when more than one
+        # employee row is present (e.g. after the checklist-recovery retries above cause more than
+        # SCHEDULE_EMPLOYEE to end up checked/rendered). The name cell has rowspan spanning every
+        # hour-row for that employee; find the newEventButton inside one of those sibling <tr>s.
+        new_event_btn_id = await page.evaluate(
+            """(name) => {
+                const nameCell = [...document.querySelectorAll('td.first_col')]
+                  .find(td => td.textContent.trim() === name);
+                if (!nameCell) return null;
+                let row = nameCell.closest('tr');
+                for (let i = 0; i < (nameCell.rowSpan || 1); i++) {
+                    if (!row) break;
+                    const btn = row.querySelector('[id*="newEventButton"]');
+                    if (btn) return btn.id;
+                    row = row.nextElementSibling;
+                }
+                return null;
+            }""",
+            SCHEDULE_EMPLOYEE,
+        )
+        if not new_event_btn_id:
+            logger.warning("Stage C: no 'add event' cell found in %s's own row for %s",
+                            SCHEDULE_EMPLOYEE, wo)
+            return False
+        new_event_btn = page.locator(f'[id="{new_event_btn_id}"]')
         await new_event_btn.click(timeout=10000)
         await page.wait_for_timeout(3000)
+
+        # Verify the popup actually opened for the right employee -- confirmed live this can still
+        # land on a stale/wrong row even with the row-scoped click above (a defensive double-check,
+        # not proven necessary, but cheap and catches exactly the failure mode already seen once).
+        assigned_ok = await page.evaluate(
+            """(name) => {
+                const label = [...document.querySelectorAll('.ui-selectonemenu-label')]
+                  .find(l => l.getBoundingClientRect().width > 0);
+                return label ? label.textContent.trim() === name : false;
+            }""",
+            SCHEDULE_EMPLOYEE,
+        )
+        if not assigned_ok:
+            logger.warning("Stage C: Event Details popup opened for a different employee than %s "
+                            "for %s -- aborting", SCHEDULE_EMPLOYEE, wo)
+            await self._screenshot(f"stage_c_wrong_employee_{wo.replace('/', '-')}")
+            close_btn = page.locator('a.ui-dialog-titlebar-close[aria-label="Close"]').locator("visible=true").first
+            if await close_btn.count():
+                await close_btn.click(timeout=5000)
+            return False
 
         job_date_str = payload.job_date.strftime("%d/%m/%Y")
         remarks = f"{payload.nature_of_work} - {wo}"
