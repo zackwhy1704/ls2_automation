@@ -683,7 +683,37 @@ than fully solved.
 
 **Not yet done**: root-cause the checklist-population intermittency (candidates: a slower ajax
 backend call than any wait tried so far, a session/browser-state factor, or a genuine Synergix
-front-end bug); retry Stage D's Fulfil submit (still untouched from the prior session, per the
-"Ground truth" note above); wire up the Attachments upload; write Stage D into `synergix_driver.py`
-as committed code once Stage C's remaining gap is resolved or explicitly accepted as a known
-limit.
+front-end bug); wire up the Attachments upload; write Stage D into `synergix_driver.py` as committed
+code once Stage C's remaining gap is resolved or explicitly accepted as a known limit.
+
+## Stage D Fulfil submit: completed live (2026-08-26)
+
+Per the user's explicit request, retried the Fulfil submit on `SV00008852` from a fresh session
+(the earlier attempt this pull had died mid-click when the Synergix session expired, leaving the
+record untouched -- see the "Ground truth" note above). This time: opened the record, confirmed
+Actual Qty was still 0.00 (the Billables edit from the earlier attempt had NOT persisted, consistent
+with the session having expired before anything committed), re-filled it to 1.00 (recalculating
+correctly to 44.00 / 3.96 GST / 47.96 total, matching the WO's authorised amount), clicked the real
+Submit button (`title="Submit"`, id ending `submitButton`, icon `fa-vote-yea`), confirmed the
+resulting "Are you sure?" dialog with Yes, and waited a full 8s (longer than the previous attempt's
+wait, on the theory that impatience contributed to hitting the session-expiry window before).
+
+**Verified via ground truth, not just the absence of an error**: searched Service Order Performance
+directly for `SV00008852` with the Service Order Status filter set to **"All"** (not just the
+default "Pending For Performance" view) -- returned **"No records found."** The record has left this
+list entirely, in any status, and the list's own count dropped from 41 to 40. This is the strongest
+available signal within this screen that the Fulfil action genuinely completed and the order moved
+downstream (out of "requires performance action" -- consistent with progressing toward billing,
+though this session did not chase down which exact screen/status it landed in next, e.g. a Sales
+Order or Invoice view outside Service Order Performance's own scope).
+
+This is the first work order in this entire project to be confirmed live through all four stages:
+Stage A (WO retrieval) -> Stage B (quotation create+submit) -> Stage B.5 (Variation Order confirm)
+-> Stage C (Schedule Board assign+submit) -> Stage D (Fulfil submit) -- `WO-PO/000076625` /
+`QUO0006749` / `SV00008852`.
+
+**Not yet done**: Attachments (the WO PDF) were deliberately skipped again this attempt, per the
+user's earlier explicit sign-off to test Fulfil without them first; write Stage D into
+`synergix_driver.py` as committed driver code (this was manual discovery-script commands only, same
+gap noted for Stage C before it was committed); confirm exactly which downstream screen/status
+`SV00008852` landed in after leaving Service Order Performance's own list.
