@@ -491,7 +491,7 @@ class SynergixDriver:
                         logger.exception("Could not abort incomplete draft %s for %s â€” may need "
                                          "manual cleanup", draft_quo_id, payload.wo_po_number)
                 raise
-            quo_id = await self._submit_quotation(payload)
+            quo_id, vo_confirmed = await self._submit_quotation(payload)
             if settings.DRY_RUN:
                 # Schedule Board (C) and Fulfil (D) remain manual â€” done by the team in Synergix.
                 return WriteResult(
@@ -499,11 +499,15 @@ class SynergixDriver:
                     f"DRY_RUN: quotation draft {quo_id or '(id unread)'} created + filled, NOT submitted.",
                 )
             # Stage B.5: a submitted quotation sits in "Under Variation" and is NOT yet a schedulable
-            # Service Order until this is confirmed -- see _confirm_variation_order's docstring.
-            # Best-effort: a failure here still leaves a real, submitted quotation (just requires a
-            # human to confirm the VO manually), not a lost WO.
-            vo_confirmed = False
-            if quo_id:
+            # Service Order until this is confirmed. _submit_quotation already attempts this inline
+            # (matching the client's actual flow -- see its docstring) -- only fall back to the older
+            # navigate-to-"Under Variation"-and-reopen path if that didn't already succeed. Confirmed
+            # live (2026-08-27) that a successfully-confirmed quotation can still show under "Under
+            # Variation" on a fresh reopen, so re-running the fallback unconditionally risks clicking
+            # Confirm a second time on an already-confirmed record -- untested territory, avoided here.
+            # Best-effort either way: a failure leaves a real, submitted quotation (just requires a
+            # human to confirm the VO manually).
+            if quo_id and not vo_confirmed:
                 try:
                     vo_confirmed = await self._confirm_variation_order(quo_id)
                 except Exception:
@@ -1776,8 +1780,9 @@ class SynergixDriver:
         immediately appeared in Schedule Board's Unscheduled Service Orders grid (count 44 -> 45).
 
         Without this step, Stage C automation has nothing to act on -- there is no Service Order to
-        schedule. Returns whether the confirm was observed to succeed (the info-banner toast, or the
-        quotation no longer appearing under "Under Variation" afterward).
+        schedule. Returns whether the confirm was observed to succeed, verified via the SA0005
+        info-banner toast ("Service Order No.: SV... is created successfully") -- NOT via the
+        quotation leaving "Under Variation", which is not a reliable signal (see below).
         """
         assert self.page is not None
         page = self.page
@@ -1849,44 +1854,32 @@ class SynergixDriver:
         await confirm_btn.click(timeout=10000)
         await page.wait_for_timeout(2000)
         yes_btn = page.get_by_role("button", name="Yes").locator("visible=true")
-        if await yes_btn.count():
-            await yes_btn.first.click(timeout=10000)
-        else:
+        if not await yes_btn.count():
             logger.warning("_confirm_variation_order: no visible 'Yes' button after Confirm on %s",
                             quotation_no)
             await self._screenshot(f"vo_confirm_no_yes_button_{quotation_no}")
-        await page.wait_for_timeout(6000)
+            return False
+        await yes_btn.first.click(timeout=10000)
 
-        # Verify: the quotation should no longer be sitting under "Under Variation".
-        await self._open_service_quotation_list()
-        if not await self._select_quotation_status_tab("Under Variation"):
-            logger.warning("_confirm_variation_order: could not re-open 'Under Variation' to "
-                            "verify %s", quotation_no)
+        # Verify via the SA0005 success toast, NOT via the quotation leaving "Under Variation".
+        # Confirmed live (2026-08-27) on QUO0006787: the toast "SA0005: Service Order No.:
+        # SV00008873 is created successfully." fired and a real Service Order was created (verified
+        # separately in Schedule Board), but the quotation STILL showed in "Under Variation" (badge
+        # count even went up, 102->103) on every recheck afterward, including after a full
+        # navigate-away-and-back cycle. The "no longer under Under Variation" check used previously
+        # was therefore a false negative that mislabelled genuine successes as PARTIAL failures on
+        # every WO run that day. This toast is the reliable signal instead.
+        try:
+            toast = page.locator("text=/SA0005.*Service Order No\\.?:?\\s*SV\\d+.*created successfully/i")
+            await toast.wait_for(state="visible", timeout=8000)
+            toast_text = await toast.first.inner_text()
+            logger.info("Confirmed Variation Order for %s -- %s", quotation_no, toast_text.strip())
+            return True
+        except Exception:
+            logger.warning("_confirm_variation_order: no SA0005 success toast seen for %s after "
+                            "Confirm+Yes", quotation_no)
+            await self._screenshot(f"vo_confirm_no_toast_{quotation_no}")
             return False
-        header2 = page.locator("th:visible", has_text="Quotation No.").first
-        filter_input2 = header2.locator("input.ui-column-filter").first
-        await filter_input2.click()
-        await filter_input2.fill(quotation_no)
-        await filter_input2.press("Enter")
-        await page.wait_for_timeout(3000)
-        still_there = await page.get_by_text(quotation_no, exact=True).locator("visible=true").count() > 0
-        if still_there:
-            # Recheck once before declaring failure -- confirmed live (2026-08-25) that this list
-            # can take longer than the wait above to drop a just-confirmed record, and re-opening the
-            # list too early read a stale grid. Same defensive pattern as _verify_and_refill_rows.
-            await page.wait_for_timeout(4000)
-            await filter_input2.click()
-            await filter_input2.fill(quotation_no)
-            await filter_input2.press("Enter")
-            await page.wait_for_timeout(3000)
-            still_there = await page.get_by_text(quotation_no, exact=True).locator("visible=true").count() > 0
-        if still_there:
-            logger.warning("_confirm_variation_order: %s still under 'Under Variation' after "
-                            "Confirm+Yes (confirmed on recheck)", quotation_no)
-            await self._screenshot(f"vo_confirm_still_present_{quotation_no}")
-            return False
-        logger.info("Confirmed Variation Order for %s -- Service Order created", quotation_no)
-        return True
 
     async def _open_schedule_board(self) -> None:
         """Navigate (logged in) to General Service -> Schedule Board - LS2.
@@ -1958,7 +1951,14 @@ class SynergixDriver:
 
         # Match the order row by its Enquiry/Subject text containing the WO-PO number -- the same
         # text Stage B wrote into the quotation's Subject, carried through to the Service Order.
+        # Confirmed live (2026-08-27) on WO-PO/000077662: the row genuinely existed (verified
+        # manually moments later, same filter) but was not yet rendered at the 3s mark -- poll a
+        # few more times before giving up, same flicker-tolerance pattern used throughout this file.
         order_row = page.locator("tr", has_text=wo.replace("WO-PO/", "")).locator("visible=true").first
+        for _ in range(4):  # ~6s more on top of the initial 3s wait
+            if await order_row.count():
+                break
+            await page.wait_for_timeout(1500)
         if not await order_row.count():
             logger.warning("Stage C: no Schedule Board order found for %s (searched customer %r)",
                             wo, council_search)
@@ -2516,18 +2516,36 @@ class SynergixDriver:
         logger.info("Stage D fulfilled and submitted for %s (%s)", wo, order_no)
         return True
 
-    async def _submit_quotation(self, payload: WOPayload) -> str | None:
-        """Submit the filled draft (DRY_RUN-gated). Returns the quotation ID if it can be read.
+    async def _submit_quotation(self, payload: WOPayload) -> tuple[str | None, bool]:
+        """Submit the filled draft (DRY_RUN-gated), then immediately Confirm the Variation Order
+        on the SAME page. Returns (quotation ID if it can be read, whether the inline confirm
+        succeeded -- callers should skip re-running _confirm_variation_order's fallback path if so,
+        since re-clicking Confirm on an already-confirmed record is unverified territory).
 
-        In DRY_RUN the Submit click is skipped and logged. Otherwise it clicks Submit and confirms any
-        follow-up dialog. The quotation ID (QUO...) is read from the form title bar either way.
+        Confirmed live (2026-08-27) via frame-by-frame review of the client's own screen recording
+        (JBTC WO Synergix.mp4): the client does NOT navigate away to a separate "Under Variation"
+        list to confirm the VO. They stay on the just-submitted quotation record. Right after the
+        "Confirm Submit?" Yes click, the SAME toolbar grows a new icon (title="Confirm", the
+        fa-check-double checkmark, positioned after the pencil/edit icon) -- clicking it raises a
+        second "Are you sure?" dialog, and clicking Yes on THAT produced the toast "SA0005: Service
+        Order No.: SV00008851 is created successfully." -- one continuous flow, no re-navigation.
+
+        This replaces the earlier approach (_confirm_variation_order navigating to Service
+        Quotation -> "Under Variation" tab -> re-filtering -> re-opening the record from scratch),
+        which is very likely WHY the Confirm button was intermittently "missing": re-opening the
+        record via a fresh list navigation is a different code path/render timing than staying on
+        the page, and is not what a human actually does. _confirm_variation_order is kept as a
+        best-effort FALLBACK below, in case the inline Confirm icon genuinely isn't there yet.
+
+        In DRY_RUN the Submit click is skipped and logged. Otherwise it clicks Submit, confirms the
+        dialog, then immediately looks for and clicks the inline Confirm icon + its own dialog.
         """
         assert self.page is not None
         page = self.page
         quo_id = await self._current_quotation_id()
 
         if _dry_guard(f"submit quotation for {payload.wo_po_number} (draft {quo_id})"):
-            return quo_id  # DRY_RUN: left as a draft
+            return quo_id, False  # DRY_RUN: left as a draft, VO not confirmed
 
         await page.locator("button:has(span.fa-vote-yea)").first.click()
         await page.wait_for_timeout(3000)
@@ -2539,7 +2557,40 @@ class SynergixDriver:
                 break
         await page.wait_for_timeout(8000)
         logger.info("Submitted quotation %s for %s", quo_id, payload.wo_po_number)
-        return quo_id
+
+        # Inline Variation Order confirm -- see docstring. Best-effort: a miss here still leaves a
+        # real, submitted quotation for _confirm_variation_order (or a human) to pick up.
+        vo_confirmed = False
+        try:
+            confirm_icon = page.locator('[title="Confirm"]').locator("visible=true").first
+            await confirm_icon.wait_for(state="visible", timeout=6000)
+            await confirm_icon.click(timeout=5000)
+            await page.wait_for_timeout(1500)
+            yes_btn = page.get_by_role("button", name="Yes").locator("visible=true")
+            if await yes_btn.count():
+                await yes_btn.first.click(timeout=5000)
+                # Same SA0005 toast signal as _confirm_variation_order -- see that method's
+                # docstring for why "quotation left Under Variation" is NOT used here.
+                toast = page.locator("text=/SA0005.*Service Order No\\.?:?\\s*SV\\d+.*created successfully/i")
+                try:
+                    await toast.wait_for(state="visible", timeout=8000)
+                    vo_confirmed = True
+                    logger.info("Inline Variation Order confirm succeeded for %s (quotation %s)",
+                                payload.wo_po_number, quo_id)
+                except Exception:
+                    logger.warning("Inline Confirm+Yes clicked but no SA0005 toast seen for %s "
+                                    "(quotation %s) -- falling back to _confirm_variation_order",
+                                    payload.wo_po_number, quo_id)
+            else:
+                logger.warning("Inline Confirm icon found but no 'Are you sure?' Yes button for "
+                                "%s (quotation %s) -- falling back to _confirm_variation_order",
+                                payload.wo_po_number, quo_id)
+        except Exception:
+            logger.warning("Inline Confirm icon not found right after Submit for %s (quotation "
+                            "%s) -- falling back to _confirm_variation_order", payload.wo_po_number,
+                            quo_id)
+            await self._screenshot(f"inline_confirm_missing_{(quo_id or 'unknown')}")
+        return quo_id, vo_confirmed
 
     async def _current_quotation_id(self) -> str | None:
         """Read the QUO id from the form title bar (e.g. 'Service Quotation - LS2 [QUO0006225]')."""

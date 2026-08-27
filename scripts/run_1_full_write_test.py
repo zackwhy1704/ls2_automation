@@ -17,7 +17,7 @@ from src.models import WOStatus
 from src.synergix_driver import SynergixDriver
 from src.validator import build_remarks, check_extraction_trust, resolve_project_code, validate
 
-PDF_PATH = "data/samples/JBTC/78229.pdf"
+PDF_PATH = "data/pdfs/WO-PO-000077662.pdf"
 
 
 async def main() -> None:

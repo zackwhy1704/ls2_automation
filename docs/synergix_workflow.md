@@ -812,3 +812,51 @@ Service Order (`SV00008856` / `SV00008852` earlier), not a draft, with every ste
 verified via ground truth rather than an absence of errors. Stage C's underlying flakiness
 (documented above) is unchanged and still best-effort; the checkbox fix here only addresses the
 Submit-button-stays-disabled failure mode, not the checklist/calendar-row rendering intermittency.
+
+## Session 7 (2026-08-26/27): Stage B.5 false-negative root-caused and fixed; full A-D re-verified
+
+After the session 6 fixes above, two full 5-WO batches were run live (`DRY_RUN=false`) to test
+routine batch volume. **Both batches went 5/5 PARTIAL, every WO stuck at Stage B.5** -- a regression
+from session 6's Stage B.5 working reliably. Every failure had the identical signature:
+`_confirm_variation_order` found the Confirm button, clicked it, found and clicked Yes, but its own
+post-click verification (re-opening "Under Variation" and checking the quotation was no longer
+listed) still found the quotation present, so it returned `False`.
+
+**Root-caused by comparing against the client's own screen recording** (`JBTC WO Synergix.mp4`,
+frame-by-frame via OpenCV) and by adding diagnostic screenshots at each step of the confirm
+sequence (`vo_confirm_button_found`, `vo_after_confirm_click`, `vo_after_yes_click` -- since removed
+after the fix landed). The screenshot taken immediately after the Yes click on `QUO0006787` showed
+the real toast: **"SA0005: Service Order No.: SV00008873 is created successfully."** -- the exact
+same success signal documented in session 2 as proof of a genuine confirm. Manually checking
+Schedule Board confirmed a real Service Order (`SV00008874` for a different WO tested the same way)
+existed and was fully functional. Yet the quotation genuinely, reproducibly remained visible under
+"Under Variation" (badge count even increased, 102->103) on every recheck afterward, including
+after a full fresh navigate-away-and-back cycle -- not a rendering delay, a real and permanent
+UI state in this environment.
+
+**Conclusion**: "the quotation leaves Under Variation" is NOT a reliable signal that Confirm
+succeeded in this Synergix environment, despite being exactly what session 2 originally observed
+and built the check around. The SA0005 toast is the correct signal instead. **Fixed** in
+`_confirm_variation_order` (`src/synergix_driver.py`): the verification step now waits for and reads
+the SA0005 toast text directly, rather than re-querying "Under Variation". This was a client-code
+bug (a false negative), not a Synergix bug -- Stage B.5 itself was never actually broken.
+
+Separately, while manually finishing Stage C+D on a WO already confirmed via the fixed logic
+(`WO-PO/000077662` -> `QUO0006788` -> `SV00008874`), `_schedule_stage_c`'s own order-row lookup also
+returned a false negative once ("no Schedule Board order found") even though the row was proven,
+moments later via the identical filter, to genuinely exist. **Fixed**: the row lookup now polls up
+to ~6s past the initial 3s wait before giving up, same flicker-tolerance pattern used elsewhere in
+this file, rather than a single fixed wait.
+
+**Full pipeline re-verified live end-to-end after both fixes**, entirely manually (Stage C's
+checklist/calendar-row flakiness from session 6 is unrelated and unchanged, so this WO was driven
+manually rather than via `_schedule_stage_c` directly): `WO-PO/000077662` -> `QUO0006788` (Stage B)
+-> `SV00008874` created via Confirm+Yes, SA0005 toast (Stage B.5) -> scheduled to TAN WEI YING on
+08/05/2026, appeared in "Upcoming Service" (Stage C) -> Billables Actual Qty set 3.00, Total After
+Tax recalculated to $215.82 matching the WO's Grand Total exactly, Submit confirmed, verified gone
+from Service Order Performance under "All" status (Stage D). Every step confirmed via ground truth,
+not absence-of-error.
+
+**Still open**: Stage C's checklist/calendar-row rendering intermittency (documented session 6) is
+unchanged -- `_schedule_stage_c` as committed code has not been re-tested end-to-end since these
+fixes; only the manual path was re-verified this session.

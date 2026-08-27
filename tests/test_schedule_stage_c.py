@@ -46,7 +46,7 @@ def _driver_ready_for_stage_c(quo_id: str = "QUO0006749") -> SynergixDriver:
     d.login = AsyncMock(return_value=None)
     d._stage_b_create_quotation = AsyncMock(return_value=None)
     d._assert_details_filled = AsyncMock(return_value=None)
-    d._submit_quotation = AsyncMock(return_value=quo_id)
+    d._submit_quotation = AsyncMock(return_value=(quo_id, False))
     d._confirm_variation_order = AsyncMock(return_value=True)
     d._back_to_home = AsyncMock(return_value=None)
     return d
