@@ -2224,16 +2224,56 @@ class SynergixDriver:
             logger.warning("Stage C: no 'add event' cell found in %s's own row for %s",
                             SCHEDULE_EMPLOYEE, wo)
             return False
+        # Confirmed live (2026-08-28): document.elementFromPoint at this button's own (scrolled-
+        # into-view) coordinates resolved to a <div class="blockUI blockOverlay">, not the button --
+        # a pending-ajax "please wait" mask (from the checkbox's own onchange round-trip and/or the
+        # calendar row's render) was still covering it. Playwright's click sometimes reports success
+        # anyway (its actionability check can pass moments before the overlay reappears for the next
+        # ajax call) while the click itself lands on the mask, opening nothing. This is exactly what
+        # _click_when_clear exists for elsewhere in this file -- reuse it here.
         new_event_btn = page.locator(f'[id="{new_event_btn_id}"]')
-        await new_event_btn.click(timeout=10000)
-        await page.wait_for_timeout(3000)
+        await self._click_when_clear(new_event_btn, timeout_ms=10000)
+
+        # Confirmed live (2026-08-28): the "Event Details" dialog takes ~8s to actually render
+        # (console showed "ajaxStatus onstart" immediately but no dialog for several seconds, then
+        # "loadDeferredContents" logs right as the dialog appeared at the 8s mark) -- a fixed 3s
+        # wait here was checking before the dialog existed at all, which is indistinguishable from
+        # "opened for the wrong employee" if the verification below isn't scoped to the dialog
+        # itself. Poll instead of guessing a fixed duration.
+        event_dialog_visible = False
+        for _ in range(20):  # ~10s
+            event_dialog_visible = await page.evaluate(
+                """() => [...document.querySelectorAll('.ui-dialog')].some(d => {
+                    const r = d.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0 &&
+                           d.querySelector('.ui-dialog-title')?.textContent?.trim() === 'Event Details';
+                })"""
+            )
+            if event_dialog_visible:
+                break
+            await page.wait_for_timeout(500)
+        if not event_dialog_visible:
+            logger.warning("Stage C: Event Details dialog never appeared for %s after clicking "
+                            "%s's calendar cell", wo, SCHEDULE_EMPLOYEE)
+            await self._screenshot(f"stage_c_no_event_dialog_{wo.replace('/', '-')}")
+            return False
 
         # Verify the popup actually opened for the right employee -- confirmed live this can still
         # land on a stale/wrong row even with the row-scoped click above (a defensive double-check,
         # not proven necessary, but cheap and catches exactly the failure mode already seen once).
+        # Scoped to the visible "Event Details" dialog specifically (not page-wide) -- confirmed
+        # live (2026-08-28) that a page-wide search for the first visible .ui-selectonemenu-label
+        # can match an unrelated dropdown elsewhere on the page (e.g. the header's company
+        # switcher) while the real dialog is still rendering, producing a false "wrong employee".
         assigned_ok = await page.evaluate(
             """(name) => {
-                const label = [...document.querySelectorAll('.ui-selectonemenu-label')]
+                const dialog = [...document.querySelectorAll('.ui-dialog')].find(d => {
+                    const r = d.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0 &&
+                           d.querySelector('.ui-dialog-title')?.textContent?.trim() === 'Event Details';
+                });
+                if (!dialog) return false;
+                const label = [...dialog.querySelectorAll('.ui-selectonemenu-label')]
                   .find(l => l.getBoundingClientRect().width > 0);
                 return label ? label.textContent.trim() === name : false;
             }""",
@@ -2328,9 +2368,24 @@ class SynergixDriver:
 
         # The grid/selection can reset after the popup's ajax refresh -- re-select the order before
         # looking for the (now separately-appearing) Submit action.
-        await _filter_orders_by_wo()
-        order_row2 = page.locator("tr", has_text=wo_bare).locator("visible=true").first
-        if await order_row2.count():
+        # Confirmed live (2026-08-28): the Event Details submit's ajax reset was bigger than
+        # expected once -- not just page 1 / filter cleared (as already documented), but the grid's
+        # own Enquiry/Subject header did not resolve on the FIRST re-filter attempt right after the
+        # popup closed (the panel was still mid-reflow), so the fill() landed on nothing and the
+        # grid was left showing its unfiltered default. That mattered here because the Order Details
+        # panel on the right kept showing our order (the schedule itself DID commit -- confirmed via
+        # "TAN WEI YING 14/07/2026 - 14/07/2026" appearing under Order Details' own Schedule
+        # section), so the only visible symptom was Submit staying disabled with no other error --
+        # order_row2 was simply empty, so _tick_row_checkbox never got a checkbox to click. Retry the
+        # filter once, giving the reflow more time, before concluding the order truly isn't there.
+        order_row2 = None
+        for _ in range(2):
+            await _filter_orders_by_wo()
+            order_row2 = page.locator("tr", has_text=wo_bare).locator("visible=true").first
+            if await order_row2.count():
+                break
+            await page.wait_for_timeout(2000)
+        if order_row2 is not None and await order_row2.count():
             await order_row2.click(timeout=10000)
             await page.wait_for_timeout(2000)
 
