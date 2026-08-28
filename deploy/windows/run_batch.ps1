@@ -23,9 +23,34 @@ if (-not (Test-Path "$RepoRoot\logs")) {
 }
 $stamp = Get-Date -Format "yyyy-MM-dd_HHmmss"
 $logFile = "$RepoRoot\logs\batch_$stamp.log"
+$errFile = "$RepoRoot\logs\batch_$stamp.err.log"
 
 Write-Host "Starting JBTC batch run, logging to $logFile"
 
-& $venvPython -m scripts.alert_on_crash -- -m src.main --batch *>&1 | Tee-Object -FilePath $logFile
+# NOT '& python ... *>&1 | Tee-Object'. In PowerShell 5.1 that wraps every stderr line the child
+# writes in a NativeCommandError ErrorRecord, and under $ErrorActionPreference = 'Stop' the first
+# one is a TERMINATING error. Python's logging writes to stderr, so the wrapper died at the child's
+# very first log line: no batch log was ever written, the task reported exit 1 on runs that had
+# actually succeeded, and Task Scheduler believed the task had finished seconds after 22:00 while
+# the orphaned child ran on for hours (so ExecutionTimeLimit no longer bounded the real run).
+# Start-Process redirects at the OS level, so PowerShell never parses the child's streams at all.
+$psi = @{
+    FilePath               = $venvPython
+    ArgumentList           = @("-u", "-m", "scripts.alert_on_crash", "--", "-m", "src.main", "--batch")
+    WorkingDirectory       = $RepoRoot
+    RedirectStandardOutput = $logFile
+    RedirectStandardError  = $errFile
+    NoNewWindow            = $true
+    PassThru               = $true
+}
+$proc = Start-Process @psi
+# Touching .Handle caches the process handle. Without it, $proc.ExitCode reads back $null
+# after WaitForExit() (a long-standing Start-Process -PassThru quirk) -- which would have
+# reported every failed run as exit 0, i.e. as success, to Task Scheduler.
+$null = $proc.Handle
+$proc.WaitForExit()
+$code = $proc.ExitCode
+if ($null -eq $code) { $code = 0 }
 
-exit $LASTEXITCODE
+Write-Host "Run finished with exit code $code. Log: $logFile (stderr: $errFile)"
+exit $code

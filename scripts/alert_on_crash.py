@@ -13,6 +13,7 @@ Usage:
 """
 from __future__ import annotations
 
+import collections
 import subprocess
 import sys
 import urllib.request
@@ -47,26 +48,34 @@ def main() -> None:
 
     from config import settings  # imported late: a broken .env shouldn't block --help etc.
 
-    # Capture stderr so its tail can ride in the Telegram alert, but still stream it live to our own
-    # stderr (inherited by the caller's log redirect) so nothing is lost from the on-host log file.
-    result = subprocess.run(
-        [sys.executable, *child_args], stderr=subprocess.PIPE, text=True,
+    # Stream the child's stderr through as it arrives, keeping only a bounded tail for the alert.
+    # This used to be subprocess.run(stderr=PIPE), whose docstring claim of streaming "live" was
+    # wrong: it buffered the WHOLE run in memory and wrote it out only after the child exited. On a
+    # 4-hour batch that meant the on-host log stayed empty until the very end, and a run that was
+    # killed, timed out, or lost to a reboot took all of its stderr with it -- precisely the cases
+    # the alerter exists for. A deque bounds the memory to the lines the alert can actually use.
+    proc = subprocess.Popen(
+        [sys.executable, *child_args], stderr=subprocess.PIPE, text=True, bufsize=1,
     )
-    if result.stderr:
-        sys.stderr.write(result.stderr)
+    tail_buf: collections.deque[str] = collections.deque(maxlen=_TAIL_LINES)
+    assert proc.stderr is not None  # guaranteed by stderr=PIPE
+    for line in proc.stderr:
+        sys.stderr.write(line)
+        sys.stderr.flush()  # unbuffered, so the redirected log file is useful mid-run
+        tail_buf.append(line.rstrip())
+    returncode = proc.wait()
 
-    if result.returncode != 0:
+    if returncode != 0:
         token = settings.TELEGRAM_BOT_TOKEN
         chat_id = settings.TELEGRAM_CHAT_ID
-        tail_lines = (result.stderr or "").strip().splitlines()[-_TAIL_LINES:]
-        tail = "\n".join(tail_lines)
+        tail = "\n".join(tail_buf).strip()
         headline = (
             "\U0001F510 ls2_automation LOGIN FAILURE"
             if any(marker in tail for marker in _LOGIN_FAILURE_MARKERS)
             else "\U0001F6A8 ls2_automation run CRASHED"
         )
         message = (
-            f"{headline} (exit code {result.returncode}). "
+            f"{headline} (exit code {returncode}). "
             f"Command: {' '.join(child_args)!r}.\n\n{tail or '(no stderr captured — check logs on host)'}"
         )
         if token and chat_id:
@@ -74,7 +83,7 @@ def main() -> None:
         else:
             print("alert_on_crash: TELEGRAM_BOT_TOKEN/CHAT_ID not set, cannot alert:", message, file=sys.stderr)
 
-    sys.exit(result.returncode)
+    sys.exit(returncode)
 
 
 if __name__ == "__main__":
