@@ -2108,15 +2108,23 @@ class SynergixDriver:
         if not employee_checkbox_id:
             # Last resort: a full re-navigation, not just re-toggling within the same page load.
             # Confirmed live (2026-08-26) that toggling Work Team<->Employee repeatedly within one
-            # page load did NOT recover an empty checklist -- unlike the Stage B.5 Confirm-button
-            # gap, this has not been proven to be helped by a reload either, but it costs one extra
-            # nav + re-select before giving up entirely.
-            logger.warning("Stage C: employee checklist still empty for %s after in-page retries -- "
-                            "trying a full re-navigation", wo)
-            await self._open_schedule_board()
-            await _filter_orders_by_wo()
-            order_row3 = page.locator("tr", has_text=wo_bare).locator("visible=true").first
-            if await order_row3.count():
+            # page load did NOT recover an empty checklist. Confirmed live (2026-08-28), in a
+            # careful step-by-step diagnostic session: a full re-navigation CAN recover it -- the
+            # checklist populated (found SCHEDULE_EMPLOYEE's checkbox) on a re-navigation attempt
+            # after the in-page retries and one earlier re-navigation had both come back empty.
+            # This matches docs/synergix_workflow.md session 6's own conclusion (2026-08-26): the
+            # checklist/calendar-row population is a genuinely flaky Synergix-side ajax, not
+            # something any fixed client-side sequence reliably triggers -- and its own explicit
+            # recommendation for whoever picked this up next was to loop the re-navigation fallback
+            # rather than trying it once, which the code never actually did until now.
+            for renav_attempt in range(1, 4):
+                logger.warning("Stage C: employee checklist still empty for %s -- full "
+                                "re-navigation attempt %d/3", wo, renav_attempt)
+                await self._open_schedule_board()
+                await _filter_orders_by_wo()
+                order_row3 = page.locator("tr", has_text=wo_bare).locator("visible=true").first
+                if not await order_row3.count():
+                    continue
                 await order_row3.click(timeout=10000)
                 await page.wait_for_timeout(2000)
                 await _mouse_click_ui_button("Employee")
@@ -2128,12 +2136,25 @@ class SynergixDriver:
                     if employee_checkbox_id:
                         break
                     await page.wait_for_timeout(500)
+                if employee_checkbox_id:
+                    break
         if not employee_checkbox_id:
             logger.warning("Stage C: employee %r not found in the Filter checklist for %s "
                             "after waiting, forced refreshes, and a re-navigation", SCHEDULE_EMPLOYEE, wo)
             await self._screenshot(f"stage_c_no_employee_{wo.replace('/', '-')}")
             return False
-        await page.locator(f'label[for="{employee_checkbox_id}"]').click(timeout=10000)
+        # Confirmed live (2026-08-28): the checkbox's real <input> is wrapped in a
+        # ui-helper-hidden-accessible div (PrimeFaces' standard a11y pattern) and has a genuine
+        # onchange="PrimeFaces.ab(...)" handler -- but the VISIBLE, actually-clickable element is
+        # the sibling .ui-chkbox-box div. label[for=...] can relay a native click to the hidden
+        # input's 'click'/'checked' state without necessarily running PrimeFaces' own JS-bound
+        # handler on .ui-chkbox-box, which is what fires the ajax and updates the visible icon
+        # class -- the same visual-state-vs-real-handler mismatch found earlier in this method for
+        # the Employee/Work Team toggle and the "Filter" link. Click the box itself instead.
+        checkbox_box = page.locator(f'input[id="{employee_checkbox_id}"]').locator(
+            "xpath=ancestor::div[contains(@class,'ui-chkbox')][1]//div[contains(@class,'ui-chkbox-box')]"
+        )
+        await checkbox_box.click(timeout=10000)
         await page.wait_for_timeout(2000)
         # Verify the checkbox actually toggled -- confirmed live (2026-08-25) that a text-based click
         # here can report success while the box stays unchecked.
@@ -2146,8 +2167,16 @@ class SynergixDriver:
             logger.warning("Stage C: clicking %s's checkbox did not actually check it for %s",
                             SCHEDULE_EMPLOYEE, wo)
             return False
-        await filter_link.click(timeout=10000)
-        await page.wait_for_timeout(2000)
+
+        # Confirmed live (2026-08-28): re-clicking "Filter" here (as if to close the panel) is not
+        # just unnecessary -- it actively breaks this. The checkbox's own <input> has a real
+        # onchange="PrimeFaces.ab(...)" handler that submits an ajax round-trip; re-clicking Filter
+        # immediately afterward fires a SECOND ajax call (the same one that opens the panel) which
+        # can complete first and re-render the checkbox section from whatever the server's state was
+        # at THAT moment -- overwriting our just-checked box back to unchecked before its own
+        # round-trip lands. Verified in isolation: without this second click, the checkbox stays
+        # checked and the calendar row is visible within 1s; with it, the checkbox flips back and
+        # the row never renders. The calendar row does not need the panel closed to appear.
 
         # Confirmed live (2026-08-26) that the checkbox itself being checked does NOT guarantee the
         # calendar's own "Service Personnel" rows have rendered yet -- these are separate ajax calls
