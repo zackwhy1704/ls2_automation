@@ -1941,50 +1941,105 @@ class SynergixDriver:
 
         await self._open_schedule_board()
 
-        council_search = _PROJECT_SITE_SEARCH_JBTC if is_jbtc(payload.town_council) else _PROJECT_SITE_SEARCH_SKTC
-        header = page.locator("th:visible", has_text="Customer").first
-        filter_input = header.locator("input.ui-column-filter").first
-        await filter_input.click()
-        await filter_input.fill(council_search)
-        await filter_input.press("Enter")
-        await page.wait_for_timeout(3000)
+        wo_bare = wo.replace("WO-PO/", "")
 
-        # Match the order row by its Enquiry/Subject text containing the WO-PO number -- the same
-        # text Stage B wrote into the quotation's Subject, carried through to the Service Order.
+        async def _filter_orders_by_wo() -> None:
+            # Filter the grid's own Enquiry/Subject column by the bare WO number -- the same text
+            # Stage B wrote into the quotation's Subject, carried through to the Service Order.
+            # Confirmed live (2026-08-28) on WO-PO/000080788: this alone narrows the grid to exactly
+            # the one target row, at the grid's default page size.
+            #
+            # Superseded by this: filtering by Customer (council name) instead, which needed a
+            # second fix to also raise the grid's page size, since a council with more than 5
+            # unscheduled orders otherwise hides a freshly-created one (it sorts onto a later page,
+            # never page 1). Confirmed live (2026-08-28) on the SAME WO: raising the page size to 200
+            # then broke a LATER step in this same method -- the order grid became tall enough that
+            # its own paginator footer visually overlapped the calendar/Employee-filter pane below
+            # it, and the increased DOM size also seemed to slow the ajax that populates the Employee
+            # checklist, which then failed even after a full re-navigation retried the same approach.
+            # Filtering by WO number avoids the whole page-size problem instead of working around it.
+            header = page.locator("th:visible", has_text="Enquiry/Subject").first
+            filter_input = header.locator("input.ui-column-filter").first
+            await filter_input.click()
+            await filter_input.fill(wo_bare)
+            await filter_input.press("Enter")
+            await page.wait_for_timeout(3000)
+
+        async def _click_filter_link() -> bool:
+            # Confirmed live (2026-08-28): querying generic 'span, a' alongside 'span.ui-button-text'
+            # found a DECOY first -- an unrelated <span class="synfaces-float-left"> sitting at the
+            # exact same on-screen position as the real "Filter" link, matched by document order
+            # rather than by which selector in the list found it. .closest('a, button, div.ui-button')
+            # on that decoy found no real button ancestor. Query ONLY span.ui-button-text (the real
+            # button's actual structure, same class the Employee/Work Team toggle buttons use) so a
+            # look-alike node can't win by DOM order.
+            #
+            # ALSO real-mouse-click, not JS .click() -- see _mouse_click_ui_button's comment just
+            # below: a synthetic click on this link opened nothing (checkbox count measured 0
+            # change across several attempts in a diagnostic session), while a real page.mouse.click
+            # at the same coordinates visibly opened the "Employee Job Type" filter panel.
+            for _ in range(3):
+                rect = await page.evaluate(
+                    """() => {
+                        const span = [...document.querySelectorAll('span.ui-button-text')]
+                          .find(el => el.textContent.trim() === 'Filter' && el.offsetParent !== null);
+                        const target = span && span.closest('a, button, div.ui-button');
+                        if (!target) return null;
+                        const r = target.getBoundingClientRect();
+                        return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+                    }"""
+                )
+                if rect:
+                    await page.mouse.click(rect["x"], rect["y"])
+                    return True
+                await page.wait_for_timeout(500)
+            return False
+
+        await _filter_orders_by_wo()
+
         # Confirmed live (2026-08-27) on WO-PO/000077662: the row genuinely existed (verified
         # manually moments later, same filter) but was not yet rendered at the 3s mark -- poll a
         # few more times before giving up, same flicker-tolerance pattern used throughout this file.
-        order_row = page.locator("tr", has_text=wo.replace("WO-PO/", "")).locator("visible=true").first
+        order_row = page.locator("tr", has_text=wo_bare).locator("visible=true").first
         for _ in range(4):  # ~6s more on top of the initial 3s wait
             if await order_row.count():
                 break
             await page.wait_for_timeout(1500)
         if not await order_row.count():
-            logger.warning("Stage C: no Schedule Board order found for %s (searched customer %r)",
-                            wo, council_search)
+            logger.warning("Stage C: no Schedule Board order found for %s", wo)
             return False
         order_no_cell = order_row.locator("td").nth(1)
         order_no = (await order_no_cell.inner_text()).strip()
         await order_row.click(timeout=10000)
         await page.wait_for_timeout(2000)
 
-        # Employee view (NOT Work Team -- that list is empty; see docstring point 2). Confirmed live
-        # (2026-08-26) that a Playwright Locator click here (both get_by_text(exact=True) and the
-        # generic text= form) can report success while the toggle visibly stays on "Work Team" --
-        # repeated across multiple fresh sessions, not a one-off. Clicking the underlying radio
-        # input directly via JS .click() (bypassing Playwright's actionability + event simulation
-        # entirely) is what the live discovery session actually used successfully; verify the button
-        # went active (ui-state-active) afterward and retry if not.
+        async def _mouse_click_ui_button(label: str) -> bool:
+            # Confirmed live (2026-08-28): a JS-dispatched btn.click() on this toggle is a no-op as
+            # far as the server is concerned -- checkbox count on the page measured 0 change after
+            # several such clicks in a diagnostic session, vs. a real page.mouse.click() at the same
+            # button's coordinates visibly opening the Employee Job Type filter panel within ~1.5s.
+            # This is very likely why this toggle (and the Filter link below) had been flaky across
+            # multiple prior sessions despite "working" moments earlier -- a synthetic click can
+            # satisfy Playwright's own success check (the CSS class DOES flip client-side) while
+            # never reaching whatever handler actually triggers PrimeFaces's ajax call.
+            rect = await page.evaluate(
+                """(label) => {
+                    const btn = [...document.querySelectorAll('div.ui-button')]
+                      .find(b => b.textContent.trim() === label && b.getBoundingClientRect().width > 0);
+                    if (!btn) return null;
+                    const r = btn.getBoundingClientRect();
+                    return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+                }""",
+                label,
+            )
+            if not rect:
+                return False
+            await page.mouse.click(rect["x"], rect["y"])
+            return True
+
         employee_active = False
         for _ in range(3):
-            await page.evaluate(
-                """() => {
-                    const btn = [...document.querySelectorAll('div.ui-button')]
-                      .find(b => b.textContent.trim() === 'Employee' &&
-                                 b.getBoundingClientRect().width > 0);
-                    if (btn) btn.click();
-                }"""
-            )
+            await _mouse_click_ui_button("Employee")
             await page.wait_for_timeout(1500)
             employee_active = await page.evaluate(
                 """() => {
@@ -2000,8 +2055,10 @@ class SynergixDriver:
             logger.warning("Stage C: could not switch to Employee view for %s", wo)
             await self._screenshot(f"stage_c_no_employee_toggle_{wo.replace('/', '-')}")
             return False
-        filter_link = page.get_by_text("Filter", exact=True).locator("visible=true").first
-        await filter_link.click(timeout=10000)
+        if not await _click_filter_link():
+            logger.warning("Stage C: could not click the Employee Filter link for %s", wo)
+            await self._screenshot(f"stage_c_no_filter_link_{wo.replace('/', '-')}")
+            return False
         await page.wait_for_timeout(2000)
 
         # Confirmed live (2026-08-26) that the checkbox list can still be genuinely empty in the DOM
@@ -2019,12 +2076,6 @@ class SynergixDriver:
         # attempt (not a confirmed fix), periodically toggle to Work Team and back to Employee to
         # force a fresh ajax repopulate, since the toggle's own onchange is the only known trigger
         # for this list to (re)render at all.
-        click_button_js = """(label) => {
-                const btn = [...document.querySelectorAll('div.ui-button')]
-                  .find(b => b.textContent.trim() === label &&
-                             b.getBoundingClientRect().width > 0);
-                if (btn) btn.click();
-            }"""
         employee_checkbox_js = """(name) => {
                 const label = [...document.querySelectorAll('label')]
                   .find(l => l.textContent.trim() === name);
@@ -2035,19 +2086,21 @@ class SynergixDriver:
             if attempt > 0 and attempt % 6 == 0:
                 logger.warning("Stage C: employee checklist still empty after %.1fs for %s -- "
                                 "forcing a refresh via Work Team -> Employee", attempt * 0.8, wo)
-                await page.evaluate(click_button_js, "Work Team")
+                await _mouse_click_ui_button("Work Team")
                 await page.wait_for_timeout(1000)
-                await page.evaluate(click_button_js, "Employee")
+                await _mouse_click_ui_button("Employee")
                 await page.wait_for_timeout(1500)
             else:
-                await page.evaluate(
+                still_active = await page.evaluate(
                     """() => {
                         const btn = [...document.querySelectorAll('div.ui-button')]
                           .find(b => b.textContent.trim() === 'Employee' &&
                                      b.getBoundingClientRect().width > 0);
-                        if (btn && !btn.classList.contains('ui-state-active')) btn.click();
+                        return btn ? btn.classList.contains('ui-state-active') : false;
                     }"""
                 )
+                if not still_active:
+                    await _mouse_click_ui_button("Employee")
             employee_checkbox_id = await page.evaluate(employee_checkbox_js, SCHEDULE_EMPLOYEE)
             if employee_checkbox_id:
                 break
@@ -2061,18 +2114,14 @@ class SynergixDriver:
             logger.warning("Stage C: employee checklist still empty for %s after in-page retries -- "
                             "trying a full re-navigation", wo)
             await self._open_schedule_board()
-            await filter_input.click()
-            await filter_input.fill(council_search)
-            await filter_input.press("Enter")
-            await page.wait_for_timeout(3000)
-            order_row3 = page.locator("tr", has_text=wo.replace("WO-PO/", "")).locator("visible=true").first
+            await _filter_orders_by_wo()
+            order_row3 = page.locator("tr", has_text=wo_bare).locator("visible=true").first
             if await order_row3.count():
                 await order_row3.click(timeout=10000)
                 await page.wait_for_timeout(2000)
-                await page.evaluate(click_button_js, "Employee")
+                await _mouse_click_ui_button("Employee")
                 await page.wait_for_timeout(1500)
-                filter_link2 = page.get_by_text("Filter", exact=True).locator("visible=true").first
-                await filter_link2.click(timeout=10000)
+                await _click_filter_link()  # best-effort here; the poll below is the real gate
                 await page.wait_for_timeout(2000)
                 for _ in range(10):  # ~5s more after the reload
                     employee_checkbox_id = await page.evaluate(employee_checkbox_js, SCHEDULE_EMPLOYEE)
@@ -2250,11 +2299,8 @@ class SynergixDriver:
 
         # The grid/selection can reset after the popup's ajax refresh -- re-select the order before
         # looking for the (now separately-appearing) Submit action.
-        await filter_input.click()
-        await filter_input.fill(council_search)
-        await filter_input.press("Enter")
-        await page.wait_for_timeout(3000)
-        order_row2 = page.locator("tr", has_text=wo.replace("WO-PO/", "")).locator("visible=true").first
+        await _filter_orders_by_wo()
+        order_row2 = page.locator("tr", has_text=wo_bare).locator("visible=true").first
         if await order_row2.count():
             await order_row2.click(timeout=10000)
             await page.wait_for_timeout(2000)
