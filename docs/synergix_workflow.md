@@ -860,3 +860,77 @@ not absence-of-error.
 **Still open**: Stage C's checklist/calendar-row rendering intermittency (documented session 6) is
 unchanged -- `_schedule_stage_c` as committed code has not been re-tested end-to-end since these
 fixes; only the manual path was re-verified this session.
+
+## Session 8 (2026-08-28): scheduler wrapper fixed; seven more Stage C bugs found on WO-PO/000080788
+
+**Infrastructure, unrelated to the Synergix driver**: the 22:00 scheduled task had reported
+`LastTaskResult 1` every night for a week with the underlying batch actually succeeding, and no
+`batch_*.log` had ever been written. Root cause: `run_batch.ps1`/`run_poll.ps1` piped the child via
+`*>&1 | Tee-Object`, which under PowerShell 5.1 wraps every stderr line in a terminating
+`NativeCommandError` (Python's `logging` writes to stderr, so the wrapper died at the child's very
+first log line -- before any log file was written and before Task Scheduler could see the real exit
+code). Worse: Task Scheduler marked the task "completed" seconds after 22:00 while the orphaned
+child ran on for hours, silently defeating `ExecutionTimeLimit`. Fixed via `Start-Process` with
+OS-level stream redirection instead of a pipeline (`c405dc1`). `alert_on_crash.py`'s stderr capture
+had the same "buffers everything, streams nothing" bug -- fixed to read line-by-line with a bounded
+tail deque (`c405dc1`).
+
+**Stage C, live A-D run on a genuinely new WO** (`WO-PO/000080788` -> `QUO0006805` ->
+`SV00008875`): Stages A, B, and B.5 all verified correct from a fresh session (total, customer,
+reference, remarks all match the source WO). Stage C then surfaced seven more real bugs across three
+commits, found by instrumenting network traffic and comparing against raw ajax responses rather than
+guessing from screenshots:
+
+1. **Order-grid pagination trap** (`091c9f4`) -- filtering Unscheduled Service Orders by Customer
+   sorts a freshly-created order onto the LAST page at the grid's 5-rows/page default. Fixed by
+   filtering the grid's own Enquiry/Subject column by the WO number instead, which needs no
+   page-size workaround at all.
+2. **Decoy Filter-link element** (`091c9f4`) -- a generic `span, a` query for the "Filter" link found
+   an unrelated look-alike span at the same screen position first; `.closest()` on it silently found
+   no button and clicked nothing while reporting success. Fixed by querying only
+   `span.ui-button-text`.
+3. **The Employee/Work Team toggle fires ZERO ajax requests on its own** (`d830c0b`) -- confirmed via
+   captured network traffic: clicking it (JS-dispatched or real mouse) only flips a CSS class
+   client-side; nothing reaches the server until a LATER action (clicking Filter) does, by which
+   point the toggle's state may not have survived. This is why forcing "Employee" mode before
+   Filter was unreliable.
+4. **The employee checkbox's real click target is `.ui-chkbox-box`, not its `<label>`** (`d830c0b`)
+   -- same visual-state-vs-real-handler mismatch as bug 2/3. `label[for=...]` does not reliably fire
+   the real `onchange="PrimeFaces.ab(...)"` handler; the sibling `.ui-chkbox-box` div does.
+5. **A second "Filter" click (meant to close the panel) was actively breaking the checkbox**
+   (`d830c0b`) -- it fires the SAME ajax call that opens the panel, which can re-render the checkbox
+   section from stale server state and overwrite the just-checked box before its own round-trip
+   lands. Removed; the calendar row never needed the panel closed to appear.
+6. **A `blockUI` overlay intercepts the `newEventButton` click** (`4b4cc03`) --
+   `document.elementFromPoint` at the button's own coordinates resolved to a pending-ajax mask, not
+   the button; Playwright's click can report success while landing on the mask. Fixed by routing
+   through the existing `_click_when_clear` helper (already used elsewhere in this file).
+7. **The Event Details dialog takes ~8s to render, not the ~3s previously assumed, and the
+   wrong-employee check must be scoped to the dialog itself** (`4b4cc03`) -- a page-wide
+   `.ui-selectonemenu-label` search can match an unrelated dropdown (e.g. the header's company
+   switcher) while the real dialog is still loading. Fixed with a poll (up to ~10s) and a
+   dialog-scoped query.
+
+Also implemented session 6's own standing recommendation: the full-re-navigation fallback for an
+empty employee checklist now loops up to 3 times instead of running once (`d830c0b`) -- confirmed
+live this sometimes succeeds where a single attempt doesn't.
+
+**Net result for `WO-PO/000080788`**: further than this automation has ever reached via the fully
+automated `_schedule_stage_c` -- checklist populates reliably, checkbox checks and stays checked,
+calendar row renders, Event Details dialog opens for the right employee, and the schedule **commits
+server-side** (`SV00008875` shows "TAN WEI YING, 14/07/2026" under its own Order Details/Schedule
+section, confirmed live). It still does not complete: **Submit does not enable even with the
+checkbox checked**, contradicting session 6's own documented finding that ticking this exact
+checkbox is what enables Submit. Not yet resolved -- left open in `4b4cc03`'s own commit message as
+either a new, additional gate (an empty "To Service"/"Billables" section was visible) or one more
+instance of the same non-deterministic flakiness. `SV00008875` was deliberately left in a safe state
+(scheduled, not submitted, not duplicated) rather than forced further.
+
+`_schedule_stage_c` as committed code has **still never completed Stage C end-to-end on its own** --
+every real A-D success in this project's history (`SV00008852`, `SV00008856`, `SV00008874`) required
+a human or a manual step-by-step session to finish Stage C. This session's fixes are real,
+independently verified progress (the automated function now gets to a materially later point of
+failure each time), but the underlying Schedule Board widget's flakiness -- flagged as likely
+genuinely non-deterministic since session 6 -- has still not been fully defeated.
+
+115 passed, 22 skipped after every commit this session.
