@@ -1773,6 +1773,14 @@ class SynergixDriver:
         second real Confirm click and a duplicate Service Order -- confirmed live (2026-08-30) this
         exact scenario created SV00008877 AND SV00008878 for the same quotation, QUO0006817.
 
+        Polls for up to ~12s (not a single fixed 3s wait) before concluding "not found". Confirmed
+        live (2026-08-30) that even THIS check's own single-wait version was too fast once: it ran
+        moments after the inline confirm's own Confirm+Yes click, found nothing yet (Schedule
+        Board's grid had not indexed the just-created order in time), and let a second real Confirm
+        click through -- creating SV00008879 AND SV00008880 for QUO0006818 the same way. This is the
+        same server-side ajax-timing class of bug as the rest of Stage C; the fix is the same
+        pattern used throughout this file: poll, don't assume one wait is long enough.
+
         This only checks Unscheduled Service Orders (not yet scheduled/submitted) -- a Service Order
         that has since been scheduled and submitted by Stage C would no longer appear here, but by
         that point Stage B.5 is moot anyway (write() only calls this before Stage C runs).
@@ -1786,9 +1794,12 @@ class SynergixDriver:
             await filter_input.click(timeout=8000)
             await filter_input.fill(quotation_no)
             await filter_input.press("Enter")
-            await page.wait_for_timeout(3000)
             row = page.locator("tr", has_text=quotation_no).locator("visible=true").first
-            return await row.count() > 0
+            for _ in range(8):  # ~12s: 8 x 1.5s, matching the SA0005 toast poll's own budget
+                await page.wait_for_timeout(1500)
+                if await row.count() > 0:
+                    return True
+            return False
         except Exception:
             logger.exception("_service_order_exists_for_quotation: check errored for %s -- "
                               "assuming no existing Service Order (fail open, matches prior "
@@ -1938,6 +1949,41 @@ class SynergixDriver:
         await self._screenshot(f"vo_confirm_no_toast_{quotation_no}")
         return False
 
+    async def _hard_reset_browser(self) -> None:
+        """Close the entire browser context and relaunch it from scratch, reusing the persisted
+        session directory (so the login cookie survives -- no credentials re-entry needed).
+
+        Built specifically for Stage C's employee-checklist flakiness. Confirmed live (2026-08-30):
+        _open_schedule_board's own "re-navigation" loop (login() is a no-op once self._logged_in is
+        set; it just re-clicks through the menu in the SAME page/tab/browser process) failed 6/6
+        times in one continuous automated run -- 3 in-page toggle refreshes plus 3 of that
+        re-navigation loop. Minutes later, the exact same order's checklist populated on the FIRST
+        attempt from a genuinely fresh browser process (a separate discovery-script run, new
+        Playwright launch, new login flow). That is a materially different action than anything the
+        in-page retries do: a new process means a new renderer, new websocket/polling connections to
+        Synergix, and a fresh client-side JS heap -- any of which could be what the old session was
+        missing. This method reproduces that exact difference programmatically, so write() never
+        again needs a human to relaunch a script to get past this.
+        """
+        logger.warning("Stage C: hard-resetting the browser (new process, same persisted session) "
+                        "after in-page recovery failed")
+        if self._context:
+            try:
+                await self._context.close()
+            except Exception:
+                logger.exception("Stage C hard reset: error closing the old browser context "
+                                  "(continuing anyway)")
+        if self._pw:
+            try:
+                await self._pw.stop()
+            except Exception:
+                logger.exception("Stage C hard reset: error stopping the old Playwright instance "
+                                  "(continuing anyway)")
+        self._logged_in = False
+        self.page = None
+        await self.start()
+        await self.login()
+
     async def _open_schedule_board(self) -> None:
         """Navigate (logged in) to General Service -> Schedule Board - LS2.
 
@@ -1963,7 +2009,64 @@ class SynergixDriver:
         raise RuntimeError("could not open Schedule Board after re-login")
 
     async def _schedule_stage_c(self, payload: WOPayload) -> bool:
-        """Stage C: find the WO's Service Order on Schedule Board, assign SCHEDULE_EMPLOYEE at the
+        """Stage C, outer retry wrapper: run _schedule_stage_c_attempt, and if it fails, do a full
+        HARD RESET of the browser (new process, same persisted login session -- see
+        _hard_reset_browser's docstring) and retry the entire attempt from scratch.
+
+        WHY A WHOLE-METHOD RETRY, NOT another per-step fix: _schedule_stage_c_attempt has 13
+        distinct internal failure points (checklist population, calendar row rendering, the
+        newEventButton click, the Event Details dialog appearing, the wrong-employee check, the
+        Submit button enabling, the final "Upcoming Service" verification, and others) -- each one
+        individually documented, across multiple sessions, as intermittently failing and then
+        succeeding on a LATER attempt with no code change in between. That pattern -- same input,
+        same code, different outcome -- is the signature of server-side ajax timing/load on
+        Synergix's own backend, not a client-side bug isolated to any one step. Patching each of the
+        13 failure points with its own bespoke hard-reset-and-retry would duplicate the same logic
+        13 times and still miss whichever ajax call breaks next in a future session. Retrying the
+        WHOLE method after a hard reset covers all of them uniformly, including ones not yet seen.
+
+        Confirmed live (2026-08-30): a fresh browser process (new Playwright launch, new login,
+        same session cookie) succeeded on WO-PO/000080935's checklist step on the FIRST attempt,
+        immediately after 6 consecutive in-page-retry failures in the previous, long-lived session.
+        This wrapper reproduces that exact recovery programmatically instead of requiring a human to
+        relaunch a script.
+
+        Each attempt gets a FRESH quotation/order lookup (Schedule Board's grid state, not just the
+        employee checklist, could differ after a reset) -- _schedule_stage_c_attempt re-navigates
+        and re-filters from scratch every time it's called, so this is safe to call repeatedly.
+        """
+        if _dry_guard(f"schedule Stage C for {payload.wo_po_number}"):
+            return True
+        # 2, not 3: each attempt (including its own internal retries) runs ~2-4 minutes, and a hard
+        # reset adds another ~15-30s for the browser relaunch + login. This shares SYNERGIX_WO_TIMEOUT_S
+        # (900s) with Stage A/B/B.5 (already run) and Stage D (still to come) -- 2 attempts leaves
+        # comfortable margin; 3 risked leaving too little for Stage D on a slow day.
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if await self._schedule_stage_c_attempt(payload):
+                    return True
+            except Exception:
+                logger.exception("Stage C attempt %d/%d errored for %s", attempt, max_attempts,
+                                  payload.wo_po_number)
+            if attempt < max_attempts:
+                logger.warning("Stage C attempt %d/%d failed for %s -- hard-resetting the browser "
+                                "and retrying the whole stage from scratch", attempt, max_attempts,
+                                payload.wo_po_number)
+                try:
+                    await self._hard_reset_browser()
+                except Exception:
+                    logger.exception("Stage C: hard reset itself failed for %s -- aborting retries",
+                                      payload.wo_po_number)
+                    break
+        logger.warning("Stage C: all %d attempts failed for %s -- this needs a human to finish "
+                        "Stage C manually in Synergix", max_attempts, payload.wo_po_number)
+        return False
+
+    async def _schedule_stage_c_attempt(self, payload: WOPayload) -> bool:
+        """One end-to-end attempt at Stage C -- see _schedule_stage_c (the retry wrapper that calls
+        this) for why failures here are retried with a full browser reset rather than patched
+        per-step. Find the WO's Service Order on Schedule Board, assign SCHEDULE_EMPLOYEE at the
         WO's job date, and submit.
 
         Discovered live (2026-08-25): a confirmed Variation Order (Stage B.5) creates a Service Order

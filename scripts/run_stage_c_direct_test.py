@@ -1,7 +1,6 @@
-"""One-off live verification of the newly-fixed _schedule_stage_c against an existing, already
-Variation-Order-confirmed Service Order (SV00008853, WO-PO/000076627 / QUO0006750) -- bypasses
-Stage B/B.5 since they're already done for this WO, to isolate testing to the Stage C fixes made
-after committing (div-based grid layout in _fill_labeled_input, Locator.fill() for the time fields).
+"""One-off live verification of _schedule_stage_c + _fulfil_stage_d against an existing, already
+Variation-Order-confirmed Service Order (SV00008877, WO-PO/000080935 / QUO0006817) -- bypasses
+Stage B/B.5 since they're already done for this WO, to isolate testing to Stage C and D.
 
 Usage:
     DRY_RUN=false SYNERGIX_HEADLESS=false python -m scripts.run_stage_c_direct_test
@@ -14,7 +13,7 @@ from config import settings
 from src.extractor import extract_from_pdf
 from src.synergix_driver import SynergixDriver
 
-PDF_PATH = "data/samples/JBTC/76627.pdf"
+PDF_PATH = "data/pdfs/WO-PO-000080935.pdf"
 
 
 async def main() -> None:
@@ -34,6 +33,9 @@ async def main() -> None:
     try:
         ok = await synergix._schedule_stage_c(payload)
         print(f"{payload.wo_po_number}: Stage C {'SUCCEEDED' if ok else 'FAILED'}")
+        if ok:
+            ok_d = await synergix._fulfil_stage_d(payload)
+            print(f"{payload.wo_po_number}: Stage D {'SUCCEEDED' if ok_d else 'FAILED'}")
     finally:
         await synergix.close()
 

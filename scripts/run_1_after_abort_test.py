@@ -1,10 +1,15 @@
-"""One-off live test: abort a confirmed-orphaned draft quotation (never submitted, Rev. No. 0, left
-over from an earlier test session), then run the REAL, unattended write() pipeline (Stage
-A-B-B.5-C-D, DRY_RUN=false) on the WO it was blocking dedup for.
+"""One-off live test: run the REAL, unattended write() pipeline (Stage A-B-B.5-C-D, DRY_RUN=false)
+on a WO whose orphaned draft quotation (never submitted, Rev. No. 0, left over from an earlier test
+session) was already manually verified and aborted.
 
-Confirmed live (2026-08-30) that WO-PO/000080935's dedup DUPLICATE was QUO0006569 -- a fully-filled
-but never-submitted draft (Rev. No. 0) from an earlier test run, not real client billing history.
-Safe to abort per abort_quotation()'s own contract (only works on an un-submitted draft).
+WO-PO/000078714's draft (QUO0006815) was individually verified live (2026-08-30) -- Salesperson TAN
+WEI YING, our item code SE-400212A, our exact remarks/bank-details format, Rev. No. 0, never
+submitted -- and aborted with the user's explicit confirmation before this script runs. This script
+does NOT abort anything itself; it only downloads the WO fresh from TCMS and runs write() on it, to
+live-verify the _service_order_exists_for_quotation polling fix (src/synergix_driver.py) with full
+logger output enabled this time (the first run of this script had no logging.basicConfig() call, so
+_confirm_variation_order's own info/warning logs were silently dropped and the real decision path
+that led to a duplicate Service Order (SV00008879 + SV00008880 for QUO0006818) was never visible).
 
 Usage:
     DRY_RUN=false SYNERGIX_HEADLESS=false TCMS_HEADLESS=false python -m scripts.run_1_after_abort_test
@@ -12,6 +17,9 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s :: %(message)s")
 
 from config import settings
 from src import db
@@ -20,8 +28,7 @@ from src.synergix_driver import DedupResult, SynergixDriver
 from src.tcms_scraper import TCMSScraper
 from src.validator import build_remarks, check_extraction_trust, resolve_project_code, validate
 
-QUOTATION_TO_ABORT = "QUO0006569"
-WO_PO_NUMBER = "WO-PO/000080935"
+WO_PO_NUMBER = "WO-PO/000078714"
 
 
 async def main() -> None:
@@ -36,13 +43,6 @@ async def main() -> None:
     synergix = SynergixDriver()
     await synergix.start()
     try:
-        print(f"=== Aborting orphaned draft {QUOTATION_TO_ABORT} ===")
-        aborted = await synergix.abort_quotation(QUOTATION_TO_ABORT)
-        print(f"{QUOTATION_TO_ABORT}: abort {'succeeded' if aborted else 'FAILED'}")
-        if not aborted:
-            print("Refusing to continue -- abort did not succeed.")
-            return
-
         print(f"\n=== Downloading {WO_PO_NUMBER}'s WO PDF from TCMS ===")
         async with TCMSScraper() as tcms:
             await tcms.login()
