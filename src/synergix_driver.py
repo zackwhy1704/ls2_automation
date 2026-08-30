@@ -1766,6 +1766,35 @@ class SynergixDriver:
                 + "; ".join(problems)
             )
 
+    async def _service_order_exists_for_quotation(self, quotation_no: str) -> bool:
+        """Check Schedule Board's Unscheduled Service Orders grid for a row whose "Quotation No."
+        column matches. Used as an idempotency guard before _confirm_variation_order clicks Confirm,
+        so a missed/slow success signal (the SA0005 toast, or "left Under Variation") never causes a
+        second real Confirm click and a duplicate Service Order -- confirmed live (2026-08-30) this
+        exact scenario created SV00008877 AND SV00008878 for the same quotation, QUO0006817.
+
+        This only checks Unscheduled Service Orders (not yet scheduled/submitted) -- a Service Order
+        that has since been scheduled and submitted by Stage C would no longer appear here, but by
+        that point Stage B.5 is moot anyway (write() only calls this before Stage C runs).
+        """
+        assert self.page is not None
+        page = self.page
+        try:
+            await self._open_schedule_board()
+            header = page.locator("th:visible", has_text="Quotation No.").first
+            filter_input = header.locator("input.ui-column-filter").first
+            await filter_input.click(timeout=8000)
+            await filter_input.fill(quotation_no)
+            await filter_input.press("Enter")
+            await page.wait_for_timeout(3000)
+            row = page.locator("tr", has_text=quotation_no).locator("visible=true").first
+            return await row.count() > 0
+        except Exception:
+            logger.exception("_service_order_exists_for_quotation: check errored for %s -- "
+                              "assuming no existing Service Order (fail open, matches prior "
+                              "behavior)", quotation_no)
+            return False
+
     async def _confirm_variation_order(self, quotation_no: str) -> bool:
         """Stage B.5: retrieve a just-submitted quotation from "Under Variation" and click Confirm.
 
@@ -1789,6 +1818,18 @@ class SynergixDriver:
 
         if _dry_guard(f"confirm Variation Order for {quotation_no}"):
             return True  # DRY_RUN: leave it sitting in Under Variation
+
+        # Pre-flight: a Service Order already existing for this quotation is the one signal proven
+        # NOT to have false positives (unlike the SA0005 toast, which can be missed by a slow/failed
+        # locator wait even after a genuine success, and unlike "left Under Variation", proven
+        # unreliable above). Confirmed live (2026-08-30) that a missed toast on QUO0006817 led this
+        # method to re-run Confirm+Yes a second time, creating a SECOND real Service Order
+        # (SV00008878) for the same quotation -- a genuine duplicate this check would have caught
+        # before ever clicking Confirm again.
+        if await self._service_order_exists_for_quotation(quotation_no):
+            logger.info("_confirm_variation_order: a Service Order already exists for %s -- "
+                        "treating as already confirmed, not re-clicking Confirm", quotation_no)
+            return True
 
         await self._open_service_quotation_list()
         if not await self._select_quotation_status_tab("Under Variation"):
@@ -1869,17 +1910,33 @@ class SynergixDriver:
         # navigate-away-and-back cycle. The "no longer under Under Variation" check used previously
         # was therefore a false negative that mislabelled genuine successes as PARTIAL failures on
         # every WO run that day. This toast is the reliable signal instead.
-        try:
-            toast = page.locator("text=/SA0005.*Service Order No\\.?:?\\s*SV\\d+.*created successfully/i")
-            await toast.wait_for(state="visible", timeout=8000)
-            toast_text = await toast.first.inner_text()
-            logger.info("Confirmed Variation Order for %s -- %s", quotation_no, toast_text.strip())
+        #
+        # Polling toast.count() (DOM presence), NOT toast.wait_for(state="visible") -- confirmed
+        # live (2026-08-30) on QUO0006817 that TWO SA0005 toasts (for two separately-created Service
+        # Orders) were sitting stacked in the notification tray at the exact moment wait_for(visible)
+        # timed out and this method reported "no toast seen", which then caused write() to retry
+        # Confirm+Yes a second time and create a genuine duplicate Service Order. count() polling
+        # tolerates a toast that is DOM-present but not (yet, or no longer) Playwright-"visible" due
+        # to stacking/animation.
+        toast = page.locator("text=/SA0005.*Service Order No\\.?:?\\s*SV\\d+.*created successfully/i")
+        for _ in range(16):  # ~8s
+            if await toast.count():
+                toast_text = await toast.first.inner_text()
+                logger.info("Confirmed Variation Order for %s -- %s", quotation_no, toast_text.strip())
+                return True
+            await page.wait_for_timeout(500)
+
+        # No toast found even by DOM presence -- before declaring failure, check Schedule Board
+        # directly. Confirmed live (2026-08-30): this is the ground-truth signal a toast can never
+        # be better than, and catches a success the toast check missed for any reason.
+        if await self._service_order_exists_for_quotation(quotation_no):
+            logger.info("_confirm_variation_order: no toast seen for %s, but a Service Order exists "
+                        "in Schedule Board -- treating as confirmed", quotation_no)
             return True
-        except Exception:
-            logger.warning("_confirm_variation_order: no SA0005 success toast seen for %s after "
-                            "Confirm+Yes", quotation_no)
-            await self._screenshot(f"vo_confirm_no_toast_{quotation_no}")
-            return False
+        logger.warning("_confirm_variation_order: no SA0005 success toast seen for %s after "
+                        "Confirm+Yes, and no Service Order found in Schedule Board", quotation_no)
+        await self._screenshot(f"vo_confirm_no_toast_{quotation_no}")
+        return False
 
     async def _open_schedule_board(self) -> None:
         """Navigate (logged in) to General Service -> Schedule Board - LS2.
@@ -2700,17 +2757,33 @@ class SynergixDriver:
             if await yes_btn.count():
                 await yes_btn.first.click(timeout=5000)
                 # Same SA0005 toast signal as _confirm_variation_order -- see that method's
-                # docstring for why "quotation left Under Variation" is NOT used here.
+                # docstring for why "quotation left Under Variation" is NOT used here, and why this
+                # polls toast.count() (DOM presence) rather than wait_for(state="visible"): confirmed
+                # live (2026-08-30) that a stacked/animating toast can be missed by a strict
+                # visibility wait even after a genuine success, which previously caused write() to
+                # retry Confirm+Yes via the fallback and create a real duplicate Service Order.
                 toast = page.locator("text=/SA0005.*Service Order No\\.?:?\\s*SV\\d+.*created successfully/i")
-                try:
-                    await toast.wait_for(state="visible", timeout=8000)
-                    vo_confirmed = True
+                for _ in range(16):  # ~8s
+                    if await toast.count():
+                        vo_confirmed = True
+                        break
+                    await page.wait_for_timeout(500)
+                if vo_confirmed:
                     logger.info("Inline Variation Order confirm succeeded for %s (quotation %s)",
                                 payload.wo_po_number, quo_id)
-                except Exception:
-                    logger.warning("Inline Confirm+Yes clicked but no SA0005 toast seen for %s "
-                                    "(quotation %s) -- falling back to _confirm_variation_order",
+                else:
+                    # Ground-truth fallback, same as _confirm_variation_order's own last check.
+                    if quo_id:
+                        vo_confirmed = await self._service_order_exists_for_quotation(quo_id)
+                    if vo_confirmed:
+                        logger.info("Inline confirm: no toast seen for %s (quotation %s), but a "
+                                    "Service Order exists in Schedule Board -- treating as confirmed",
                                     payload.wo_po_number, quo_id)
+                    else:
+                        logger.warning("Inline Confirm+Yes clicked but no SA0005 toast seen and no "
+                                        "Service Order found for %s (quotation %s) -- falling back "
+                                        "to _confirm_variation_order",
+                                        payload.wo_po_number, quo_id)
             else:
                 logger.warning("Inline Confirm icon found but no 'Are you sure?' Yes button for "
                                 "%s (quotation %s) -- falling back to _confirm_variation_order",
