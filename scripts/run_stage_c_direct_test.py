@@ -1,19 +1,28 @@
-"""One-off live verification of _schedule_stage_c + _fulfil_stage_d against an existing, already
-Variation-Order-confirmed Service Order (SV00008877, WO-PO/000080935 / QUO0006817) -- bypasses
-Stage B/B.5 since they're already done for this WO, to isolate testing to Stage C and D.
+"""One-off live verification of _schedule_stage_c (+ _fulfil_stage_d on success) against an
+existing, already Variation-Order-confirmed Service Order -- bypasses Stage B/B.5 since they're
+already done for this WO, to isolate testing to Stage C and D and gather more hard-reset-wrapper
+data points without re-running the whole pipeline each time.
+
+Also used to close out WOs left stranded PARTIAL (Stage B.5-confirmed, Stage C not scheduled)
+from a prior session's hard-reset testing: WO-PO/000078720 (QUO0006818) and WO-PO/000078714
+(QUO0006819), both already have PDFs cached locally under data/pdfs/.
 
 Usage:
-    DRY_RUN=false SYNERGIX_HEADLESS=false python -m scripts.run_stage_c_direct_test
+    DRY_RUN=false SYNERGIX_HEADLESS=false python -m scripts.run_stage_c_direct_test <pdf_path>
 """
 from __future__ import annotations
 
 import asyncio
+import logging
+import sys
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s :: %(message)s")
 
 from config import settings
 from src.extractor import extract_from_pdf
 from src.synergix_driver import SynergixDriver
 
-PDF_PATH = "data/pdfs/WO-PO-000080935.pdf"
+PDF_PATH = sys.argv[1] if len(sys.argv) > 1 else "data/pdfs/WO-PO-000080935.pdf"
 
 
 async def main() -> None:

@@ -2125,6 +2125,21 @@ class SynergixDriver:
             await filter_input.press("Enter")
             await page.wait_for_timeout(3000)
 
+        async def _filter_panel_is_open() -> bool:
+            # The Filter toggle is a PrimeFaces panel (data-widget="panel-filter") whose content div
+            # gets style="display: none" when collapsed. Confirmed live (2026-08-30): _click_filter_link
+            # is a raw toggle click with no open/closed check, so calling it when the panel is ALREADY
+            # open (e.g. a second recovery pass within the same attempt) silently CLOSES it instead --
+            # this was found to be the actual reason a Clear-All-based recovery sequence still failed
+            # even though the same sequence, driven by hand with visual confirmation at each step,
+            # had worked. Query the real DOM state instead of assuming click = open.
+            return await page.evaluate(
+                """() => {
+                    const panel = document.querySelector('[data-widget="panel-filter"] .ui-panel-content');
+                    return !!panel && panel.style.display !== 'none';
+                }"""
+            )
+
         async def _click_filter_link() -> bool:
             # Confirmed live (2026-08-28): querying generic 'span, a' alongside 'span.ui-button-text'
             # found a DECOY first -- an unrelated <span class="synfaces-float-left"> sitting at the
@@ -2154,6 +2169,40 @@ class SynergixDriver:
                     return True
                 await page.wait_for_timeout(500)
             return False
+
+        async def _ensure_filter_link_open() -> bool:
+            # Idempotent wrapper: only clicks if the panel is currently closed, so repeated calls
+            # within one recovery loop can't accidentally toggle it shut. See _filter_panel_is_open.
+            if await _filter_panel_is_open():
+                return True
+            return await _click_filter_link()
+
+        async def _click_visible_text(text: str) -> bool:
+            # Native Playwright locator click (re-resolves the element's position at click time),
+            # NOT the coordinate-snapshot-then-mouse.click() pattern used elsewhere in this method
+            # for the Filter link and Employee/Work Team toggle. Confirmed live (2026-08-30) via an
+            # isolated side-by-side test: the SAME Clear-All-based recovery sequence (Employee ->
+            # Filter -> Clear All -> Employee -> Filter) reproduced the fix 3/3 times manually using
+            # this native-click style, but the coordinate-based version of the identical sequence
+            # failed 2/2 times when run through the real driver code. Root cause: Clear All triggers
+            # a PrimeFaces ajax repopulate that reflows the panel (checklist/calendar rows
+            # appearing), so a bounding-rect computed just before the click can be stale by the time
+            # page.mouse.click() fires on it a moment later -- re-resolving at click time avoids
+            # that race entirely. Used only for the Clear-All recovery path added 2026-08-30; the
+            # pre-existing Filter/Employee/Work Team helpers are left as coordinate-based since they
+            # have their own confirmed reasons (see _click_filter_link, _mouse_click_ui_button).
+            loc = page.locator(f"text={text}").locator("visible=true").first
+            try:
+                await loc.wait_for(state="visible", timeout=5000)
+            except Exception:
+                return False
+            await loc.click()
+            return True
+
+        async def _click_clear_all_link() -> bool:
+            # See _click_visible_text's docstring for why this uses native clicks, not the
+            # coordinate-based pattern used by _click_filter_link/_mouse_click_ui_button.
+            return await _click_visible_text("Clear All")
 
         await _filter_orders_by_wo()
 
@@ -2236,6 +2285,24 @@ class SynergixDriver:
         # attempt (not a confirmed fix), periodically toggle to Work Team and back to Employee to
         # force a fresh ajax repopulate, since the toggle's own onchange is the only known trigger
         # for this list to (re)render at all.
+        #
+        # IMPORTANT root-cause finding (2026-08-30), from isolated side-by-side testing via
+        # scripts/synergix_discover_schedule_fulfil.py: a "Clear All -> Employee -> Filter" sequence
+        # (added below) DOES reliably repopulate the checklist -- but ONLY when performed on Schedule
+        # Board's Employee/Filter controls directly, with no specific Service Order row selected.
+        # The SAME exact sequence, run after clicking into a specific Unscheduled Service Order row
+        # first (which is what this method always does, since it needs a specific order selected to
+        # assign an employee to), reproducibly leaves the checklist's <div class="ui-panel-content">
+        # present and "open" (visible, flex, non-'none' display) but with ZERO checkbox HTML ever
+        # rendered inside it -- confirmed via innerHTML inspection, not just visual/CSS state. This
+        # means the employee checklist's ajax repopulate is scoped to (or depends on) something
+        # about the "no order selected" page state, and genuinely does not fire the same way once a
+        # specific order is the active selection. This is a server-side behavior difference this
+        # method has no confirmed way to work around from the client side -- the Clear-All sequence
+        # below is kept because it's a real, harmless improvement (it DOES help in the no-row-selected
+        # case, e.g. if the row selection is ever lost mid-attempt), but it is NOT a fix for the
+        # per-order checklist-empty failure this method exists to work around. That failure remains
+        # best-effort: retry, hard-reset, then surface to a human.
         employee_checkbox_js = """(name) => {
                 const label = [...document.querySelectorAll('label')]
                   .find(l => l.textContent.trim() === name);
@@ -2245,10 +2312,22 @@ class SynergixDriver:
         for attempt in range(24):  # ~20s, with forced refreshes every ~5s
             if attempt > 0 and attempt % 6 == 0:
                 logger.warning("Stage C: employee checklist still empty after %.1fs for %s -- "
-                                "forcing a refresh via Work Team -> Employee", attempt * 0.8, wo)
-                await _mouse_click_ui_button("Work Team")
+                                "forcing a refresh via Clear All -> Employee -> Filter", attempt * 0.8, wo)
+                # Clear All FIRST, then re-toggle -- see _click_clear_all_link's docstring: this
+                # exact order is the only sequence confirmed live (2026-08-30) to actually recover
+                # a genuinely empty checklist, after Work-Team<->Employee alone had failed 8/8 times.
+                # Clear All only exists in the DOM while the Filter panel is open, so make sure of
+                # that first (idempotent -- won't toggle an already-open panel shut).
+                await _ensure_filter_link_open()
+                await page.wait_for_timeout(500)
+                await _click_clear_all_link()
                 await page.wait_for_timeout(1000)
-                await _mouse_click_ui_button("Employee")
+                # Native click here too, not _mouse_click_ui_button -- see _click_visible_text's
+                # docstring: the coordinate-based Employee re-click right after Clear All is exactly
+                # what was confirmed live (2026-08-30) to fail from stale coordinates post-reflow.
+                await _click_visible_text("Employee")
+                await page.wait_for_timeout(1000)
+                await _ensure_filter_link_open()
                 await page.wait_for_timeout(1500)
             else:
                 still_active = await page.evaluate(
@@ -2289,7 +2368,16 @@ class SynergixDriver:
                 await page.wait_for_timeout(2000)
                 await _mouse_click_ui_button("Employee")
                 await page.wait_for_timeout(1500)
-                await _click_filter_link()  # best-effort here; the poll below is the real gate
+                await _click_filter_link()
+                await page.wait_for_timeout(2000)
+                # Same Clear All -> Employee -> Filter sequence as the in-page recovery loop above
+                # -- confirmed live (2026-08-30) as the actual fix, so apply it here too rather than
+                # relying on the poll below to save a re-navigation attempt that's missing it.
+                await _click_clear_all_link()
+                await page.wait_for_timeout(1000)
+                await _click_visible_text("Employee")
+                await page.wait_for_timeout(1000)
+                await _ensure_filter_link_open()
                 await page.wait_for_timeout(2000)
                 for _ in range(10):  # ~5s more after the reload
                     employee_checkbox_id = await page.evaluate(employee_checkbox_js, SCHEDULE_EMPLOYEE)
