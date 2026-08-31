@@ -292,46 +292,69 @@ staleness possible -- and it hit the **exact same** `ui-dialog-mask` (`id="j_idt
 
 This rules out "stale/idle session" as the sole or main cause: this run had no idle gap at all, and
 the SV9104 guard proves the server-side state was fresh and correct going into the second attempt,
-yet the mask still appeared both times at the same step. The manual success previously observed is
-still real and still unexplained -- something a human does differently at or around this step
-reliably unblocks it, but it is very unlikely to be "just wait longer" or "re-login," since this run
-had neither problem and still failed identically twice. **Status: open, unresolved, needs a human to
-drive the exact `_tick_row_checkbox` moment manually while comparing against automation.** See the
-"Manual investigation checklist" below.
+yet the mask still appeared both times at the same step.
 
-### Manual investigation checklist for the `j_idt737_modal` blocker (open as of 2026-08-31)
+**RESOLVED FOR REAL (2026-08-31, later still): root cause was never the mask -- the whole
+`_tick_row_checkbox` step was solving a problem that does not exist in the real flow.** Found by
+re-doing the frame-by-frame video review at higher density (every single 30fps frame, with
+pixel-diff to localize exact transition moments) specifically across 7:00-7:52, the segment covering
+Event Details Confirm through the final Submit. Every prior session (2026-08-26 through the
+"session timeout" theory above) assumed Submit is gated on re-selecting the WO's row in the LEFT
+"Unscheduled Service Orders" grid and re-ticking its own `.ui-chkbox`. **This is false.** What the
+video actually shows, precisely:
 
-Use `scripts/run_stage_c_handoff_at_submit.py` to get the browser to the exact stuck point
-automatically (row select -> Employee -> Event Details -> To Pair With tick -> dates -> Confirm),
-then take over by hand from there. Concretely, with the browser sitting at that stuck point:
+1. Event Details Confirm is clicked; the popup closes. The LEFT grid visibly resets to an unrelated,
+   unfiltered page underneath (different Order Nos, different customers) -- this is cosmetic noise,
+   not a state that needs repairing.
+2. The human does **not** touch the left grid again at all -- no re-filter, no row click, no
+   checkbox click, for the rest of the flow.
+3. The RIGHT-hand **Order Details panel** (already open the entire time, e.g.
+   `Order Details[SV00008851]`) still shows a yellow "This Service Order has not been submitted"
+   banner. Its own **"Submit" link, in that panel's own header** (top-left, next to the panel title
+   and "Abort" -- same `fa-vote-yea` icon used at every other stage-ending confirm in this app), is
+   clicked **directly**.
+4. That click raises a separate **"Confirmation -- Are you sure?"** Yes/No dialog (confirmed via a
+   frame at 7:27.93 showing the cursor still on "Submit" with the browser's own hover-link preview
+   in the status bar, and the dialog freshly appeared) -- distinct from Event Details' own Confirm
+   checkmark earlier. Clicking **Yes** here is the final action.
+5. Immediately after, the "not submitted" warning disappears and a new **"Schedule"** section
+   appears at the bottom of Order Details (showing the paired-with name, e.g. "INFIGO") -- the real
+   success signal.
 
-1. **Look at the screen before touching anything.** Is `id="j_idt737_modal"` (or any
-   `.ui-widget-overlay.ui-dialog-mask`) visible over the grid? Open devtools Elements panel and
-   search for `j_idt737_modal` -- note whether it exists in the DOM at all, and if so, is it
-   actually painted (not `display:none`/zero-opacity)? The automation only knows it exists and
-   intercepts clicks; it does not know if it's a real ghost dialog remnant or something else.
-2. **Check what dialog `j_idt737` itself is**, not just its mask. Search devtools for
-   `id="j_idt737"` (without `_modal`) -- what dialog does that id belong to? My working theory is
-   it's a leftover/hidden PrimeFaces dialog (possibly the Event Details dialog's own container,
-   not fully torn down after Confirm) whose mask is still attached even though the dialog body
-   looks closed. If so, the fix may be waiting for `#j_idt737` (not just `.blockUI.blockOverlay`)
-   to detach, or explicitly dismissing it, before the checkbox click.
-3. **Try clicking directly on the visible mask/greyed area itself** (not the checkbox) -- does that
-   dismiss it, the way clicking outside a modal often closes it? If yes, that single extra click is
-   likely the missing step.
-4. **Try pressing Escape** while focus is anywhere on the page -- PrimeFaces dialogs often close on
-   Escape even when a mask blocks pointer events.
-5. **If neither works, try clicking the row itself again first** (re-select `order_row2`, i.e. click
-   the WO's row text/cells, not its checkbox) before clicking the checkbox -- it's possible the grid
-   needs a fresh row-select click to re-establish context after Confirm closes, and the checkbox
-   click alone (skipping the row re-click) is what's actually missing.
-6. **Whatever action actually clears the mask and lets Submit enable, note it exactly**: what you
-   clicked, where, and whether anything visibly changed first (e.g. did the mask fade before or
-   after your click; did any other element flash). Report back with that description, plus which of
-   steps 2-5 (or something else entirely) was the one that worked, so it can be encoded as an
-   explicit wait/click in `_schedule_stage_c_attempt` (most likely right before or inside
-   `_tick_row_checkbox`, mirroring how `_wait_for_ajax_spinner` fixed the earlier, structurally
-   similar employee-checklist race).
+The `ui-dialog-mask`/`j_idt737_modal` blocker chased across multiple sessions was always the
+automation clicking into the LEFT grid's checkbox -- a step that was never part of the real flow to
+begin with. Of course it kept timing out: it was fighting a stale, resetting grid for no reason,
+while the real Submit button sat unblocked on the Order Details panel the whole time. No
+mask-clearing, no Escape, no re-click sequence was ever needed.
+
+**Fixed in `_schedule_stage_c_attempt`**: removed the entire `order_row2` re-selection and
+`_tick_row_checkbox` block after Event Details Confirm. The method now goes straight from Confirm
+to polling the (page-wide, already correctly-scoped) `button:has(span.fa-vote-yea)` Submit locator
+for `is_enabled()`, clicks it via the existing `_click_when_clear` overlay-safe helper, then handles
+its "Are you sure?" Yes dialog -- which the code already had correct logic for; it just never used
+to get reached.
+
+**Re-tested live (2026-08-31, same session): the mask/timeout bug is confirmed gone.** A fresh
+end-to-end run (`WO-PO/99999m4`) reached Submit cleanly with no `ui-dialog-mask` timeout at all --
+proof the removed `_tick_row_checkbox` block was the actual cause. But it surfaced a SECOND, real,
+previously-undiscovered bug that the mask bug had been masking: Submit correctly stayed disabled
+because Synergix rejected the booking with a visible `SV9010: Schedule time overlapped with other
+schedules` toast. Screenshot showed why: the Schedule Calendar's `31/08/2026` (today) slot already
+had a leftover green block from an earlier synthetic WO (`WO-PO/99999m2`), and `99999m4`'s own event
+was ALSO trying to book `31/08/2026` -- despite its payload's `job_date` being computed as
+`2026-03-22`, a completely different date. Root cause: `_fill_labeled_input`, reused for the Event
+Details popup's From/To fields, calls Playwright's `field.fill(value)` on a jQuery-UI/PrimeFaces
+datepicker input (`class="... hasDatepicker"`) -- `fill()` sets the raw DOM value (so the input
+visibly showed the right date) but does NOT fire the datepicker widget's own change handler, so
+Synergix's server-side booking silently kept using whatever date the widget's internal state was
+already on (today, its own default) -- a real, silent-failure-shaped bug, structurally the same
+class as `_select_external_remark`'s already-documented row-click bug just via a different
+mechanism. **Fixed**: `_fill_labeled_input` now dispatches a real `change` event on the field right
+after `fill()`, forcing the value to actually register -- harmless no-op for the method's
+non-datepicker callers (Enquiry/Subject, Reference No., etc.). Not yet re-verified live after this
+second fix (next step) -- also needs the leftover `WO-PO/99999m2`/`99999m4` colliding test Service
+Orders cleaned up in Schedule Board before re-testing, since they'll keep colliding with each other
+otherwise.
 
 ## ⚠️ Cloudflare bot protection
 `taskhub.ls2.sg` sits behind **Cloudflare bot protection**. HEADLESS Chromium gets blocked

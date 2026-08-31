@@ -978,6 +978,19 @@ class SynergixDriver:
         field = page.locator(f'[id="{input_id}"]')
         await self._click_when_clear(field)
         await field.fill(value)
+        # Confirmed live (2026-08-31) on WO-PO/99999m4: for a jQuery-UI/PrimeFaces datepicker input
+        # (class includes "hasDatepicker", seen on Schedule Board's Event Details From/To fields),
+        # Playwright's fill() sets the raw DOM value but does NOT fire the datepicker widget's own
+        # change handler -- Synergix's server-side booking still used its PREVIOUS date (defaulting
+        # to today) even though the input visibly showed the correct WO date, causing a real
+        # "SV9010: Schedule time overlapped with other schedules" collision against another test WO
+        # that also defaulted to today. A plain field.fill() looked like it worked (correct text in
+        # the input) but silently didn't commit -- the same "silent-failure shape" as
+        # _select_external_remark's row-click bug above, just via a different mechanism. Firing a
+        # real 'change' event (matching what the widget's own onSelect would dispatch after a
+        # calendar-day click) forces the value to actually register. Harmless no-op for any
+        # non-datepicker field this method is also used for (Enquiry/Subject, Reference No., etc.).
+        await field.evaluate("(el) => el.dispatchEvent(new Event('change', {bubbles: true}))")
 
     async def _select_external_remark(self, remark_code: str, *, timeout_ms: int = 6000) -> bool:
         """Set the 'External Remarks' field via its magnifying-glass search picker, selecting the
@@ -2455,73 +2468,35 @@ class SynergixDriver:
                     await self._screenshot(f"stage_c_dialog_stuck_{wo.replace('/', '-')}")
                     return False
 
-        # The grid/selection can reset after the popup's ajax refresh -- re-select the order before
-        # The grid/selection can reset after the popup's ajax refresh -- re-select the order before
-        # looking for the (now separately-appearing) Submit action.
-        # Confirmed live (2026-08-28): the Event Details submit's ajax reset was bigger than
-        # expected once -- not just page 1 / filter cleared (as already documented), but the grid's
-        # own Enquiry/Subject header did not resolve on the FIRST re-filter attempt right after the
-        # popup closed (the panel was still mid-reflow), so the fill() landed on nothing and the
-        # grid was left showing its unfiltered default. That mattered here because the Order Details
-        # panel on the right kept showing our order (the schedule itself DID commit -- confirmed via
-        # "TAN WEI YING 14/07/2026 - 14/07/2026" appearing under Order Details' own Schedule
-        # section), so the only visible symptom was Submit staying disabled with no other error --
-        # order_row2 was simply empty, so _tick_row_checkbox never got a checkbox to click. Retry the
-        # filter once, giving the reflow more time, before concluding the order truly isn't there.
-        order_row2 = None
-        for _ in range(2):
-            await _filter_orders_by_wo()
-            # Confirmed live (2026-08-31): a plain `tr` + text match can land on a Schedule Calendar
-            # row instead of the Unscheduled Service Orders grid row once an event has actually been
-            # scheduled -- by this point in the method the calendar DOES contain a real, colored
-            # event block whose cell text includes the same WO number, and Playwright's `.first`
-            # then non-deterministically grabbed whichever `<tr>` happened to be first in DOM order.
-            # Symptom: order_row2.count() > 0, but its own `.ui-chkbox-box` never has anything, since
-            # a calendar row has no such checkbox at all -- this was previously misread as "the
-            # order simply isn't there yet" (see the aged comment above). Scope to rows that
-            # actually contain a checkbox, which only the grid's own rows have.
-            order_row2 = page.locator("tr", has_text=wo_bare).filter(
-                has=page.locator(".ui-chkbox")
-            ).locator("visible=true").first
-            if await order_row2.count():
-                break
-            await page.wait_for_timeout(2000)
-        if order_row2 is not None and await order_row2.count():
-            # _click_when_clear, not a raw click -- confirmed live (2026-08-31) that the modal mask
-            # from the just-closed Event Details dialog (or its own trailing ajax) can still be
-            # covering this row for several seconds, causing "<div class=ui-dialog-mask> intercepts
-            # pointer events" here specifically, right after the popup supposedly finished closing.
-            # overlay_wait_ms widened to 45s for the same reason as _tick_row_checkbox below.
-            await self._click_when_clear(order_row2, timeout_ms=10000, overlay_wait_ms=45000)
-            await _wait_for_ajax_spinner("order re-select after popup")
-
+        # CORRECTED (2026-08-31, frame-by-frame review of JBTC WO Synergix.mp4 at 7:00-7:52):
+        # everything from here through Submit was WRONG in every prior version of this method. Every
+        # earlier session (including the 2026-08-26/28/31 comments preserved in git blame for this
+        # block) assumed Submit is gated on re-selecting the order row in the LEFT "Unscheduled
+        # Service Orders" grid and ticking its own .ui-chkbox -- that a fresh checkbox tick there is
+        # what flips the Order Details panel's Submit button from disabled to enabled. The video
+        # proves this is false: after the Event Details popup's Confirm closes, the human does NOT
+        # touch the left grid again at all (no re-filter, no row click, no checkbox click). The left
+        # grid visibly resets to an unrelated, unfiltered page underneath -- and that reset is
+        # harmless noise to be ignored, not a state to repair. The RIGHT-hand Order Details panel
+        # (already open the whole time, e.g. "Order Details[SV00008851]") is what matters: it still
+        # shows the "This Service Order has not been submitted" warning, and its own Submit
+        # link/button (top-left of that panel's own header, same fa-vote-yea icon used at every
+        # other stage-ending confirm in this app) is clicked DIRECTLY. Immediately after that click,
+        # the warning disappears and a new "Schedule" section appears at the bottom of Order Details
+        # showing the paired-with name (e.g. "INFIGO") -- the real, only success signal at this step.
+        #
+        # This also explains the entire `ui-dialog-mask`/`j_idt737_modal` blocker chased across
+        # multiple sessions (see docs/synergix_workflow.md's retracted "session timeout" theory): the
+        # blocked click was always on the LEFT grid's checkbox, which was never part of the real flow
+        # to begin with -- of course it kept timing out, it was clicking into a stale, resetting grid
+        # for no reason, while the real Submit button sat right there on the Order Details panel the
+        # whole time, unblocked. No mask-clearing, no Escape, no re-click sequence was ever needed.
         submit_btn = page.locator('button:has(span.fa-vote-yea)').locator("visible=true").first
         if not await submit_btn.count():
             logger.warning("Stage C: no Submit button found on Order Details for %s", wo)
             return False
-
-        async def _tick_row_checkbox() -> bool:
-            # Confirmed live (2026-08-26): clicking the row or its link text does NOT enable Submit --
-            # only the row's own ui-chkbox does, since its onchange explicitly ajax-updates
-            # "@(.pfs-all-selected) @(.submit-button)". Isolated via the discovery REPL's `js` command,
-            # watching document.querySelector("[id*=submitButton]")?.disabled flip True -> False only
-            # after this specific checkbox (not the row) was clicked.
-            checkbox = order_row2.locator(".ui-chkbox-box").locator("visible=true").first
-            if not await checkbox.count():
-                return False
-            # overlay_wait_ms widened to 45s (2026-08-31): confirmed live that the ui-dialog-mask
-            # left over from Event Details' own Confirm ajax (which can itself take ~18-30s, see
-            # the Confirm click above) can still be covering this checkbox well past
-            # _click_when_clear's previous 30s default wait -- this is the SAME class of "measure,
-            # don't guess" fix as the Confirm spinner wait, just a step later in the sequence.
-            await self._click_when_clear(checkbox, timeout_ms=10000, overlay_wait_ms=45000)
-            await _wait_for_ajax_spinner("row checkbox tick")
-            return True
-
-        await _tick_row_checkbox()
-        # Confirmed live (2026-08-26) that this button can still read disabled right after
-        # re-selecting the order row -- poll for it to actually enable before giving up, same
-        # ajax-timing tolerance pattern used throughout this file.
+        # Poll for it to read enabled -- confirmed live the schedule-commit ajax from Confirm can
+        # still be settling for a second or two after the dialog itself has closed.
         enabled = False
         for _ in range(10):  # ~5s
             if await submit_btn.is_enabled():
@@ -2529,22 +2504,15 @@ class SynergixDriver:
                 break
             await page.wait_for_timeout(500)
         if not enabled:
-            logger.warning("Stage C: Submit button stayed disabled for %s -- re-selecting the order "
-                            "row and its checkbox once more", wo)
-            if await order_row2.count():
-                await order_row2.click(timeout=10000)
-                await _wait_for_ajax_spinner("order re-select retry")
-                await _tick_row_checkbox()
-            for _ in range(10):
-                if await submit_btn.is_enabled():
-                    enabled = True
-                    break
-                await page.wait_for_timeout(500)
-        if not enabled:
             logger.warning("Stage C: Submit button never enabled for %s", wo)
             await self._screenshot(f"stage_c_submit_disabled_{wo.replace('/', '-')}")
             return False
-        await submit_btn.click(timeout=10000)
+        await self._click_when_clear(submit_btn, timeout_ms=10000, overlay_wait_ms=30000)
+        # Confirmed in the video (frame at 7:27.93): this Submit click raises its own separate
+        # "Confirmation -- Are you sure?" Yes/No dialog -- distinct from Event Details' own Confirm
+        # popup earlier in this method. The existing Yes-click below already anticipated this
+        # correctly; it just never used to get reached because the grid-checkbox re-selection this
+        # replaced was blocking every attempt before Submit was ever clicked.
         await page.wait_for_timeout(1500)
         yes_btn = page.get_by_role("button", name="Yes").locator("visible=true")
         if await yes_btn.count():
