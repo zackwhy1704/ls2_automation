@@ -2523,10 +2523,20 @@ class SynergixDriver:
         if not await submit_btn.count():
             logger.warning("Stage C: no Submit button found on Order Details for %s", wo)
             return False
-        # Poll for it to read enabled -- confirmed live the schedule-commit ajax from Confirm can
-        # still be settling for a second or two after the dialog itself has closed.
+        # Poll for it to read enabled. Widened from 5s to 30s (2026-09-01) after WO-PO/99999m9:
+        # confirmed live via screenshot that a 5s-timeout "failure" here was a FALSE NEGATIVE -- the
+        # schedule had genuinely committed server-side (calendar showed the real, correctly-dated
+        # green event block; Order Details' own "Schedule" section showed "INFIGO / 800SUPER /
+        # 18/03/2026 - 18/03/2026") -- Submit just hadn't caught up to enabled within 5s on a slow
+        # response (the SAME "Event Details confirm" ajax call already documented above as taking up
+        # to ~18-30s). Because this false failure triggered a hard-reset retry, attempt 2 then
+        # re-opened a SECOND Event Details dialog on the now-already-scheduled event and got stuck
+        # (no SV9104 text this time, so the existing self-collision guard didn't catch it either) --
+        # the retry made things WORSE, not better. Giving Submit's own poll the same generous budget
+        # as the Confirm ajax it depends on should let genuinely-slow-but-successful runs finish on
+        # attempt 1 instead of forcing a needless, harmful retry.
         enabled = False
-        for _ in range(10):  # ~5s
+        for _ in range(60):  # ~30s
             if await submit_btn.is_enabled():
                 enabled = True
                 break
