@@ -2204,6 +2204,40 @@ class SynergixDriver:
             # coordinate-based pattern used by _click_filter_link/_mouse_click_ui_button.
             return await _click_visible_text("Clear All")
 
+        async def _wait_for_ajax_spinner(label: str, *, timeout_s: float = 15) -> None:
+            # THE REAL FIX for the employee-checklist race (found live with the user, 2026-08-31):
+            # Synergix has a genuine, visible global ajax indicator -- <img class="js-ajax-spinner">
+            # in the page footer, id like "j_idt7501:j_idt7503", display:none when idle -- that the
+            # user demonstrated live: click the order row -> watch the spinner run -> wait for it to
+            # finish -> THEN click the Employee toggle -> watch it run again -> wait for it to finish
+            # -> the checklist is populated. Every previous "fix" in this method (real mouse clicks,
+            # Clear All, hard resets, re-navigation) was working around this same root cause: fixed
+            # `wait_for_timeout()` calls only guess how long the server's ajax response takes, and a
+            # click issued before the PREVIOUS click's ajax has actually finished lands on a page
+            # still mid-update. Confirmed live: waiting for this exact spinner's visible->hidden
+            # cycle after each click reproduced a populated checklist 4/4 times in isolated testing,
+            # including on a WO where the checklist didn't appear until the check after the SECOND
+            # (Employee) click -- so this is called after every click in the sequence below, not
+            # just once.
+            spinner = page.locator("img.js-ajax-spinner").first
+            became_visible = False
+            for _ in range(15):  # ~3s grace period to catch the spinner appearing at all
+                if await spinner.is_visible():
+                    became_visible = True
+                    break
+                await page.wait_for_timeout(200)
+            if not became_visible:
+                # No ajax observed for this click -- nothing to wait out. Not necessarily an error:
+                # some clicks (e.g. a toggle that was already in the target state) are genuine no-ops.
+                return
+            deadline_polls = int(timeout_s / 0.2)
+            for _ in range(deadline_polls):
+                if not await spinner.is_visible():
+                    return
+                await page.wait_for_timeout(200)
+            logger.warning("Stage C: ajax spinner still visible %.1fs after %s -- proceeding anyway",
+                            timeout_s, label)
+
         await _filter_orders_by_wo()
 
         # Confirmed live (2026-08-27) on WO-PO/000077662: the row genuinely existed (verified
@@ -2220,7 +2254,8 @@ class SynergixDriver:
         order_no_cell = order_row.locator("td").nth(1)
         order_no = (await order_no_cell.inner_text()).strip()
         await order_row.click(timeout=10000)
-        await page.wait_for_timeout(2000)
+        await _wait_for_ajax_spinner("row selection")
+        await page.wait_for_timeout(500)  # small settle margin on top of the real ajax-done signal
 
         async def _mouse_click_ui_button(label: str) -> bool:
             # Confirmed live (2026-08-28): a JS-dispatched btn.click() on this toggle is a no-op as
@@ -2249,7 +2284,7 @@ class SynergixDriver:
         employee_active = False
         for _ in range(3):
             await _mouse_click_ui_button("Employee")
-            await page.wait_for_timeout(1500)
+            await _wait_for_ajax_spinner("Employee toggle")
             employee_active = await page.evaluate(
                 """() => {
                     const btn = [...document.querySelectorAll('div.ui-button')]
@@ -2268,7 +2303,7 @@ class SynergixDriver:
             logger.warning("Stage C: could not click the Employee Filter link for %s", wo)
             await self._screenshot(f"stage_c_no_filter_link_{wo.replace('/', '-')}")
             return False
-        await page.wait_for_timeout(2000)
+        await _wait_for_ajax_spinner("Filter panel open")
 
         # Confirmed live (2026-08-26) that the checkbox list can still be genuinely empty in the DOM
         # several seconds after the Filter panel visibly opens -- a fixed 2s wait was not enough on a
@@ -2286,23 +2321,28 @@ class SynergixDriver:
         # force a fresh ajax repopulate, since the toggle's own onchange is the only known trigger
         # for this list to (re)render at all.
         #
-        # IMPORTANT root-cause finding (2026-08-30), from isolated side-by-side testing via
-        # scripts/synergix_discover_schedule_fulfil.py: a "Clear All -> Employee -> Filter" sequence
-        # (added below) DOES reliably repopulate the checklist -- but ONLY when performed on Schedule
-        # Board's Employee/Filter controls directly, with no specific Service Order row selected.
-        # The SAME exact sequence, run after clicking into a specific Unscheduled Service Order row
-        # first (which is what this method always does, since it needs a specific order selected to
-        # assign an employee to), reproducibly leaves the checklist's <div class="ui-panel-content">
-        # present and "open" (visible, flex, non-'none' display) but with ZERO checkbox HTML ever
-        # rendered inside it -- confirmed via innerHTML inspection, not just visual/CSS state. This
-        # means the employee checklist's ajax repopulate is scoped to (or depends on) something
-        # about the "no order selected" page state, and genuinely does not fire the same way once a
-        # specific order is the active selection. This is a server-side behavior difference this
-        # method has no confirmed way to work around from the client side -- the Clear-All sequence
-        # below is kept because it's a real, harmless improvement (it DOES help in the no-row-selected
-        # case, e.g. if the row selection is ever lost mid-attempt), but it is NOT a fix for the
-        # per-order checklist-empty failure this method exists to work around. That failure remains
-        # best-effort: retry, hard-reset, then surface to a human.
+        # CORRECTION (2026-08-31): the 2026-08-30 note below (still kept for its Clear-All finding)
+        # concluded the checklist-empty failure was a deterministic server-side rule tied to having a
+        # row selected. That conclusion was WRONG and has been retracted -- it was based on an A/B
+        # test that varied row-selected vs. not, but NEVER controlled for automation vs. a human
+        # doing the identical steps, which is the variable that actually mattered. Verified live with
+        # the user (2026-08-31): the real fix is waiting for Synergix's own global ajax indicator
+        # (<img class="js-ajax-spinner"> in the page footer, see _wait_for_ajax_spinner) to finish
+        # after EACH click, not a fixed timeout -- the user demonstrated this by hand (click row ->
+        # watch the spinner run -> wait -> click Employee -> watch it run again -> wait -> checklist
+        # populated), and it was confirmed 4/4 in isolated scripted testing once the fixed
+        # `wait_for_timeout()` calls around the row click and Employee/Filter clicks were replaced
+        # with a real wait for that spinner's visible->hidden cycle (done above and via
+        # _wait_for_ajax_spinner calls threaded through this method as of this commit). The
+        # documented "empty checklist even with Employee active" symptom across many prior sessions
+        # was a client issued its next click before the previous click's ajax response had actually
+        # landed -- not a Synergix-side bug and not something row-selection state controls.
+        #
+        # 2026-08-30 finding (Clear-All), kept for reference -- still a real, harmless improvement:
+        # a "Clear All -> Employee -> Filter" sequence reliably repopulates the checklist when
+        # performed with no specific Service Order row selected. Superseded as the PRIMARY fix by
+        # the spinner-wait above, but left in the retry loop below since it costs little and may
+        # still help recover a genuinely stuck state.
         employee_checkbox_js = """(name) => {
                 const label = [...document.querySelectorAll('label')]
                   .find(l => l.textContent.trim() === name);
@@ -2365,11 +2405,11 @@ class SynergixDriver:
                 if not await order_row3.count():
                     continue
                 await order_row3.click(timeout=10000)
-                await page.wait_for_timeout(2000)
+                await _wait_for_ajax_spinner("row selection (re-navigation)")
                 await _mouse_click_ui_button("Employee")
-                await page.wait_for_timeout(1500)
+                await _wait_for_ajax_spinner("Employee toggle (re-navigation)")
                 await _click_filter_link()
-                await page.wait_for_timeout(2000)
+                await _wait_for_ajax_spinner("Filter panel open (re-navigation)")
                 # Same Clear All -> Employee -> Filter sequence as the in-page recovery loop above
                 # -- confirmed live (2026-08-30) as the actual fix, so apply it here too rather than
                 # relying on the poll below to save a re-navigation attempt that's missing it.
@@ -2480,7 +2520,12 @@ class SynergixDriver:
         # ajax call) while the click itself lands on the mask, opening nothing. This is exactly what
         # _click_when_clear exists for elsewhere in this file -- reuse it here.
         new_event_btn = page.locator(f'[id="{new_event_btn_id}"]')
-        await self._click_when_clear(new_event_btn, timeout_ms=10000)
+        try:
+            await self._click_when_clear(new_event_btn, timeout_ms=10000)
+        except Exception:
+            logger.exception("Stage C: newEventButton click failed for %s (id=%s)", wo, new_event_btn_id)
+            await self._screenshot(f"stage_c_newevent_click_failed_{wo.replace('/', '-')}")
+            raise
 
         # Confirmed live (2026-08-28): the "Event Details" dialog takes ~8s to actually render
         # (console showed "ajaxStatus onstart" immediately but no dialog for several seconds, then
