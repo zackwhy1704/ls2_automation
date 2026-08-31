@@ -2101,6 +2101,25 @@ class SynergixDriver:
 
         await self._open_schedule_board()
 
+        # Step 1 per the JBTC workflow doc (docs shared 2026-08-31, "JBTC_Adhoc_Pest_Control_
+        # Billing_Workflow.docx", Stage C Step 1 screenshot): collapse the right-side Customer Info
+        # panel via the layout toggle (a right-pointing triangle, class "ui-layout-unit-header-icon",
+        # NOT the Unscheduled Service Orders panel's own titlebar minimize icon -- confirmed live
+        # 2026-08-31 that clicking the wrong one just collapses the order grid instead). This is the
+        # VERY FIRST action the documented human workflow takes on this page, done before anything
+        # else -- this driver never did it before this commit, running the whole rest of Stage C in
+        # a cramped ~1030px-wide layout instead of the full 1920px width the human process uses.
+        # Best-effort: if the toggle isn't present (e.g. already collapsed from a prior attempt in
+        # the same session), proceed anyway rather than fail Stage C over a cosmetic step.
+        try:
+            layout_toggle = page.locator("a.ui-layout-unit-header-icon").first
+            if await layout_toggle.count():
+                await layout_toggle.click(timeout=5000)
+                await page.wait_for_timeout(1000)
+        except Exception:
+            logger.warning("Stage C: could not collapse the Customer Info panel for %s -- "
+                            "continuing anyway", wo)
+
         wo_bare = wo.replace("WO-PO/", "")
 
         async def _filter_orders_by_wo() -> None:
@@ -2400,6 +2419,13 @@ class SynergixDriver:
                 logger.warning("Stage C: employee checklist still empty for %s -- full "
                                 "re-navigation attempt %d/3", wo, renav_attempt)
                 await self._open_schedule_board()
+                try:
+                    layout_toggle = page.locator("a.ui-layout-unit-header-icon").first
+                    if await layout_toggle.count():
+                        await layout_toggle.click(timeout=5000)
+                        await page.wait_for_timeout(1000)
+                except Exception:
+                    pass
                 await _filter_orders_by_wo()
                 order_row3 = page.locator("tr", has_text=wo_bare).locator("visible=true").first
                 if not await order_row3.count():
@@ -2486,6 +2512,13 @@ class SynergixDriver:
                             SCHEDULE_EMPLOYEE, wo)
             await self._screenshot(f"stage_c_no_calendar_row_{wo.replace('/', '-')}")
             return False
+        # The calendar row's own hour-cell/newEventButton structure can still be mid-render for a
+        # moment after the row's NAME cell first appears (same class of race the employee-checklist
+        # fix addressed, see _wait_for_ajax_spinner's docstring) -- wait for any trailing ajax to
+        # settle before computing the button id below, rather than grabbing it the instant the name
+        # cell exists.
+        await _wait_for_ajax_spinner("calendar row render")
+        await page.wait_for_timeout(500)
 
         # Scoped to the employee's OWN row -- confirmed live (2026-08-26) that a bare
         # [id*="newEventButton"] .first can land on a DIFFERENT employee's cell when more than one
@@ -2521,7 +2554,11 @@ class SynergixDriver:
         # _click_when_clear exists for elsewhere in this file -- reuse it here.
         new_event_btn = page.locator(f'[id="{new_event_btn_id}"]')
         try:
-            await self._click_when_clear(new_event_btn, timeout_ms=10000)
+            await new_event_btn.scroll_into_view_if_needed(timeout=5000)
+        except Exception:
+            pass  # best-effort; the click below will raise its own clear error if this matters
+        try:
+            await self._click_when_clear(new_event_btn, timeout_ms=15000)
         except Exception:
             logger.exception("Stage C: newEventButton click failed for %s (id=%s)", wo, new_event_btn_id)
             await self._screenshot(f"stage_c_newevent_click_failed_{wo.replace('/', '-')}")
@@ -2639,25 +2676,44 @@ class SynergixDriver:
             logger.warning("Stage C: no Event Details confirm button found for %s", wo)
             return False
         await confirm_btn.click(timeout=10000)
-        await page.wait_for_timeout(4000)
+        await _wait_for_ajax_spinner("Event Details confirm")
         # Confirmed live (2026-08-26) that this click can leave the dialog (and its modal overlay)
         # still open, which then blocks every subsequent click with "<div class=ui-dialog-mask>
-        # intercepts pointer events" for a full 30s timeout. Wait for it to actually close, retrying
-        # the confirm click once if it hasn't.
+        # intercepts pointer events" for a full 30s timeout. Wait for it to actually close.
+        #
+        # IMPORTANT (2026-08-31): do NOT blindly re-click Confirm just because the dialog is still
+        # showing after the wait -- confirmed live that the first click can genuinely succeed
+        # server-side (the event visibly commits to the calendar) while the dialog itself is slow
+        # to detach, and clicking Confirm a SECOND time on an already-scheduled event re-submits the
+        # same booking and collides with itself, surfacing Synergix's own "SV9104: you can only book
+        # one task on the same Timeslot" error -- a real, self-inflicted duplicate-submit bug, not a
+        # Synergix flaw. Check the actual toast/error state before deciding whether a retry is safe.
         try:
             await event_dialog.wait_for(state="hidden", timeout=8000)
         except Exception:
-            logger.warning("Stage C: Event Details dialog still open after Confirm for %s -- "
-                            "retrying the click", wo)
-            if await confirm_btn.count():
-                await confirm_btn.click(timeout=10000)
-                await page.wait_for_timeout(4000)
-            try:
-                await event_dialog.wait_for(state="hidden", timeout=8000)
-            except Exception:
-                logger.warning("Stage C: Event Details dialog would not close for %s", wo)
-                await self._screenshot(f"stage_c_dialog_stuck_{wo.replace('/', '-')}")
-                return False
+            sv9104_shown = await page.locator("text=/SV9104/").locator("visible=true").count() > 0
+            if sv9104_shown:
+                logger.warning("Stage C: Confirm already succeeded for %s (SV9104 duplicate-booking "
+                                "message from a stray double-submit) -- treating as scheduled, not "
+                                "retrying", wo)
+                close_btn = event_dialog.locator(
+                    'a.ui-dialog-titlebar-close[aria-label="Close"]'
+                ).locator("visible=true").first
+                if await close_btn.count():
+                    await close_btn.click(timeout=5000)
+                    await page.wait_for_timeout(1000)
+            else:
+                logger.warning("Stage C: Event Details dialog still open after Confirm for %s -- "
+                                "retrying the click", wo)
+                if await confirm_btn.count():
+                    await confirm_btn.click(timeout=10000)
+                    await _wait_for_ajax_spinner("Event Details confirm retry")
+                try:
+                    await event_dialog.wait_for(state="hidden", timeout=8000)
+                except Exception:
+                    logger.warning("Stage C: Event Details dialog would not close for %s", wo)
+                    await self._screenshot(f"stage_c_dialog_stuck_{wo.replace('/', '-')}")
+                    return False
 
         # The grid/selection can reset after the popup's ajax refresh -- re-select the order before
         # looking for the (now separately-appearing) Submit action.
@@ -2679,8 +2735,12 @@ class SynergixDriver:
                 break
             await page.wait_for_timeout(2000)
         if order_row2 is not None and await order_row2.count():
-            await order_row2.click(timeout=10000)
-            await page.wait_for_timeout(2000)
+            # _click_when_clear, not a raw click -- confirmed live (2026-08-31) that the modal mask
+            # from the just-closed Event Details dialog (or its own trailing ajax) can still be
+            # covering this row for several seconds, causing "<div class=ui-dialog-mask> intercepts
+            # pointer events" here specifically, right after the popup supposedly finished closing.
+            await self._click_when_clear(order_row2, timeout_ms=10000)
+            await _wait_for_ajax_spinner("order re-select after popup")
 
         submit_btn = page.locator('button:has(span.fa-vote-yea)').locator("visible=true").first
         if not await submit_btn.count():
@@ -2696,8 +2756,8 @@ class SynergixDriver:
             checkbox = order_row2.locator(".ui-chkbox-box").locator("visible=true").first
             if not await checkbox.count():
                 return False
-            await checkbox.click(timeout=10000)
-            await page.wait_for_timeout(1500)
+            await self._click_when_clear(checkbox, timeout_ms=10000)
+            await _wait_for_ajax_spinner("row checkbox tick")
             return True
 
         await _tick_row_checkbox()
@@ -2715,7 +2775,7 @@ class SynergixDriver:
                             "row and its checkbox once more", wo)
             if await order_row2.count():
                 await order_row2.click(timeout=10000)
-                await page.wait_for_timeout(2000)
+                await _wait_for_ajax_spinner("order re-select retry")
                 await _tick_row_checkbox()
             for _ in range(10):
                 if await submit_btn.is_enabled():

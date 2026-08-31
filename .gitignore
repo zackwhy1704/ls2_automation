@@ -28,3 +28,4 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+.DS_Store

@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from datetime import date
+from datetime import date, timedelta
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s :: %(message)s")
 
@@ -32,6 +32,15 @@ from src.synergix_driver import DedupResult, SynergixDriver
 
 SUFFIX = sys.argv[1] if len(sys.argv) > 1 else "01"
 WO_NUMBER = f"WO-PO/99999{SUFFIX}"
+# A unique job date per run, derived from the suffix's characters (NOT Python's hash() -- that's
+# randomized per-process by default and gave collisions across separate script invocations).
+# Multiple synthetic test WOs sharing the SAME job_date all collide on Schedule Board with
+# Synergix's own genuine "SV9104: you can only book one task on the same Timeslot" validation
+# once any one of them gets scheduled (confirmed live 2026-08-31, twice, on WO-PO/99999i1 and
+# WO-PO/99999i2 after earlier same-dated synthetic WOs). Spread runs across different dates so
+# this class of test doesn't self-collide.
+_day_offset = sum(ord(c) for c in SUFFIX) % 300
+JOB_DATE = date(2026, 9, 1) + timedelta(days=_day_offset)
 
 
 def build_payload() -> WOPayload:
@@ -41,7 +50,7 @@ def build_payload() -> WOPayload:
         job_sheet_number=f"TEST{SUFFIX}",
         service_location="Blk 52 Chin Swee Road (SYNTHETIC TEST RECORD)",
         nature_of_work="SYNTHETIC TEST -- Stage C clean-sample testing, safe to delete",
-        job_date=date(2026, 8, 31),
+        job_date=JOB_DATE,
         prepared_by="test-harness",
         gl_number="431-KK-KKR3P1-160052-0-721010-0000",
         quantity=1.0,
