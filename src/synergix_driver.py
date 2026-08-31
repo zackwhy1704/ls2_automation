@@ -2661,7 +2661,15 @@ class SynergixDriver:
             logger.warning("Stage C: no Event Details confirm button found for %s", wo)
             return False
         await confirm_btn.click(timeout=10000)
-        await _wait_for_ajax_spinner("Event Details confirm")
+        # Confirmed live (2026-08-31), by polling masks/dialog/spinner state every second: the
+        # Confirm ajax call can genuinely take ~18s to complete (spinner visible continuously for
+        # 18s, then dialog+mask cleared cleanly in the SAME second with no error) -- not a hang, a
+        # real slow operation. The 15s spinner-wait + 8s dialog-hidden-wait budgets used before this
+        # were BOTH individually shorter than that observed real duration, so the code was reaching
+        # the "still open, retry" branch on a request that was still genuinely in flight, not stuck
+        # -- and the retry then collided with the original's own success (see the SV9104 handling
+        # below). Widened to 30s/20s to give real margin above the slowest observed case.
+        await _wait_for_ajax_spinner("Event Details confirm", timeout_s=30)
         # Confirmed live (2026-08-26) that this click can leave the dialog (and its modal overlay)
         # still open, which then blocks every subsequent click with "<div class=ui-dialog-mask>
         # intercepts pointer events" for a full 30s timeout. Wait for it to actually close.
@@ -2674,7 +2682,7 @@ class SynergixDriver:
         # one task on the same Timeslot" error -- a real, self-inflicted duplicate-submit bug, not a
         # Synergix flaw. Check the actual toast/error state before deciding whether a retry is safe.
         try:
-            await event_dialog.wait_for(state="hidden", timeout=8000)
+            await event_dialog.wait_for(state="hidden", timeout=20000)
         except Exception:
             sv9104_shown = await page.locator("text=/SV9104/").locator("visible=true").count() > 0
             if sv9104_shown:
@@ -2692,9 +2700,9 @@ class SynergixDriver:
                                 "retrying the click", wo)
                 if await confirm_btn.count():
                     await confirm_btn.click(timeout=10000)
-                    await _wait_for_ajax_spinner("Event Details confirm retry")
+                    await _wait_for_ajax_spinner("Event Details confirm retry", timeout_s=30)
                 try:
-                    await event_dialog.wait_for(state="hidden", timeout=8000)
+                    await event_dialog.wait_for(state="hidden", timeout=20000)
                 except Exception:
                     logger.warning("Stage C: Event Details dialog would not close for %s", wo)
                     await self._screenshot(f"stage_c_dialog_stuck_{wo.replace('/', '-')}")
@@ -2715,7 +2723,18 @@ class SynergixDriver:
         order_row2 = None
         for _ in range(2):
             await _filter_orders_by_wo()
-            order_row2 = page.locator("tr", has_text=wo_bare).locator("visible=true").first
+            # Confirmed live (2026-08-31): a plain `tr` + text match can land on a Schedule Calendar
+            # row instead of the Unscheduled Service Orders grid row once an event has actually been
+            # scheduled -- by this point in the method the calendar DOES contain a real, colored
+            # event block whose cell text includes the same WO number, and Playwright's `.first`
+            # then non-deterministically grabbed whichever `<tr>` happened to be first in DOM order.
+            # Symptom: order_row2.count() > 0, but its own `.ui-chkbox-box` never has anything, since
+            # a calendar row has no such checkbox at all -- this was previously misread as "the
+            # order simply isn't there yet" (see the aged comment above). Scope to rows that
+            # actually contain a checkbox, which only the grid's own rows have.
+            order_row2 = page.locator("tr", has_text=wo_bare).filter(
+                has=page.locator(".ui-chkbox")
+            ).locator("visible=true").first
             if await order_row2.count():
                 break
             await page.wait_for_timeout(2000)
