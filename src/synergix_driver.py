@@ -2101,24 +2101,16 @@ class SynergixDriver:
 
         await self._open_schedule_board()
 
-        # Step 1 per the JBTC workflow doc (docs shared 2026-08-31, "JBTC_Adhoc_Pest_Control_
-        # Billing_Workflow.docx", Stage C Step 1 screenshot): collapse the right-side Customer Info
-        # panel via the layout toggle (a right-pointing triangle, class "ui-layout-unit-header-icon",
-        # NOT the Unscheduled Service Orders panel's own titlebar minimize icon -- confirmed live
-        # 2026-08-31 that clicking the wrong one just collapses the order grid instead). This is the
-        # VERY FIRST action the documented human workflow takes on this page, done before anything
-        # else -- this driver never did it before this commit, running the whole rest of Stage C in
-        # a cramped ~1030px-wide layout instead of the full 1920px width the human process uses.
-        # Best-effort: if the toggle isn't present (e.g. already collapsed from a prior attempt in
-        # the same session), proceed anyway rather than fail Stage C over a cosmetic step.
-        try:
-            layout_toggle = page.locator("a.ui-layout-unit-header-icon").first
-            if await layout_toggle.count():
-                await layout_toggle.click(timeout=5000)
-                await page.wait_for_timeout(1000)
-        except Exception:
-            logger.warning("Stage C: could not collapse the Customer Info panel for %s -- "
-                            "continuing anyway", wo)
+        # REVERTED (2026-08-31, same day as added): the JBTC workflow doc's Stage C Step 1 shows
+        # the human collapsing the right-side Customer Info panel first (via a layout toggle,
+        # a.ui-layout-unit-header-icon, a right-pointing triangle -- NOT the Unscheduled Service
+        # Orders panel's own titlebar minimize icon). Adding this step here reproduced a NEW
+        # click-intercept failure on the Employee toggle itself (its own parent buttonset container
+        # started intercepting pointer events) that had never once occurred in ~15 prior live test
+        # runs without it. Not confirmed as definitely caused by the collapse (could be coincidental
+        # timing/layout-reflow flakiness), but reverted out of caution rather than risk stacking a
+        # new regression on top of the still-unresolved dialog-mask blocker below. If revisited,
+        # test the collapse step in isolation first, independent of the rest of Stage C.
 
         wo_bare = wo.replace("WO-PO/", "")
 
@@ -2419,13 +2411,6 @@ class SynergixDriver:
                 logger.warning("Stage C: employee checklist still empty for %s -- full "
                                 "re-navigation attempt %d/3", wo, renav_attempt)
                 await self._open_schedule_board()
-                try:
-                    layout_toggle = page.locator("a.ui-layout-unit-header-icon").first
-                    if await layout_toggle.count():
-                        await layout_toggle.click(timeout=5000)
-                        await page.wait_for_timeout(1000)
-                except Exception:
-                    pass
                 await _filter_orders_by_wo()
                 order_row3 = page.locator("tr", has_text=wo_bare).locator("visible=true").first
                 if not await order_row3.count():
