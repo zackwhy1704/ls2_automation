@@ -356,6 +356,65 @@ second fix (next step) -- also needs the leftover `WO-PO/99999m2`/`99999m4` coll
 Orders cleaned up in Schedule Board before re-testing, since they'll keep colliding with each other
 otherwise.
 
+### Two more bugs found chasing full end-to-end verification (2026-09-01)
+
+**Bug 3 -- Event Details Confirm click needed the same overlay-safe treatment as everything else.**
+Re-testing the two fixes above (`WO-PO/99999m4`, then `/99999m6`) surfaced a NEW symptom that did not
+happen before the datepicker fix existed: "Stage C: Event Details dialog still open after Confirm",
+on both attempts of the `m6` run. The `m6` failure screenshot showed the Event Details popup fully
+and CORRECTLY filled (From/To both `21/03/2026`, Assigned=800SUPER, INFIGO ticked) -- proving the
+datepicker fix itself works -- just sitting there un-dismissed. Cause: the From/To fields now each
+fire a real PrimeFaces ajax cascade via their new `change` event dispatch (see Bug 2 above), on top
+of the To Pair With tick's own ajax right before that -- and `confirm_btn.click(timeout=10000)` was
+a bare Playwright click with no overlay wait, the one click in this method that never got the
+`_click_when_clear` treatment every other click already has. **Fixed**: `confirm_btn` now goes
+through `_click_when_clear` like everything else. Not yet independently re-verified in isolation
+(only as part of the full re-test below).
+
+**Bug 4 -- `_select_external_remark`'s "no match" dialog-dismiss was wrong, twice.** Unrelated to
+Stage C -- a pre-existing Stage B flake (first seen this same day, this morning, on an unrelated WO
+before any Stage C work started) that recurred often enough during today's re-testing
+(`WO-PO/99999m5`, `/99999m7`, `/99999m8`) to repeatedly block verification. Symptom: `_select_
+external_remark("OCBC BANK DETAIL")` fails to match a row that a screenshot proves is plainly
+visible in the results table, then its "no match" fallback fails to actually close the search popup
+-- leaving it (and whatever invisibly blocks clicks underneath it) on screen for the rest of the run,
+which then hard-crashes the NEXT unrelated click (`button.add-row-button`, adding a Details line
+item) with a 30s Playwright timeout instead of degrading to "field left blank" the way this method's
+own docstring already promises. Took two attempts to fix correctly:
+- **First attempt (wrong)**: assumed this is a modal PrimeFaces `p:dialog` (like Event Details) and
+  added a check for a generic `.ui-widget-overlay`/`.ui-dialog-mask` before clicking a titlebar close
+  (X) icon. Confirmed wrong immediately on the very next run (`WO-PO/99999m8`): that run's own
+  Playwright error log showed the actual intercepting element is
+  `<div id="searchPanel" class="ui-outputpanel ui-widget">` itself, NOT a `.ui-dialog-mask` -- so the
+  mask check was always false, the close-button click never ran, and there was no titlebar close icon
+  to find in the first place.
+- **Second attempt (current)**: this is a NON-modal PrimeFaces overlay panel (the same family as an
+  autocomplete/selectOneMenu dropdown, not a modal dialog) -- dismissed the standard way, a click
+  anywhere outside the panel. Replaced the close-button click with `page.mouse.click(10, 10)` (a
+  neutral, always-present point on the page header) when `#searchPanel` is confirmed still visible
+  after Escape. **The underlying row-match logic itself (`'[id$="searchResultTable"]'`) is still
+  unconfirmed/likely wrong** and was NOT fixed -- only the fallout (the stuck popup) was addressed,
+  since a human-visible match failure on a plainly-present row wasn't independently investigated via
+  a live DOM dump. If this recurs, the next debugging step should be a short-lived script that stops
+  and holds the browser open with the popup showing, so its exact live structure can be read directly
+  instead of inferred from a screenshot and an error log's partial DOM excerpts.
+
+**Status as of this write-up: a genuine, clean, fully-automated Stage A-D `PROCESSED` result has
+still NOT been achieved.** Every attempt today ended in either a Stage B crash (Bug 4, before the
+fix) or a Stage C failure now believed fixed (Bugs 1-3) but not yet proven by an unbroken run all the
+way through. A fresh end-to-end test with all four fixes applied (`WO-PO/99999m9`) was started
+immediately after Bug 4's second fix and was still in progress (Stage B in flight) when this section
+was written -- its outcome is not yet known and must be checked and recorded as its own follow-up,
+not assumed from the fixes alone. Do not report or act on a "PROCESSED" claim for `99999m9` (or any
+WO) without first confirming it in that run's own log / a fresh screenshot.
+
+**Test-data note**: `WO-PO/99999m2`, `m4`, `m5`, `m6`, `m7`, `m8` are all synthetic test Service
+Orders left behind in Synergix (`copy.` environment only) from today's debugging -- safe to delete,
+not yet cleaned up. `m2` and `m4` in particular sit on colliding Schedule Board dates
+(`2026-03-24`/`2026-03-22` per their payloads, but see Bug 2 -- some may still show as booked on
+`31/08/2026` if they were scheduled before the datepicker fix landed) and should be deleted before
+any further Stage C testing to avoid a false SV9010 collision unrelated to the code under test.
+
 ## ⚠️ Cloudflare bot protection
 `taskhub.ls2.sg` sits behind **Cloudflare bot protection**. HEADLESS Chromium gets blocked
 ("Sorry, you have been blocked"), and rapid repeated automated hits trigger an **IP-level block**
