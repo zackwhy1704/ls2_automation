@@ -399,14 +399,78 @@ own docstring already promises. Took two attempts to fix correctly:
   and holds the browser open with the popup showing, so its exact live structure can be read directly
   instead of inferred from a screenshot and an error log's partial DOM excerpts.
 
-**Status as of this write-up: a genuine, clean, fully-automated Stage A-D `PROCESSED` result has
-still NOT been achieved.** Every attempt today ended in either a Stage B crash (Bug 4, before the
-fix) or a Stage C failure now believed fixed (Bugs 1-3) but not yet proven by an unbroken run all the
-way through. A fresh end-to-end test with all four fixes applied (`WO-PO/99999m9`) was started
-immediately after Bug 4's second fix and was still in progress (Stage B in flight) when this section
-was written -- its outcome is not yet known and must be checked and recorded as its own follow-up,
-not assumed from the fixes alone. Do not report or act on a "PROCESSED" claim for `99999m9` (or any
-WO) without first confirming it in that run's own log / a fresh screenshot.
+### Bug 5 -- Stage C Submit-enable poll was too short, causing a harmful false-negative retry
+
+`WO-PO/99999m9`'s attempt 1 gave up on Submit after only ~5s and hard-reset for a retry -- but its
+own screenshot (`logs/synergix_error_stage_c_submit_disabled_WO-PO-99999m9.png`) proved the schedule
+had ALREADY committed correctly server-side: the calendar showed a real green event block, and Order
+Details' own "Schedule" section read "INFIGO / 800SUPER / 18/03/2026 - 18/03/2026" -- exactly
+matching the payload, no date collision, nothing wrong. Submit just hadn't caught up to enabled
+within the too-short 5s poll (the same "Event Details confirm" ajax this method already documents
+elsewhere as taking up to ~18-30s). The false failure then triggered attempt 2, which re-opened a
+SECOND Event Details dialog on the now-already-scheduled event and got stuck (no SV9104 text this
+time, so the guard didn't catch it) -- the retry made the run worse, not better.
+
+**Fixed**: widened the poll from ~5s to ~30s to match the ajax's own documented slowness. This is a
+genuinely promising fix, since it's the first time a screenshot proved Stage C's actual scheduling
+logic (assignment, pairing, date) working end-to-end correctly -- the only remaining gap was giving
+Submit enough time to reflect that success. Not yet independently re-verified in isolation (only as
+part of the fuller re-test below, which hit an unrelated Stage B issue before reaching Stage C again).
+
+### Bug 4's fix status: STILL UNRESOLVED, despite two "fixes" -- do not trust either commit
+
+Re-testing after Bug 5's fix (`WO-PO/99999m10`) hit the External Remarks crash YET AGAIN, proving the
+`585dcb1` click-outside fix does not reliably work either. Investigated properly this time with a
+temporary live DOM dump (instrumented `_select_external_remark`, ran once more as `WO-PO/99999m11`,
+captured real JSON+screenshot instead of inferring from a static error log) -- and the result
+overturns BOTH previous fix attempts' core assumption:
+
+- `#searchPanel` is **completely empty** (`<div id="searchPanel" class="ui-outputpanel
+  ui-widget"></div>`) on the actual DOM -- it was NEVER the visible "Remarks" popup shown in every
+  screenshot. Both `86382f1` (titlebar close icon) and `585dcb1` (click-outside, gated on
+  `#searchPanel` visibility) were built on a false premise from the start; `585dcb1`'s own
+  `still_open` check was checking the wrong element and could never have correctly detected the real
+  popup's state.
+- The other dialog found (`id="j_idt968"`, `class="... global-confirmation-dialog ..."`) is a
+  **hidden** (`aria-hidden="true"`), generic, app-wide Yes/No confirm-dialog template (same
+  `j_idt968`/`j_idt969`/`j_idt970` id family already flagged elsewhere in this file as recurring
+  across unrelated dialogs) -- also not the visible Remarks popup.
+- On the `m11` discovery run specifically, the popup had ALREADY closed by the time the screenshot
+  was taken -- normal quotation-edit fields were showing, External Remarks was blank, no popup
+  visible at all. This means the underlying symptom is NOT "the popup never closes" universally --
+  it closed fine this time. It's inconsistent: closes fine on some runs (`m11`, apparently also
+  whichever earlier runs never logged the warning at all), stays stuck on others (`m5`, `m7`, `m8`,
+  `m10`) -- a genuine race, not a deterministic missing step, and neither prior fix addressed a race
+  since both assumed a specific, wrong, static blocking element.
+
+**Real status: Bug 4 is NOT fixed. Both `86382f1` and `585dcb1` should be treated as ineffective**
+(kept in history for the record of what was tried and ruled out, per this project's commit-message
+standard) rather than trusted going forward. The actual "Remarks" popup's real container element
+was never identified in this session -- next session should dump the FULL page HTML (not scoped to
+`#searchPanel` or `[role="dialog"]`) at the moment the popup is visibly showing, e.g. by adding a
+temporary `await asyncio.sleep(30)` right after `_click_when_clear(page.locator(...search
+button...))` and inspecting the live page in devtools during that window, rather than reasoning from
+an error log's partial DOM excerpt a fourth time.
+
+### Overall status as of this write-up
+
+**A genuine, clean, fully-automated Stage A-D `PROCESSED` result has still NOT been achieved.**
+Summary of the day's five bugs:
+
+| # | Bug | Status |
+|---|-----|--------|
+| 1 | Wrong grid-checkbox re-selection blocking Stage C Submit | **Fixed, verified live** (`7708c86`) |
+| 2 | Datepicker `.fill()` not registering with Synergix | Fixed, not yet independently re-verified |
+| 3 | Event Details Confirm click needed overlay-safe wait | Fixed, not yet independently re-verified |
+| 4 | External Remarks popup not reliably closing on no-match | **NOT fixed** -- two attempts both wrong, real cause still unknown, likely a race |
+| 5 | Stage C Submit-enable poll too short, caused harmful retry | Fixed (widened 5s->30s), not yet independently re-verified |
+
+Bugs 1, 2, 3, and 5 all look individually sound based on the evidence gathered for each (especially
+Bug 5, backed by a screenshot proving the underlying scheduling logic genuinely works end-to-end).
+Bug 4 remains the actual open blocker to a clean automated run purely because it happens early
+(Stage B) and, when it hits, prevents ever reaching Stage C to test bugs 1/2/3/5 together in the same
+run. **Next step: get a real DOM dump of the Remarks popup's actual container while it's visibly
+stuck, then fix Bug 4 correctly on the first attempt from real data, then re-run end-to-end.**
 
 **Test-data note**: `WO-PO/99999m2`, `m4`, `m5`, `m6`, `m7`, `m8` are all synthetic test Service
 Orders left behind in Synergix (`copy.` environment only) from today's debugging -- safe to delete,
