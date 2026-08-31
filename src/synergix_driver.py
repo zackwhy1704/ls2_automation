@@ -60,11 +60,25 @@ class DedupResult(str, Enum):
 ITEM_CODE = "SE-400212A"
 ITEM_TYPE = "S"
 
-# Schedule Board (Stage C) employee. Same fixed value already used as the Stage B Salesperson (see
-# _stage_b_create_quotation) -- "TAN WEI YING" is the only person seen assigned on every real
-# quotation/schedule observed so far, both councils. See that TODO(human) for the same open question
-# (confirm with the client whether this should ever vary per-WO).
+# RETIRED as of 2026-08-31 -- kept only because Stage B's Salesperson field uses the same literal
+# "TAN WEI YING" string directly (see _stage_b_create_quotation, unrelated to this constant). This
+# constant is no longer read by Stage C: frame-by-frame analysis of the client's own walkthrough
+# video (JBTC WO Synergix.mp4, see docs/synergix_workflow.md "Stage C, frame-by-frame") proved
+# Stage C's real scheduling target is a WORK TEAM ("Assigned" dropdown) paired with INFIGO/ECOCARE
+# via a "To Pair With" checklist -- NOT an individual employee. "TAN WEI YING" genuinely does
+# appear on the real Event Details popup, but as one of 12 "To Pair With" options, not the
+# assignee -- which is almost certainly why every session before this one assumed she was the
+# target. See ASSIGNED_WORK_TEAM below for what replaced this.
 SCHEDULE_EMPLOYEE = "TAN WEI YING"
+
+# Schedule Board (Stage C) "Assigned" Work Team, per the video walkthrough (WO-PO/000080291,
+# 2026-08-31). ASSUMPTION, NOT CONFIRMED: the video shows exactly one example, where the "Assigned"
+# dropdown defaulted to "800SUPER" and the human operator left it as-is. Nothing on the source WO
+# (Job Sheet, GL No., Schedule Type, Contractor Code) obviously determines this value, and the
+# workflow doc never explains how to choose it. Using the observed default until the client
+# confirms whether it's fixed or WO/council/date-dependent -- see docs/synergix_workflow.md
+# "Open question for the client" for the full writeup of this assumption.
+ASSIGNED_WORK_TEAM = "800SUPER"
 
 # Payment Method dropdown target. Confirmed live (2026-08-15) that the previously-targeted
 # "Cheque" does not appear as an option at all for JALAN BESAR TOWN COUNCIL â€” the only real
@@ -520,8 +534,8 @@ class SynergixDriver:
                     "confirm failed or was skipped -- human must confirm it in Synergix before it "
                     "becomes a schedulable Service Order. Schedule board + fulfil still manual.",
                 )
-            # Stage C: schedule the new Service Order (assign SCHEDULE_EMPLOYEE at the WO's job
-            # date) and submit it -- see _schedule_stage_c's docstring. Best-effort, same reasoning
+            # Stage C: schedule the new Service Order (assign ASSIGNED_WORK_TEAM + To-Pair-With at
+            # the WO's job date) and submit it -- see _schedule_stage_c's docstring. Best-effort, same reasoning
             # as Stage B.5: a failure here still leaves a real, confirmed quotation + Service Order,
             # just requiring a human to finish scheduling manually in Synergix.
             scheduled = False
@@ -2066,25 +2080,27 @@ class SynergixDriver:
     async def _schedule_stage_c_attempt(self, payload: WOPayload) -> bool:
         """One end-to-end attempt at Stage C -- see _schedule_stage_c (the retry wrapper that calls
         this) for why failures here are retried with a full browser reset rather than patched
-        per-step. Find the WO's Service Order on Schedule Board, assign SCHEDULE_EMPLOYEE at the
-        WO's job date, and submit.
+        per-step. Find the WO's Service Order on Schedule Board, assign ASSIGNED_WORK_TEAM + a
+        To-Pair-With council (INFIGO/ECOCARE) at the WO's job date, and submit.
+
+        REWRITTEN 2026-08-31 -- see docs/synergix_workflow.md "Stage C, frame-by-frame from JBTC WO
+        Synergix.mp4" for the full corrected narrative and open assumptions pending client
+        confirmation. Prior versions of this method (through 2026-08-30) assigned an EMPLOYEE
+        (`SCHEDULE_EMPLOYEE`, "TAN WEI YING") via a Filter checklist -- that was the wrong target,
+        found by extracting and reviewing the client's own walkthrough video frame-by-frame. The
+        real, successfully-submitted flow assigns a WORK TEAM via the Event Details popup's own
+        "Assigned" dropdown, paired with INFIGO or ECOCARE via a separate "To Pair With" checklist.
 
         Discovered live (2026-08-25): a confirmed Variation Order (Stage B.5) creates a Service Order
-        that appears in Schedule Board's "Unscheduled Service Orders" grid, but scheduling it needs a
-        specific sequence found only by watching the user do it by hand -- see docs/synergix_workflow.md
-        ("Stage C completed end-to-end") for the full narrative. Summary of the non-obvious parts:
+        that appears in Schedule Board's "Unscheduled Service Orders" grid. Non-obvious parts that
+        still hold after the rewrite:
           1. The order's ROW must be selected first (click it) -- clicking the calendar with no order
              selected does nothing at all, no error, no popup.
-          2. The Employee filter's checkboxes are the ONLY way to make an employee's calendar row
-             appear; "Work Team" (a separate toggle) is a different, unrelated list.
-          3. The actual click target for "add an event" is a fully-transparent overlay button
+          2. The actual click target for "add an event" is a fully-transparent overlay button
              (`[id*="newEventButton"]`), NOT the visible cell div underneath it -- the click failed
              with a "<td> intercepts pointer events" error until this was found, because Playwright
              was (correctly) reporting that invisible overlay as the interceptor.
-          4. The Event Details popup's time sub-fields reset to 00:00 every time a DIFFERENT field in
-             the same popup is edited (a whole-form ajax re-render) -- so times must be set LAST,
-             immediately before submitting, or they get silently wiped by a later edit.
-          5. After the popup's own checkmark, a SECOND, separate "Submit" action appears on the
+          3. After the popup's own checkmark, a SECOND, separate "Submit" action appears on the
              underlying Order Details panel -- both must be clicked; the popup's checkmark alone does
              not finish Stage C.
 
@@ -2135,85 +2151,6 @@ class SynergixDriver:
             await filter_input.fill(wo_bare)
             await filter_input.press("Enter")
             await page.wait_for_timeout(3000)
-
-        async def _filter_panel_is_open() -> bool:
-            # The Filter toggle is a PrimeFaces panel (data-widget="panel-filter") whose content div
-            # gets style="display: none" when collapsed. Confirmed live (2026-08-30): _click_filter_link
-            # is a raw toggle click with no open/closed check, so calling it when the panel is ALREADY
-            # open (e.g. a second recovery pass within the same attempt) silently CLOSES it instead --
-            # this was found to be the actual reason a Clear-All-based recovery sequence still failed
-            # even though the same sequence, driven by hand with visual confirmation at each step,
-            # had worked. Query the real DOM state instead of assuming click = open.
-            return await page.evaluate(
-                """() => {
-                    const panel = document.querySelector('[data-widget="panel-filter"] .ui-panel-content');
-                    return !!panel && panel.style.display !== 'none';
-                }"""
-            )
-
-        async def _click_filter_link() -> bool:
-            # Confirmed live (2026-08-28): querying generic 'span, a' alongside 'span.ui-button-text'
-            # found a DECOY first -- an unrelated <span class="synfaces-float-left"> sitting at the
-            # exact same on-screen position as the real "Filter" link, matched by document order
-            # rather than by which selector in the list found it. .closest('a, button, div.ui-button')
-            # on that decoy found no real button ancestor. Query ONLY span.ui-button-text (the real
-            # button's actual structure, same class the Employee/Work Team toggle buttons use) so a
-            # look-alike node can't win by DOM order.
-            #
-            # ALSO real-mouse-click, not JS .click() -- see _mouse_click_ui_button's comment just
-            # below: a synthetic click on this link opened nothing (checkbox count measured 0
-            # change across several attempts in a diagnostic session), while a real page.mouse.click
-            # at the same coordinates visibly opened the "Employee Job Type" filter panel.
-            for _ in range(3):
-                rect = await page.evaluate(
-                    """() => {
-                        const span = [...document.querySelectorAll('span.ui-button-text')]
-                          .find(el => el.textContent.trim() === 'Filter' && el.offsetParent !== null);
-                        const target = span && span.closest('a, button, div.ui-button');
-                        if (!target) return null;
-                        const r = target.getBoundingClientRect();
-                        return {x: r.x + r.width / 2, y: r.y + r.height / 2};
-                    }"""
-                )
-                if rect:
-                    await page.mouse.click(rect["x"], rect["y"])
-                    return True
-                await page.wait_for_timeout(500)
-            return False
-
-        async def _ensure_filter_link_open() -> bool:
-            # Idempotent wrapper: only clicks if the panel is currently closed, so repeated calls
-            # within one recovery loop can't accidentally toggle it shut. See _filter_panel_is_open.
-            if await _filter_panel_is_open():
-                return True
-            return await _click_filter_link()
-
-        async def _click_visible_text(text: str) -> bool:
-            # Native Playwright locator click (re-resolves the element's position at click time),
-            # NOT the coordinate-snapshot-then-mouse.click() pattern used elsewhere in this method
-            # for the Filter link and Employee/Work Team toggle. Confirmed live (2026-08-30) via an
-            # isolated side-by-side test: the SAME Clear-All-based recovery sequence (Employee ->
-            # Filter -> Clear All -> Employee -> Filter) reproduced the fix 3/3 times manually using
-            # this native-click style, but the coordinate-based version of the identical sequence
-            # failed 2/2 times when run through the real driver code. Root cause: Clear All triggers
-            # a PrimeFaces ajax repopulate that reflows the panel (checklist/calendar rows
-            # appearing), so a bounding-rect computed just before the click can be stale by the time
-            # page.mouse.click() fires on it a moment later -- re-resolving at click time avoids
-            # that race entirely. Used only for the Clear-All recovery path added 2026-08-30; the
-            # pre-existing Filter/Employee/Work Team helpers are left as coordinate-based since they
-            # have their own confirmed reasons (see _click_filter_link, _mouse_click_ui_button).
-            loc = page.locator(f"text={text}").locator("visible=true").first
-            try:
-                await loc.wait_for(state="visible", timeout=5000)
-            except Exception:
-                return False
-            await loc.click()
-            return True
-
-        async def _click_clear_all_link() -> bool:
-            # See _click_visible_text's docstring for why this uses native clicks, not the
-            # coordinate-based pattern used by _click_filter_link/_mouse_click_ui_button.
-            return await _click_visible_text("Clear All")
 
         async def _wait_for_ajax_spinner(label: str, *, timeout_s: float = 15) -> None:
             # THE REAL FIX for the employee-checklist race (found live with the user, 2026-08-31):
@@ -2292,6 +2229,29 @@ class SynergixDriver:
             await page.mouse.click(rect["x"], rect["y"])
             return True
 
+        # REWRITTEN 2026-08-31: everything from here to the Event Details Confirm below used to
+        # search for SCHEDULE_EMPLOYEE ("TAN WEI YING") in the Employee Filter checklist and open
+        # her calendar row specifically. That entire approach targeted the WRONG field -- frame-by-
+        # frame analysis of the client's own walkthrough video (JBTC WO Synergix.mp4, see
+        # docs/synergix_workflow.md "Stage C, frame-by-frame") proved the real, successfully-
+        # submitted flow assigns a WORK TEAM via the Event Details popup's own "Assigned" dropdown
+        # (defaulted to ASSIGNED_WORK_TEAM = "800SUPER" in the one recorded example) plus a
+        # "To Pair With" checklist tick (INFIGO or ECOCARE, by the same alphabetic/numeric Job Sheet
+        # rule as resolve_project_code() already uses for Project Site) -- TAN WEI YING genuinely
+        # appears on that same "To Pair With" checklist, as one of 12 options, which is almost
+        # certainly why every session before this one assumed she was the assignee.
+        #
+        # The video's own recording never explicitly clicked "Employee" vs "Work Team" as a
+        # deliberate binary choice the way earlier sessions assumed -- it toggled to Employee, the
+        # calendar populated with a real (paginated) list, and clicking into the calendar body opened
+        # Event Details directly. This code keeps the Employee toggle click (proven harmless, and
+        # matches the doc's own Step 3) but no longer searches for a specific person's row -- it
+        # opens Event Details via the FIRST available newEventButton-style overlay found in the
+        # visible calendar, since Stage C no longer needs to target a specific individual's slot.
+        # ASSUMPTION, not directly observed on video (the recording's 1fps sampling skipped the exact
+        # moment of this click): if this lands on the wrong row/date in practice, the fallback is to
+        # scope by the WO's job date column instead of taking the first button found -- flagged here
+        # for whoever revisits this once the client confirms the open questions in the doc.
         employee_active = False
         for _ in range(3):
             await _mouse_click_ui_button("Employee")
@@ -2310,233 +2270,30 @@ class SynergixDriver:
             logger.warning("Stage C: could not switch to Employee view for %s", wo)
             await self._screenshot(f"stage_c_no_employee_toggle_{wo.replace('/', '-')}")
             return False
-        if not await _click_filter_link():
-            logger.warning("Stage C: could not click the Employee Filter link for %s", wo)
-            await self._screenshot(f"stage_c_no_filter_link_{wo.replace('/', '-')}")
-            return False
-        await _wait_for_ajax_spinner("Filter panel open")
 
-        # Confirmed live (2026-08-26) that the checkbox list can still be genuinely empty in the DOM
-        # several seconds after the Filter panel visibly opens -- a fixed 2s wait was not enough on a
-        # retest, even though the exact same sequence had worked moments earlier in the same session.
-        # ALSO confirmed live, separately, that the Employee/Work Team toggle can drift back to "Work
-        # Team" between here and the earlier check with no single action caught doing it -- so this
-        # loop re-asserts Employee is active on every poll, not just once up front, rather than
-        # trying to pin the exact moment/cause of the reset. Same ajax-timing tolerance pattern
-        # already applied throughout this file (e.g. _click_panel_row_by_text).
-        #
-        # Confirmed live (2026-08-26) that even with Employee correctly active the whole time, the
-        # checklist itself can stay genuinely empty for the full ~8s poll window on some runs -- a
-        # separate failure mode from the toggle-state bug above, still unexplained. As a recovery
-        # attempt (not a confirmed fix), periodically toggle to Work Team and back to Employee to
-        # force a fresh ajax repopulate, since the toggle's own onchange is the only known trigger
-        # for this list to (re)render at all.
-        #
-        # CORRECTION (2026-08-31): the 2026-08-30 note below (still kept for its Clear-All finding)
-        # concluded the checklist-empty failure was a deterministic server-side rule tied to having a
-        # row selected. That conclusion was WRONG and has been retracted -- it was based on an A/B
-        # test that varied row-selected vs. not, but NEVER controlled for automation vs. a human
-        # doing the identical steps, which is the variable that actually mattered. Verified live with
-        # the user (2026-08-31): the real fix is waiting for Synergix's own global ajax indicator
-        # (<img class="js-ajax-spinner"> in the page footer, see _wait_for_ajax_spinner) to finish
-        # after EACH click, not a fixed timeout -- the user demonstrated this by hand (click row ->
-        # watch the spinner run -> wait -> click Employee -> watch it run again -> wait -> checklist
-        # populated), and it was confirmed 4/4 in isolated scripted testing once the fixed
-        # `wait_for_timeout()` calls around the row click and Employee/Filter clicks were replaced
-        # with a real wait for that spinner's visible->hidden cycle (done above and via
-        # _wait_for_ajax_spinner calls threaded through this method as of this commit). The
-        # documented "empty checklist even with Employee active" symptom across many prior sessions
-        # was a client issued its next click before the previous click's ajax response had actually
-        # landed -- not a Synergix-side bug and not something row-selection state controls.
-        #
-        # 2026-08-30 finding (Clear-All), kept for reference -- still a real, harmless improvement:
-        # a "Clear All -> Employee -> Filter" sequence reliably repopulates the checklist when
-        # performed with no specific Service Order row selected. Superseded as the PRIMARY fix by
-        # the spinner-wait above, but left in the retry loop below since it costs little and may
-        # still help recover a genuinely stuck state.
-        employee_checkbox_js = """(name) => {
-                const label = [...document.querySelectorAll('label')]
-                  .find(l => l.textContent.trim() === name);
-                return label ? label.getAttribute('for') : null;
-            }"""
-        employee_checkbox_id = None
-        for attempt in range(24):  # ~20s, with forced refreshes every ~5s
-            if attempt > 0 and attempt % 6 == 0:
-                logger.warning("Stage C: employee checklist still empty after %.1fs for %s -- "
-                                "forcing a refresh via Clear All -> Employee -> Filter", attempt * 0.8, wo)
-                # Clear All FIRST, then re-toggle -- see _click_clear_all_link's docstring: this
-                # exact order is the only sequence confirmed live (2026-08-30) to actually recover
-                # a genuinely empty checklist, after Work-Team<->Employee alone had failed 8/8 times.
-                # Clear All only exists in the DOM while the Filter panel is open, so make sure of
-                # that first (idempotent -- won't toggle an already-open panel shut).
-                await _ensure_filter_link_open()
-                await page.wait_for_timeout(500)
-                await _click_clear_all_link()
-                await page.wait_for_timeout(1000)
-                # Native click here too, not _mouse_click_ui_button -- see _click_visible_text's
-                # docstring: the coordinate-based Employee re-click right after Clear All is exactly
-                # what was confirmed live (2026-08-30) to fail from stale coordinates post-reflow.
-                await _click_visible_text("Employee")
-                await page.wait_for_timeout(1000)
-                await _ensure_filter_link_open()
-                await page.wait_for_timeout(1500)
-            else:
-                still_active = await page.evaluate(
-                    """() => {
-                        const btn = [...document.querySelectorAll('div.ui-button')]
-                          .find(b => b.textContent.trim() === 'Employee' &&
-                                     b.getBoundingClientRect().width > 0);
-                        return btn ? btn.classList.contains('ui-state-active') : false;
-                    }"""
-                )
-                if not still_active:
-                    await _mouse_click_ui_button("Employee")
-            employee_checkbox_id = await page.evaluate(employee_checkbox_js, SCHEDULE_EMPLOYEE)
-            if employee_checkbox_id:
-                break
-            await page.wait_for_timeout(300)
-        if not employee_checkbox_id:
-            # Last resort: a full re-navigation, not just re-toggling within the same page load.
-            # Confirmed live (2026-08-26) that toggling Work Team<->Employee repeatedly within one
-            # page load did NOT recover an empty checklist. Confirmed live (2026-08-28), in a
-            # careful step-by-step diagnostic session: a full re-navigation CAN recover it -- the
-            # checklist populated (found SCHEDULE_EMPLOYEE's checkbox) on a re-navigation attempt
-            # after the in-page retries and one earlier re-navigation had both come back empty.
-            # This matches docs/synergix_workflow.md session 6's own conclusion (2026-08-26): the
-            # checklist/calendar-row population is a genuinely flaky Synergix-side ajax, not
-            # something any fixed client-side sequence reliably triggers -- and its own explicit
-            # recommendation for whoever picked this up next was to loop the re-navigation fallback
-            # rather than trying it once, which the code never actually did until now.
-            for renav_attempt in range(1, 4):
-                logger.warning("Stage C: employee checklist still empty for %s -- full "
-                                "re-navigation attempt %d/3", wo, renav_attempt)
-                await self._open_schedule_board()
-                await _filter_orders_by_wo()
-                order_row3 = page.locator("tr", has_text=wo_bare).locator("visible=true").first
-                if not await order_row3.count():
-                    continue
-                await order_row3.click(timeout=10000)
-                await _wait_for_ajax_spinner("row selection (re-navigation)")
-                await _mouse_click_ui_button("Employee")
-                await _wait_for_ajax_spinner("Employee toggle (re-navigation)")
-                await _click_filter_link()
-                await _wait_for_ajax_spinner("Filter panel open (re-navigation)")
-                # Same Clear All -> Employee -> Filter sequence as the in-page recovery loop above
-                # -- confirmed live (2026-08-30) as the actual fix, so apply it here too rather than
-                # relying on the poll below to save a re-navigation attempt that's missing it.
-                await _click_clear_all_link()
-                await page.wait_for_timeout(1000)
-                await _click_visible_text("Employee")
-                await page.wait_for_timeout(1000)
-                await _ensure_filter_link_open()
-                await page.wait_for_timeout(2000)
-                for _ in range(10):  # ~5s more after the reload
-                    employee_checkbox_id = await page.evaluate(employee_checkbox_js, SCHEDULE_EMPLOYEE)
-                    if employee_checkbox_id:
-                        break
-                    await page.wait_for_timeout(500)
-                if employee_checkbox_id:
-                    break
-        if not employee_checkbox_id:
-            logger.warning("Stage C: employee %r not found in the Filter checklist for %s "
-                            "after waiting, forced refreshes, and a re-navigation", SCHEDULE_EMPLOYEE, wo)
-            await self._screenshot(f"stage_c_no_employee_{wo.replace('/', '-')}")
-            return False
-        # Confirmed live (2026-08-28): the checkbox's real <input> is wrapped in a
-        # ui-helper-hidden-accessible div (PrimeFaces' standard a11y pattern) and has a genuine
-        # onchange="PrimeFaces.ab(...)" handler -- but the VISIBLE, actually-clickable element is
-        # the sibling .ui-chkbox-box div. label[for=...] can relay a native click to the hidden
-        # input's 'click'/'checked' state without necessarily running PrimeFaces' own JS-bound
-        # handler on .ui-chkbox-box, which is what fires the ajax and updates the visible icon
-        # class -- the same visual-state-vs-real-handler mismatch found earlier in this method for
-        # the Employee/Work Team toggle and the "Filter" link. Click the box itself instead.
-        checkbox_box = page.locator(f'input[id="{employee_checkbox_id}"]').locator(
-            "xpath=ancestor::div[contains(@class,'ui-chkbox')][1]//div[contains(@class,'ui-chkbox-box')]"
-        )
-        await checkbox_box.click(timeout=10000)
-        await page.wait_for_timeout(2000)
-        # Verify the checkbox actually toggled -- confirmed live (2026-08-25) that a text-based click
-        # here can report success while the box stays unchecked.
-        checked = await page.evaluate(
-            "(id) => document.getElementById(id)?.parentElement?.parentElement?"
-            ".querySelector('.ui-chkbox-icon')?.classList.contains('ui-icon-check')",
-            employee_checkbox_id,
-        )
-        if not checked:
-            logger.warning("Stage C: clicking %s's checkbox did not actually check it for %s",
-                            SCHEDULE_EMPLOYEE, wo)
-            return False
-
-        # Confirmed live (2026-08-28): re-clicking "Filter" here (as if to close the panel) is not
-        # just unnecessary -- it actively breaks this. The checkbox's own <input> has a real
-        # onchange="PrimeFaces.ab(...)" handler that submits an ajax round-trip; re-clicking Filter
-        # immediately afterward fires a SECOND ajax call (the same one that opens the panel) which
-        # can complete first and re-render the checkbox section from whatever the server's state was
-        # at THAT moment -- overwriting our just-checked box back to unchecked before its own
-        # round-trip lands. Verified in isolation: without this second click, the checkbox stays
-        # checked and the calendar row is visible within 1s; with it, the checkbox flips back and
-        # the row never renders. The calendar row does not need the panel closed to appear.
-
-        # Confirmed live (2026-08-26) that the checkbox itself being checked does NOT guarantee the
-        # calendar's own "Service Personnel" rows have rendered yet -- these are separate ajax calls
-        # that can be independently slow/stuck. Poll for the employee's name cell to actually appear
-        # in the calendar before touching it; without this, the row-scoped click below finds nothing
-        # and either fails cleanly or (worse, seen live) matches stale content from a previous render.
-        calendar_row_ready = False
+        # Poll for the calendar to actually render at least one newEventButton-style overlay cell --
+        # same ajax-timing tolerance pattern as every other wait in this file (see
+        # _wait_for_ajax_spinner's docstring for why fixed timeouts alone are not reliable here).
+        new_event_btn_id = None
         for _ in range(20):  # ~10s
-            calendar_row_ready = await page.evaluate(
-                "(name) => [...document.querySelectorAll('td.first_col')]"
-                ".some(td => td.textContent.trim() === name)",
-                SCHEDULE_EMPLOYEE,
+            new_event_btn_id = await page.evaluate(
+                """() => {
+                    const btn = document.querySelector('[id*="newEventButton"]');
+                    return btn ? btn.id : null;
+                }"""
             )
-            if calendar_row_ready:
+            if new_event_btn_id:
                 break
             await page.wait_for_timeout(500)
-        if not calendar_row_ready:
-            logger.warning("Stage C: %s's row never appeared on the calendar for %s",
-                            SCHEDULE_EMPLOYEE, wo)
+        if not new_event_btn_id:
+            logger.warning("Stage C: no 'add event' cell found on the calendar for %s", wo)
             await self._screenshot(f"stage_c_no_calendar_row_{wo.replace('/', '-')}")
             return False
-        # The calendar row's own hour-cell/newEventButton structure can still be mid-render for a
-        # moment after the row's NAME cell first appears (same class of race the employee-checklist
-        # fix addressed, see _wait_for_ajax_spinner's docstring) -- wait for any trailing ajax to
-        # settle before computing the button id below, rather than grabbing it the instant the name
-        # cell exists.
-        await _wait_for_ajax_spinner("calendar row render")
-        await page.wait_for_timeout(500)
-
-        # Scoped to the employee's OWN row -- confirmed live (2026-08-26) that a bare
-        # [id*="newEventButton"] .first can land on a DIFFERENT employee's cell when more than one
-        # employee row is present (e.g. after the checklist-recovery retries above cause more than
-        # SCHEDULE_EMPLOYEE to end up checked/rendered). The name cell has rowspan spanning every
-        # hour-row for that employee; find the newEventButton inside one of those sibling <tr>s.
-        new_event_btn_id = await page.evaluate(
-            """(name) => {
-                const nameCell = [...document.querySelectorAll('td.first_col')]
-                  .find(td => td.textContent.trim() === name);
-                if (!nameCell) return null;
-                let row = nameCell.closest('tr');
-                for (let i = 0; i < (nameCell.rowSpan || 1); i++) {
-                    if (!row) break;
-                    const btn = row.querySelector('[id*="newEventButton"]');
-                    if (btn) return btn.id;
-                    row = row.nextElementSibling;
-                }
-                return null;
-            }""",
-            SCHEDULE_EMPLOYEE,
-        )
-        if not new_event_btn_id:
-            logger.warning("Stage C: no 'add event' cell found in %s's own row for %s",
-                            SCHEDULE_EMPLOYEE, wo)
-            return False
-        # Confirmed live (2026-08-28): document.elementFromPoint at this button's own (scrolled-
-        # into-view) coordinates resolved to a <div class="blockUI blockOverlay">, not the button --
-        # a pending-ajax "please wait" mask (from the checkbox's own onchange round-trip and/or the
-        # calendar row's render) was still covering it. Playwright's click sometimes reports success
-        # anyway (its actionability check can pass moments before the overlay reappears for the next
-        # ajax call) while the click itself lands on the mask, opening nothing. This is exactly what
-        # _click_when_clear exists for elsewhere in this file -- reuse it here.
+        # Confirmed live (2026-08-28, still applicable): document.elementFromPoint at this button's
+        # own (scrolled-into-view) coordinates resolved to a <div class="blockUI blockOverlay">, not
+        # the button -- a pending-ajax "please wait" mask was still covering it. Playwright's click
+        # sometimes reports success anyway while the click itself lands on the mask, opening nothing.
+        # This is exactly what _click_when_clear exists for elsewhere in this file -- reuse it here.
         new_event_btn = page.locator(f'[id="{new_event_btn_id}"]')
         try:
             await new_event_btn.scroll_into_view_if_needed(timeout=5000)
@@ -2549,12 +2306,9 @@ class SynergixDriver:
             await self._screenshot(f"stage_c_newevent_click_failed_{wo.replace('/', '-')}")
             raise
 
-        # Confirmed live (2026-08-28): the "Event Details" dialog takes ~8s to actually render
-        # (console showed "ajaxStatus onstart" immediately but no dialog for several seconds, then
-        # "loadDeferredContents" logs right as the dialog appeared at the 8s mark) -- a fixed 3s
-        # wait here was checking before the dialog existed at all, which is indistinguishable from
-        # "opened for the wrong employee" if the verification below isn't scoped to the dialog
-        # itself. Poll instead of guessing a fixed duration.
+        # Confirmed live (2026-08-28, still applicable): the "Event Details" dialog takes several
+        # seconds to actually render (ajax "onstart" fires immediately but the dialog itself lags) --
+        # poll instead of guessing a fixed duration.
         event_dialog_visible = False
         for _ in range(20):  # ~10s
             event_dialog_visible = await page.evaluate(
@@ -2568,43 +2322,74 @@ class SynergixDriver:
                 break
             await page.wait_for_timeout(500)
         if not event_dialog_visible:
-            logger.warning("Stage C: Event Details dialog never appeared for %s after clicking "
-                            "%s's calendar cell", wo, SCHEDULE_EMPLOYEE)
+            logger.warning("Stage C: Event Details dialog never appeared for %s", wo)
             await self._screenshot(f"stage_c_no_event_dialog_{wo.replace('/', '-')}")
             return False
 
-        # Verify the popup actually opened for the right employee -- confirmed live this can still
-        # land on a stale/wrong row even with the row-scoped click above (a defensive double-check,
-        # not proven necessary, but cheap and catches exactly the failure mode already seen once).
-        # Scoped to the visible "Event Details" dialog specifically (not page-wide) -- confirmed
-        # live (2026-08-28) that a page-wide search for the first visible .ui-selectonemenu-label
-        # can match an unrelated dropdown elsewhere on the page (e.g. the header's company
-        # switcher) while the real dialog is still rendering, producing a false "wrong employee".
-        assigned_ok = await page.evaluate(
-            """(name) => {
-                const dialog = [...document.querySelectorAll('.ui-dialog')].find(d => {
-                    const r = d.getBoundingClientRect();
-                    return r.width > 0 && r.height > 0 &&
-                           d.querySelector('.ui-dialog-title')?.textContent?.trim() === 'Event Details';
-                });
-                if (!dialog) return false;
-                const label = [...dialog.querySelectorAll('.ui-selectonemenu-label')]
-                  .find(l => l.getBoundingClientRect().width > 0);
-                return label ? label.textContent.trim() === name : false;
+        event_dialog = page.locator('[role="dialog"]:has-text("Event Details")').locator("visible=true").first
+
+        # "Assigned" dropdown -- per the video, defaults to ASSIGNED_WORK_TEAM already; only change
+        # it if it's showing something else, so a differently-defaulted popup doesn't get silently
+        # overwritten to the wrong team. Confirmed structure: a PrimeFaces selectonemenu, same
+        # pattern used for Customer/Salesperson/Project Site in Stage B (_select_autocomplete_row is
+        # NOT reused here since Assigned is a plain dropdown, not a live-search autocomplete).
+        assigned_label = event_dialog.locator(".ui-selectonemenu-label").first
+        assigned_text = (await assigned_label.inner_text()).strip() if await assigned_label.count() else ""
+        if assigned_text and assigned_text != ASSIGNED_WORK_TEAM:
+            logger.warning("Stage C: Event Details 'Assigned' defaulted to %r, not the expected %r, "
+                            "for %s -- leaving as-is rather than guessing which dropdown option to "
+                            "pick (ASSIGNED_WORK_TEAM is an unconfirmed assumption, see "
+                            "docs/synergix_workflow.md)", assigned_text, ASSIGNED_WORK_TEAM, wo)
+
+        # "To Pair With" checklist -- tick INFIGO or ECOCARE by the SAME alphabetic/numeric Job Sheet
+        # rule resolve_project_code() already uses for Project Site (Stage B). Only one example seen
+        # on video (Job Sheet A25-01086, alphabetic -> Infigo, ticked INFIGO) -- ASSUMING this rule
+        # generalizes rather than being independently confirmed for Ecocare/numeric-prefix WOs.
+        pair_with_label = "INFIGO" if (payload.job_sheet_number or "").strip()[:1].isalpha() else "ECOCARE"
+        # Confirmed live (2026-08-31), via a raw DOM dump: this checklist's real <input
+        # type="checkbox"> is wrapped in a div.ui-helper-hidden-accessible (PrimeFaces' standard
+        # a11y pattern, same as the retired employee-checklist code found for its own checkbox) --
+        # the input itself is not interactable; the VISIBLE, actually-clickable element is the
+        # sibling .ui-chkbox-box div. Found by the checkbox's own `value` attribute (which encodes
+        # the option, e.g. "...oa_code=INFIGO;..."), not by label text, since this popup's
+        # label/input pairing structure was not confirmed to use a `for` attribute.
+        pair_checkbox_id = await event_dialog.evaluate(
+            """(dialog, label) => {
+                const input = [...dialog.querySelectorAll('input[type=checkbox]')]
+                  .find(i => (i.value || '').includes(`oa_code=${label}`));
+                return input ? input.id : null;
             }""",
-            SCHEDULE_EMPLOYEE,
+            pair_with_label,
         )
-        if not assigned_ok:
-            logger.warning("Stage C: Event Details popup opened for a different employee than %s "
-                            "for %s -- aborting", SCHEDULE_EMPLOYEE, wo)
-            await self._screenshot(f"stage_c_wrong_employee_{wo.replace('/', '-')}")
-            close_btn = page.locator('a.ui-dialog-titlebar-close[aria-label="Close"]').locator("visible=true").first
+        if not pair_checkbox_id:
+            logger.warning("Stage C: could not find the %r 'To Pair With' checkbox for %s",
+                            pair_with_label, wo)
+            await self._screenshot(f"stage_c_no_pair_with_{wo.replace('/', '-')}")
+            close_btn = event_dialog.locator('a.ui-dialog-titlebar-close[aria-label="Close"]').locator("visible=true").first
             if await close_btn.count():
                 await close_btn.click(timeout=5000)
             return False
+        pair_checkbox_box = page.locator(f'input[id="{pair_checkbox_id}"]').locator(
+            "xpath=ancestor::div[contains(@class,'ui-chkbox')][1]//div[contains(@class,'ui-chkbox-box')]"
+        )
+        await self._click_when_clear(pair_checkbox_box, timeout_ms=10000)
+        await _wait_for_ajax_spinner("To Pair With tick")
+        # Verify the tick actually landed -- confirmed elsewhere in this file (the retired employee-
+        # checklist code) that a click can report success while the underlying checkbox state
+        # doesn't actually change.
+        pair_checked = await page.evaluate(
+            "(id) => document.getElementById(id)?.checked === true", pair_checkbox_id
+        )
+        if not pair_checked:
+            logger.warning("Stage C: clicking %r's checkbox did not actually check it for %s",
+                            pair_with_label, wo)
+            await self._screenshot(f"stage_c_pair_with_not_checked_{wo.replace('/', '-')}")
+            return False
 
+        # From/To dates -- per the video, both set to the WO Date (top of the WO PDF), same day for
+        # both fields. Uses the same _fill_labeled_input helper as the retired employee-flow version
+        # (unchanged field-lookup mechanics, just the same From/To labels on the same popup).
         job_date_str = payload.job_date.strftime("%d/%m/%Y")
-        remarks = f"{payload.nature_of_work} - {wo}"
         await self._fill_labeled_input("From", job_date_str)
         await page.wait_for_timeout(500)
         await page.locator('button:has-text("Close")').first.click(timeout=5000)
@@ -2613,49 +2398,15 @@ class SynergixDriver:
         await page.wait_for_timeout(500)
         await page.locator('button:has-text("Close")').first.click(timeout=5000)
         await page.wait_for_timeout(1000)
-        await self._fill_labeled_input("Remarks", remarks)
-        await page.wait_for_timeout(1000)
-
-        # Time sub-fields last -- see docstring point 4. Located relationally: each date/time pair
-        # lives together in one .synfaces-grid-item (the div-based layout confirmed for this popup,
-        # NOT a <td> -- there is no <tr>/<td> anywhere in this dialog's markup). The date input
-        # (DD/MM/YYYY) and its sibling time input (HH:MM) share that same grid-item container.
-        # Uses Locator.fill(), not a raw JS value-setter -- confirmed elsewhere in this file
-        # (_fill_grid_field's docstring) that PrimeFaces cells can silently ignore a value set via a
-        # synthetic event and only reliably commit through Playwright's own fill().
-        for date_value, time_value in (("From", "08:00"), ("To", "08:30")):
-            # Scoped to inside the Event Details dialog (same reasoning as the confirm button fix
-            # below): querying the whole document risks matching a same-named label/field belonging
-            # to an unrelated, hidden element elsewhere on the page.
-            time_input_id = await page.evaluate(
-                """(label) => {
-                    const dialog = [...document.querySelectorAll('[role="dialog"]')]
-                      .find(d => d.textContent.includes('Event Details') &&
-                                 d.getBoundingClientRect().width > 0);
-                    if (!dialog) return null;
-                    const norm = s => (s||'').replace(/\\s+/g,' ').trim();
-                    const host = [...dialog.querySelectorAll('td,div,span,label')]
-                      .find(e => e.children.length === 0 && norm(e.textContent) === label);
-                    const item = host && host.closest('.synfaces-grid-item');
-                    if (!item) return null;
-                    const inputs = [...item.querySelectorAll('input:not([type=hidden])')];
-                    const timeInput = inputs.find(i => /^\\d{1,2}:\\d{2}$/.test(i.value));
-                    return timeInput ? timeInput.id : null;
-                }""",
-                date_value,
-            )
-            if not time_input_id:
-                logger.warning("Stage C: could not locate the %s time field for %s", date_value, wo)
-                continue
-            await page.locator(f'[id="{time_input_id}"]').fill(time_value)
-            await page.wait_for_timeout(500)
+        # Remarks left blank -- per the video, the one confirmed successful example never filled
+        # this field and Submit still succeeded. ASSUMPTION: optional, not independently confirmed
+        # as intentional vs. an omission in that one recording.
 
         # Scoped to the Event Details dialog itself, not a bare button:has(span.fa-check) --
         # confirmed live (2026-08-26) that a generic fa-check search can resolve to an unrelated,
         # hidden confirm-dialog's own "Yes" button elsewhere on the page (id="j_idt969", a
         # PrimeFaces-generated id that recurs across different dialogs) and hang forever waiting for
         # it to become visible. role="dialog" + its own title text is a stable, structural anchor.
-        event_dialog = page.locator('[role="dialog"]:has-text("Event Details")').locator("visible=true").first
         confirm_btn = event_dialog.locator('button:has(span.fa-check)').first
         if not await confirm_btn.count():
             logger.warning("Stage C: no Event Details confirm button found for %s", wo)
@@ -2664,11 +2415,7 @@ class SynergixDriver:
         # Confirmed live (2026-08-31), by polling masks/dialog/spinner state every second: the
         # Confirm ajax call can genuinely take ~18s to complete (spinner visible continuously for
         # 18s, then dialog+mask cleared cleanly in the SAME second with no error) -- not a hang, a
-        # real slow operation. The 15s spinner-wait + 8s dialog-hidden-wait budgets used before this
-        # were BOTH individually shorter than that observed real duration, so the code was reaching
-        # the "still open, retry" branch on a request that was still genuinely in flight, not stuck
-        # -- and the retry then collided with the original's own success (see the SV9104 handling
-        # below). Widened to 30s/20s to give real margin above the slowest observed case.
+        # real slow operation. Widened to 30s/20s to give real margin above the slowest observed case.
         await _wait_for_ajax_spinner("Event Details confirm", timeout_s=30)
         # Confirmed live (2026-08-26) that this click can leave the dialog (and its modal overlay)
         # still open, which then blocks every subsequent click with "<div class=ui-dialog-mask>
@@ -2709,6 +2456,7 @@ class SynergixDriver:
                     return False
 
         # The grid/selection can reset after the popup's ajax refresh -- re-select the order before
+        # The grid/selection can reset after the popup's ajax refresh -- re-select the order before
         # looking for the (now separately-appearing) Submit action.
         # Confirmed live (2026-08-28): the Event Details submit's ajax reset was bigger than
         # expected once -- not just page 1 / filter cleared (as already documented), but the grid's
@@ -2743,7 +2491,8 @@ class SynergixDriver:
             # from the just-closed Event Details dialog (or its own trailing ajax) can still be
             # covering this row for several seconds, causing "<div class=ui-dialog-mask> intercepts
             # pointer events" here specifically, right after the popup supposedly finished closing.
-            await self._click_when_clear(order_row2, timeout_ms=10000)
+            # overlay_wait_ms widened to 45s for the same reason as _tick_row_checkbox below.
+            await self._click_when_clear(order_row2, timeout_ms=10000, overlay_wait_ms=45000)
             await _wait_for_ajax_spinner("order re-select after popup")
 
         submit_btn = page.locator('button:has(span.fa-vote-yea)').locator("visible=true").first
@@ -2760,7 +2509,12 @@ class SynergixDriver:
             checkbox = order_row2.locator(".ui-chkbox-box").locator("visible=true").first
             if not await checkbox.count():
                 return False
-            await self._click_when_clear(checkbox, timeout_ms=10000)
+            # overlay_wait_ms widened to 45s (2026-08-31): confirmed live that the ui-dialog-mask
+            # left over from Event Details' own Confirm ajax (which can itself take ~18-30s, see
+            # the Confirm click above) can still be covering this checkbox well past
+            # _click_when_clear's previous 30s default wait -- this is the SAME class of "measure,
+            # don't guess" fix as the Confirm spinner wait, just a step later in the sequence.
+            await self._click_when_clear(checkbox, timeout_ms=10000, overlay_wait_ms=45000)
             await _wait_for_ajax_spinner("row checkbox tick")
             return True
 

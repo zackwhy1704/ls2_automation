@@ -148,10 +148,13 @@ headless was pip-installed to do the extraction, no other tool was available).
    mistake in the recording, not part of the procedure) which correctly returns "No records found".
    Corrected to **`WO-PO/000080291` — the FULL string, WITH the `WO-PO/` prefix and slash** — which
    returns exactly one row (`SV00008851 | QUO0006213 | JALAN BESAR TOWN COUNCIL | ...`).
-   ⚠️ **This directly contradicts the current driver code**, which strips the prefix before
-   filtering (`wo_bare = wo.replace("WO-PO/", "")` in `_schedule_stage_c_attempt`). The video never
-   tests the bare-number form, so it's not proven wrong, only proven that the WITH-prefix form
-   definitely works — worth testing whether the bare form still works before assuming it doesn't.
+   **RESOLVED (2026-08-31, later same day)**: this looked like a contradiction with the driver's
+   `wo_bare = wo.replace("WO-PO/", "")` filtering, but the bare-number form has since been confirmed
+   working live, repeatedly, across many real test runs this same session (always narrows the grid
+   to exactly one row). Both forms apparently work — the video just happened to show the with-prefix
+   form because of the stray first paste being corrected to the full string, not because the bare
+   form fails. Left the driver's existing bare-number filter unchanged rather than risk a regression
+   on weaker (single-example) video evidence against much stronger (repeated live) evidence.
 3. **[6:13–6:14]** **Tick the row's own checkbox** (the small checkbox at the start of the row, NOT
    a click on the row body/text). This is the "correct order MUST BE SELECTED (blue highlight)"
    step the user described from memory before the video was reviewed. Ticking it immediately opens
@@ -246,6 +249,43 @@ currently targets. This is a structural rewrite, not a small patch — nearly ev
 method (`_mouse_click_ui_button` targeting Employee/Work Team, the `employee_checkbox_js` lookup,
 `SCHEDULE_EMPLOYEE` itself) was built for the wrong target field and will need to be re-pointed or
 replaced.
+
+### Rewrite done and live-tested (2026-08-31, same day) — real progress, one blocker remains
+
+Per the user's explicit instruction ("do it first we will make the changes over at the client
+side"), `_schedule_stage_c_attempt` was rewritten around the corrected target before the open
+assumptions above were confirmed. `SCHEDULE_EMPLOYEE` is retired (kept only because Stage B's
+Salesperson field happens to use the same literal string); a new `ASSIGNED_WORK_TEAM = "800SUPER"`
+constant was added with the same "unconfirmed assumption" framing as above.
+
+**What's now proven working, live, across multiple test runs:**
+- Row checkbox selection, Employee toggle click, opening Event Details via a (now name-agnostic)
+  `newEventButton` overlay click.
+- The "Assigned" dropdown correctly defaults to `ASSIGNED_WORK_TEAM` and is left alone when it
+  matches (only warns, doesn't guess, if it defaults to something else).
+- **The "To Pair With" checkbox click required its own fix**: initially assumed a plain native
+  `<input type="checkbox">` was directly clickable (based on how the popup LOOKS in a screenshot),
+  but a raw DOM dump showed the real `<input>` is wrapped in `div.ui-helper-hidden-accessible` --
+  the same PrimeFaces accessibility pattern the now-retired employee-checklist code had already
+  found and worked around for ITS OWN checkbox. Fixed by clicking the sibling `.ui-chkbox-box` div
+  instead of the hidden input directly, exactly mirroring that older, already-solved pattern. Found
+  the correct checkbox by its `value` attribute (encodes `oa_code=INFIGO`/`oa_code=ECOCARE`), not
+  by label text, since the label/input `for`-attribute pairing on this specific popup was not
+  confirmed.
+- From/To date fields, and the popup's own Confirm click (with the already-fixed SV9104 self-
+  collision guard) all work correctly through to the confirmation dialog.
+
+**What's NOT yet resolved — a real, pre-existing blocker, not something this rewrite introduced:**
+a `ui-dialog-mask` overlay (id `j_idt737_modal` in the runs so far) blocks the post-Confirm re-
+select of the order row and the Submit-enabling checkbox click, even after widening
+`_click_when_clear`'s overlay wait from the default 30s to 45s. This is the SAME class of failure
+documented earlier in this file under the (now-retired) employee-checklist flow -- it happens
+after Stage C's Confirm step regardless of which assignment field is used, so it's a separate,
+generic Stage C timing issue, not specific to Work Team vs. Employee. Confirmed live 2x
+(`WO-PO/99999s1`, `WO-PO/99999s2`) with the corrected flow otherwise working end-to-end through
+Confirm. Whoever picks this up next should treat "assignment logic" (proven working) and "post-
+Confirm Submit enablement" (still broken) as two separate problems -- do not re-litigate the
+Work-Team/To-Pair-With logic while debugging this.
 
 ## ⚠️ Cloudflare bot protection
 `taskhub.ls2.sg` sits behind **Cloudflare bot protection**. HEADLESS Chromium gets blocked
