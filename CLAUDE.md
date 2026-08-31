@@ -42,3 +42,12 @@ level of specificity, not just the code comments.
   Several sessions' worth of wrong conclusions (e.g. the retracted "row-selection state" theory for
   the Stage C checklist bug) came from reasoning about a failure without looking at the actual
   screen state first.
+- **Synthetic test WO job dates must always be in the past (or today), never in the future.** A
+  Work Order bills for work already performed — every real WO this project has seen has a job date
+  at or before the WO date. Caught live (2026-08-31): a fix for a date-collision bug in
+  `run_synthetic_stage_c_test.py` offset test dates FORWARD from a fixed 2026-09-01 base, landing
+  several synthetic WOs in 2027 without anyone noticing until the user spotted it on screen. Wrong
+  in two ways: it's not what a real WO looks like, and it risks silently masking date-dependent
+  Synergix behavior (validation rules, business logic) that only real past/current dates would ever
+  exercise. When a test needs unique dates to avoid collisions, offset BACKWARD from
+  `date.today()`, never forward.

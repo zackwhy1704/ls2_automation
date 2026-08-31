@@ -39,8 +39,17 @@ WO_NUMBER = f"WO-PO/99999{SUFFIX}"
 # once any one of them gets scheduled (confirmed live 2026-08-31, twice, on WO-PO/99999i1 and
 # WO-PO/99999i2 after earlier same-dated synthetic WOs). Spread runs across different dates so
 # this class of test doesn't self-collide.
+#
+# CORRECTED (2026-08-31, same day, caught by the user): the first fix to this offset it FORWARD
+# from 2026-09-01, landing several test WOs in 2027 -- a real, avoidable mistake. A Work Order
+# represents billing for a job ALREADY PERFORMED; every real WO this project has ever seen has a
+# job date in the past or, at latest, today. Pushing test dates a year into the future is not just
+# cosmetically wrong, it risks masking date-dependent Synergix behavior (e.g. validation rules that
+# only apply to past/current dates) that a real WO would never trigger. Offset BACKWARD from
+# "yesterday" instead, so every synthetic test WO looks like a real one: recent, distinct, never
+# future-dated.
 _day_offset = sum(ord(c) for c in SUFFIX) % 300
-JOB_DATE = date(2026, 9, 1) + timedelta(days=_day_offset)
+JOB_DATE = date.today() - timedelta(days=1 + _day_offset)
 
 
 def build_payload() -> WOPayload:
