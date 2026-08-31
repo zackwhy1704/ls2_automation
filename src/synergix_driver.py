@@ -2424,7 +2424,17 @@ class SynergixDriver:
         if not await confirm_btn.count():
             logger.warning("Stage C: no Event Details confirm button found for %s", wo)
             return False
-        await confirm_btn.click(timeout=10000)
+        # _click_when_clear, not a raw click (2026-09-01): the From/To date fields immediately
+        # before this now each dispatch their own 'change' event (added to make the datepicker
+        # actually register -- see _fill_labeled_input's docstring) which fires a real PrimeFaces
+        # ajax cascade of its own, on top of the To Pair With tick's ajax right before that. Two
+        # live runs (WO-PO/99999m4, /99999m6) after that fix both saw this exact Confirm click
+        # leave the Event Details dialog open (needing the retry-or-fail path below) where the
+        # SAME flow had no such issue before the datepicker fix existed -- consistent with this
+        # click now firing while one of those trailing ajax calls (and its blockUI overlay) is
+        # still in flight. Every other click in this method already goes through
+        # _click_when_clear for exactly this reason; this one was the one holdout.
+        await self._click_when_clear(confirm_btn, timeout_ms=10000, overlay_wait_ms=15000)
         # Confirmed live (2026-08-31), by polling masks/dialog/spinner state every second: the
         # Confirm ajax call can genuinely take ~18s to complete (spinner visible continuously for
         # 18s, then dialog+mask cleared cleanly in the SAME second with no error) -- not a hang, a
