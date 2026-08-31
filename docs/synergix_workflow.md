@@ -275,21 +275,63 @@ constant was added with the same "unconfirmed assumption" framing as above.
 - From/To date fields, and the popup's own Confirm click (with the already-fixed SV9104 self-
   collision guard) all work correctly through to the confirmation dialog.
 
-**RESOLVED (2026-08-31, later same day): the `ui-dialog-mask`/disabled-Submit blocker was a SESSION
-TIMEOUT artifact, not a missing UI step.** Extensive investigation (frame-by-frame video review,
-live DOM polling for 30s straight, force-clicking the "disabled" Submit button) could not find any
-client-side action that enables Submit, because there wasn't one to find -- the automated test runs
-that hit this were sitting idle for extended periods (the test machine went to sleep mid-run
-multiple times that same session, freezing the browser process for many minutes at a stretch),
-almost certainly long enough for Synergix's own session/state to go stale server-side. When the
-user manually drove the SAME flow through by hand (no automation, no idle gaps) after seeing this
-exact error overlay once, **Submit worked correctly on the very next attempt** -- confirming the
-rewritten Work-Team + To-Pair-With flow (row select -> Employee -> Event Details -> To Pair With ->
-dates -> Confirm -> Submit) is correct and complete as implemented in `_schedule_stage_c_attempt`.
-No further UI/selector change was needed here. The real lesson: an idle/slept browser session
-mid-Stage-C can produce exactly this symptom (a button that looks disabled and never activates, a
-mask that never clears) -- treat a stuck Submit as a possible stale-session issue first (re-login,
-retry from a fresh page load) before assuming a missing click sequence.
+**RETRACTED (2026-08-31, same day, later still): the "session timeout" conclusion above is WRONG,
+or at least incomplete.** It was based on a single data point (one manual success after one idle
+automated run) and was not re-tested before being committed. Immediately after committing it, a
+fresh full Stage A-D end-to-end run (`WO-PO/99999cc1`) was executed with sleep actively prevented
+(`pmset -g` confirmed no sleep the whole run, verified before starting) -- i.e. with NO idle/session-
+staleness possible -- and it hit the **exact same** `ui-dialog-mask` (`id="j_idt737_modal"`) blocking
+`_tick_row_checkbox`'s click on `order_row2`'s `.ui-chkbox-box`, on BOTH Stage C attempts:
+- Attempt 1: Event Details Confirm succeeded (QUO0006859, SV00008919 confirmed via the Stage B.5
+  fallback), then failed at `_tick_row_checkbox` blocked by `j_idt737_modal` for the full 10s
+  timeout (`overlay_wait_ms=45000` did not help -- the mask never cleared inside that window either).
+- Hard reset triggered a retry. Attempt 2 correctly hit the SV9104 self-collision guard ("Confirm
+  already succeeded... treating as scheduled, not retrying") -- proving attempt 1's Confirm really
+  did land server-side -- and then **still** failed at the identical `_tick_row_checkbox` call,
+  blocked by the identical mask.
+
+This rules out "stale/idle session" as the sole or main cause: this run had no idle gap at all, and
+the SV9104 guard proves the server-side state was fresh and correct going into the second attempt,
+yet the mask still appeared both times at the same step. The manual success previously observed is
+still real and still unexplained -- something a human does differently at or around this step
+reliably unblocks it, but it is very unlikely to be "just wait longer" or "re-login," since this run
+had neither problem and still failed identically twice. **Status: open, unresolved, needs a human to
+drive the exact `_tick_row_checkbox` moment manually while comparing against automation.** See the
+"Manual investigation checklist" below.
+
+### Manual investigation checklist for the `j_idt737_modal` blocker (open as of 2026-08-31)
+
+Use `scripts/run_stage_c_handoff_at_submit.py` to get the browser to the exact stuck point
+automatically (row select -> Employee -> Event Details -> To Pair With tick -> dates -> Confirm),
+then take over by hand from there. Concretely, with the browser sitting at that stuck point:
+
+1. **Look at the screen before touching anything.** Is `id="j_idt737_modal"` (or any
+   `.ui-widget-overlay.ui-dialog-mask`) visible over the grid? Open devtools Elements panel and
+   search for `j_idt737_modal` -- note whether it exists in the DOM at all, and if so, is it
+   actually painted (not `display:none`/zero-opacity)? The automation only knows it exists and
+   intercepts clicks; it does not know if it's a real ghost dialog remnant or something else.
+2. **Check what dialog `j_idt737` itself is**, not just its mask. Search devtools for
+   `id="j_idt737"` (without `_modal`) -- what dialog does that id belong to? My working theory is
+   it's a leftover/hidden PrimeFaces dialog (possibly the Event Details dialog's own container,
+   not fully torn down after Confirm) whose mask is still attached even though the dialog body
+   looks closed. If so, the fix may be waiting for `#j_idt737` (not just `.blockUI.blockOverlay`)
+   to detach, or explicitly dismissing it, before the checkbox click.
+3. **Try clicking directly on the visible mask/greyed area itself** (not the checkbox) -- does that
+   dismiss it, the way clicking outside a modal often closes it? If yes, that single extra click is
+   likely the missing step.
+4. **Try pressing Escape** while focus is anywhere on the page -- PrimeFaces dialogs often close on
+   Escape even when a mask blocks pointer events.
+5. **If neither works, try clicking the row itself again first** (re-select `order_row2`, i.e. click
+   the WO's row text/cells, not its checkbox) before clicking the checkbox -- it's possible the grid
+   needs a fresh row-select click to re-establish context after Confirm closes, and the checkbox
+   click alone (skipping the row re-click) is what's actually missing.
+6. **Whatever action actually clears the mask and lets Submit enable, note it exactly**: what you
+   clicked, where, and whether anything visibly changed first (e.g. did the mask fade before or
+   after your click; did any other element flash). Report back with that description, plus which of
+   steps 2-5 (or something else entirely) was the one that worked, so it can be encoded as an
+   explicit wait/click in `_schedule_stage_c_attempt` (most likely right before or inside
+   `_tick_row_checkbox`, mirroring how `_wait_for_ajax_spinner` fixed the earlier, structurally
+   similar employee-checklist race).
 
 ## ⚠️ Cloudflare bot protection
 `taskhub.ls2.sg` sits behind **Cloudflare bot protection**. HEADLESS Chromium gets blocked
