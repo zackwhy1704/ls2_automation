@@ -1051,33 +1051,25 @@ class SynergixDriver:
             await page.wait_for_timeout(step_ms)
             elapsed += step_ms
         if not found:
-            # Confirmed live (2026-08-31/09-01) on WO-PO/99999m5 and /99999m7: Escape alone does NOT
-            # reliably close this popup -- it's a real PrimeFaces p:dialog (titled "Remarks", its own
-            # X close icon top-right), not a native browser prompt, and this one isn't wired to close
-            # on Escape. Screenshots from both failures show "OCBC BANK DETAIL" plainly visible as
-            # the first row in the results table, yet the `found` search above still returned False
-            # both times -- meaning the '[id$="searchResultTable"]' selector or its row-match logic
-            # doesn't actually match this popup's real structure (never independently confirmed via a
-            # live DOM dump; likely guessed). Left unfixed for now since the caller only warns and
-            # continues either way -- but leaving the dialog open is the real, confirmed failure mode
-            # that then blocks EVERY subsequent click on the page behind its mask for the rest of the
-            # run. Escape is kept as a first attempt (harmless, occasionally sufficient elsewhere in
-            # this app), then explicitly click the dialog's own titlebar close (X) icon as a second,
-            # more reliable fallback, and confirm the mask is actually gone before returning -- so a
-            # failed remark match degrades to "field left blank" (already-acceptable, per this
-            # method's own docstring) instead of silently wedging the rest of Stage B.
+            # Confirmed live across THREE separate attempts (2026-08-31/09-01, WO-PO/99999m5, m7,
+            # m8) that this popup does not close the way it looks like it should:
+            #  - Attempt 1: Escape alone -- didn't work, popup stayed open both times it was hit.
+            #  - Attempt 2: assumed a `.ui-dialog-mask` modal (like Event Details) and looked for a
+            #    titlebar close (X) icon -- also wrong. WO-PO/99999m8's own error log proved the
+            #    actual intercepting element is `<div id="searchPanel" class="ui-outputpanel
+            #    ui-widget">` itself, NOT a `.ui-dialog-mask` -- meaning this is a NON-modal
+            #    PrimeFaces overlay panel (the same family as an autocomplete/selectOneMenu dropdown
+            #    panel), which has no titlebar or close icon at all -- there was never a button for
+            #    that second attempt's close_btn.click() to find.
+            # A non-modal overlay panel like this is dismissed the standard PrimeFaces way: a click
+            # anywhere outside the panel. Click a neutral, always-present point (the page's own
+            # header bar) rather than guessing at another in-panel selector a third time.
             await page.keyboard.press("Escape")
             await page.wait_for_timeout(300)
-            mask_still_up = await page.locator(".ui-widget-overlay, .ui-dialog-mask").locator(
-                "visible=true"
-            ).count() > 0
-            if mask_still_up:
-                close_btn = page.locator(
-                    '[role="dialog"]:has-text("Remarks") a.ui-dialog-titlebar-close'
-                ).locator("visible=true").first
-                if await close_btn.count():
-                    await close_btn.click(timeout=5000)
-                    await page.wait_for_timeout(500)
+            still_open = await page.locator("#searchPanel").locator("visible=true").count() > 0
+            if still_open:
+                await page.mouse.click(10, 10)
+                await page.wait_for_timeout(500)
             return False
         try:
             await self._click_when_clear(page.locator(f'[{marker}="1"]'))
