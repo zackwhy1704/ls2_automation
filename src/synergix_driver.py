@@ -1051,7 +1051,33 @@ class SynergixDriver:
             await page.wait_for_timeout(step_ms)
             elapsed += step_ms
         if not found:
+            # Confirmed live (2026-08-31/09-01) on WO-PO/99999m5 and /99999m7: Escape alone does NOT
+            # reliably close this popup -- it's a real PrimeFaces p:dialog (titled "Remarks", its own
+            # X close icon top-right), not a native browser prompt, and this one isn't wired to close
+            # on Escape. Screenshots from both failures show "OCBC BANK DETAIL" plainly visible as
+            # the first row in the results table, yet the `found` search above still returned False
+            # both times -- meaning the '[id$="searchResultTable"]' selector or its row-match logic
+            # doesn't actually match this popup's real structure (never independently confirmed via a
+            # live DOM dump; likely guessed). Left unfixed for now since the caller only warns and
+            # continues either way -- but leaving the dialog open is the real, confirmed failure mode
+            # that then blocks EVERY subsequent click on the page behind its mask for the rest of the
+            # run. Escape is kept as a first attempt (harmless, occasionally sufficient elsewhere in
+            # this app), then explicitly click the dialog's own titlebar close (X) icon as a second,
+            # more reliable fallback, and confirm the mask is actually gone before returning -- so a
+            # failed remark match degrades to "field left blank" (already-acceptable, per this
+            # method's own docstring) instead of silently wedging the rest of Stage B.
             await page.keyboard.press("Escape")
+            await page.wait_for_timeout(300)
+            mask_still_up = await page.locator(".ui-widget-overlay, .ui-dialog-mask").locator(
+                "visible=true"
+            ).count() > 0
+            if mask_still_up:
+                close_btn = page.locator(
+                    '[role="dialog"]:has-text("Remarks") a.ui-dialog-titlebar-close'
+                ).locator("visible=true").first
+                if await close_btn.count():
+                    await close_btn.click(timeout=5000)
+                    await page.wait_for_timeout(500)
             return False
         try:
             await self._click_when_clear(page.locator(f'[{marker}="1"]'))
