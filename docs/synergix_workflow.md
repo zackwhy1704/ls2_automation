@@ -275,17 +275,21 @@ constant was added with the same "unconfirmed assumption" framing as above.
 - From/To date fields, and the popup's own Confirm click (with the already-fixed SV9104 self-
   collision guard) all work correctly through to the confirmation dialog.
 
-**What's NOT yet resolved — a real, pre-existing blocker, not something this rewrite introduced:**
-a `ui-dialog-mask` overlay (id `j_idt737_modal` in the runs so far) blocks the post-Confirm re-
-select of the order row and the Submit-enabling checkbox click, even after widening
-`_click_when_clear`'s overlay wait from the default 30s to 45s. This is the SAME class of failure
-documented earlier in this file under the (now-retired) employee-checklist flow -- it happens
-after Stage C's Confirm step regardless of which assignment field is used, so it's a separate,
-generic Stage C timing issue, not specific to Work Team vs. Employee. Confirmed live 2x
-(`WO-PO/99999s1`, `WO-PO/99999s2`) with the corrected flow otherwise working end-to-end through
-Confirm. Whoever picks this up next should treat "assignment logic" (proven working) and "post-
-Confirm Submit enablement" (still broken) as two separate problems -- do not re-litigate the
-Work-Team/To-Pair-With logic while debugging this.
+**RESOLVED (2026-08-31, later same day): the `ui-dialog-mask`/disabled-Submit blocker was a SESSION
+TIMEOUT artifact, not a missing UI step.** Extensive investigation (frame-by-frame video review,
+live DOM polling for 30s straight, force-clicking the "disabled" Submit button) could not find any
+client-side action that enables Submit, because there wasn't one to find -- the automated test runs
+that hit this were sitting idle for extended periods (the test machine went to sleep mid-run
+multiple times that same session, freezing the browser process for many minutes at a stretch),
+almost certainly long enough for Synergix's own session/state to go stale server-side. When the
+user manually drove the SAME flow through by hand (no automation, no idle gaps) after seeing this
+exact error overlay once, **Submit worked correctly on the very next attempt** -- confirming the
+rewritten Work-Team + To-Pair-With flow (row select -> Employee -> Event Details -> To Pair With ->
+dates -> Confirm -> Submit) is correct and complete as implemented in `_schedule_stage_c_attempt`.
+No further UI/selector change was needed here. The real lesson: an idle/slept browser session
+mid-Stage-C can produce exactly this symptom (a button that looks disabled and never activates, a
+mask that never clears) -- treat a stuck Submit as a possible stale-session issue first (re-login,
+retry from a fresh page load) before assuming a missing click sequence.
 
 ## ⚠️ Cloudflare bot protection
 `taskhub.ls2.sg` sits behind **Cloudflare bot protection**. HEADLESS Chromium gets blocked
