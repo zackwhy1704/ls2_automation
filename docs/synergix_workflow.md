@@ -26,10 +26,17 @@ only in WO intake (JBTC = TCMS scrape, SKTC = email).
 - Go to **Variation Order**, retrieve the same service quotation, click it, and **Confirm** the VO.
 
 ## 2. Schedule Board (stage C — most fragile, best-effort)
-- Type customer name to search; click on the employee.
-- Click on the calendar → event details pop up.
-- **Date = WO date**; choose **ECOCARE** or **INFIGO** from the dropdown.
-- Check the person name, remarks, etc.; if in order, press **Submit**.
+- Filter Unscheduled Service Orders by the WO-PO number (WITH its `WO-PO/` prefix, per the video —
+  see the detailed frame-by-frame section below); tick the row's own checkbox to select it.
+- Click Employee (toggle may need clicking twice if it drifts back to Work Team).
+- Click on the calendar → Event Details pop up: **Assigned** = a Work Team (e.g. `800SUPER`, not a
+  person — this is the field ⚠️ this project spent a week automating the WRONG target for, see
+  below), **To Pair With** = tick **ECOCARE** or **INFIGO** (alphabetic/numeric Job Sheet rule).
+- **Date = WO date** (both From and To); Remarks left blank in the one confirmed example.
+- Confirm the popup (tick → Yes), then click the SEPARATE **Submit** button on Order Details to
+  actually commit it — the popup's own confirm does not submit by itself.
+- See "Stage C, frame-by-frame from JBTC WO Synergix.mp4" further down for the full, exact,
+  timestamped walkthrough and open questions for the client.
 
 ## 3. Service Order Performance — Fulfil (stage D)
 - Search for the **service order no.** (or customer code if only one).
@@ -105,6 +112,140 @@ The **Service Quotation - LS2** edit form fields (confirmed against a real fille
 
 Stage C (Schedule Board) and the Fulfil view (Service Order Performance) were also shown but are OUT
 of the current Stage-B automation scope.
+
+## Stage C, frame-by-frame from JBTC WO Synergix.mp4 (2026-08-31) — corrects a multi-session mistake
+
+**This section exists because the automation spent roughly a week (sessions 4 through 8+) building
+and repeatedly "fixing" Stage C against the WRONG target.** Every one of those sessions assumed the
+final scheduling assignment is an **Employee** (specifically `SCHEDULE_EMPLOYEE = "TAN WEI YING"`,
+via Schedule Board's Employee/Work Team toggle and its "Employee Job Type" checklist). Extracting
+and reading the actual walkthrough video frame-by-frame (1 frame/sec, OpenCV, from 5:30 to 7:52)
+shows the REAL, successful, submitted flow uses a **Work Team** assignment ("Assigned: 800SUPER")
+paired with **INFIGO or ECOCARE** via a "To Pair With" checklist — never an employee name at all.
+The high-level summary two sections above this one (`## 2. Schedule Board`) already said "choose
+ECOCARE or INFIGO from the dropdown" — the correct answer was written down from the start; later
+sessions built an entire employee-checklist automation path without cross-checking it.
+
+Video: `~/Downloads/JBTC WO Synergix.mp4` (9.6 min, 30fps, screen recording against
+`copy.taskhub.ls2.sg` — confirmed by the visible URL bar and the "NON-PRODUCTION SERVER" banner in
+frame, so this is NOT a prod-only flow). WO used: `WO-PO/000080291` (JALAN BESAR TOWN COUNCIL,
+Job Sheet `A25-01086`, alphabetic prefix -> Infigo project code, Grand Total $47.96). Timestamps
+below are video position, extracted via `cv2.VideoCapture` + `CAP_PROP_POS_FRAMES` — reproducible
+by anyone with the same file (`ffmpeg`/`cv2` were not preinstalled on this machine; opencv-python-
+headless was pip-installed to do the extraction, no other tool was available).
+
+**Step-by-step, exact clicks and waits (referenced by video timestamp):**
+
+1. **[5:54–6:04]** From the Stage B.5 success toast (SA0005, Variation Order confirmed), navigate
+   General Service -> **Schedule Board - LS2**. Page loads with the Customer Info/Search panel open
+   on the right at full width — the panel is NOT collapsed first; no "Step 1 chevron" action of any
+   kind happens before filtering. (An earlier session in THIS SAME investigation invented a
+   "collapse the Customer Info panel first" step from a misreading of the written doc's Step-1
+   screenshot and had to revert it after it caused a regression — see the commit history on
+   `_schedule_stage_c_attempt`. The video proves that step doesn't exist in the real flow.)
+2. **[6:04–6:12]** Click into the **Unscheduled Service Orders** grid's **Enquiry/Subject** column
+   filter box. First paste is a stray, unrelated clipboard string (a PowerFX snippet — a genuine
+   mistake in the recording, not part of the procedure) which correctly returns "No records found".
+   Corrected to **`WO-PO/000080291` — the FULL string, WITH the `WO-PO/` prefix and slash** — which
+   returns exactly one row (`SV00008851 | QUO0006213 | JALAN BESAR TOWN COUNCIL | ...`).
+   ⚠️ **This directly contradicts the current driver code**, which strips the prefix before
+   filtering (`wo_bare = wo.replace("WO-PO/", "")` in `_schedule_stage_c_attempt`). The video never
+   tests the bare-number form, so it's not proven wrong, only proven that the WITH-prefix form
+   definitely works — worth testing whether the bare form still works before assuming it doesn't.
+3. **[6:13–6:14]** **Tick the row's own checkbox** (the small checkbox at the start of the row, NOT
+   a click on the row body/text). This is the "correct order MUST BE SELECTED (blue highlight)"
+   step the user described from memory before the video was reviewed. Ticking it immediately opens
+   **Order Details[SV00008851]** in the right-hand panel (replacing Customer Search), showing
+   "⚠ This Service Order has not been submitted."
+4. **[6:15]** Click **Employee** (top-right of the Schedule Calendar section, next to Work Team).
+   Becomes active (blue) immediately.
+5. **[6:15–~6:28]** A **long ajax wait** — Synergix's own footer loading spinner
+   (`img.js-ajax-spinner`, see `_wait_for_ajax_spinner` in `src/synergix_driver.py`) runs
+   continuously for approximately **13 seconds** here with no visible page change, then the
+   calendar grid changes shape and gains a real "1 / 2" pagination footer. No "Filter" panel was
+   explicitly opened in this recording before this point — the calendar itself became paginated
+   directly off the Employee click. (This differs from the current driver's assumption that a
+   separate Filter-panel click is required to see/select employees — worth re-testing whether
+   Filter is actually optional, or whether it happened off-screen/too fast for the recording to
+   show. Flagging as unconfirmed rather than asserting either way.)
+6. **[6:28–6:44]** Cursor moves around the empty calendar body and the right panel, clicks page "2"
+   navigation once, calendar switches from a plain date view to a **Week of 16/07/2026** view.
+   Ticking the row's checkbox again (or the toggle reasserting itself) causes "Employee" to
+   revert to "Work Team" being highlighted, needing "Employee" clicked a second time — the same
+   "toggle can drift back" flakiness this project's earlier sessions already documented, now with
+   ground truth that this drift is a real, recorded phenomenon and not a testing artifact.
+7. **[6:50]** Click into the calendar body -> **Event Details** popup opens. Fields, exactly as shown:
+   - **From** / **To** date pickers (both default to `15/07/2026` on open — NOT the WO date; this
+     gets manually corrected in the next step).
+   - **Assigned** — a dropdown, defaulted to **`800SUPER`**. This is a WORK TEAM, not a person.
+     ⚠️ **Nothing on the WO PDF or in the workflow doc names "800SUPER" or explains how to choose
+     it.** No field on the source WO (`Contractor Code: 530`, `Schedule Type: KB-000202`, GL No.,
+     etc.) obviously maps to it. Treating `800SUPER` as the default/only value used to date is an
+     ASSUMPTION, not a confirmed rule — see "Open question for the client" below.
+   - **Paired With** (read-only display, populated once a "To Pair With" box is ticked).
+   - **To Pair With** — a checklist of 12 names/teams: CADILLAX, ECOCARE, GREENCARE, HERBERT LIM PIN
+     HENG, INFIGO, NEWS, SUSAN LEE SUN SUN, TAN WEI YING, TAN ZHEN YUAN BENEDICT, TOMMY TOH GIM POR,
+     VINCENT TEO BOON WAH, VISHAL ANAND SINGH. **`TAN WEI YING` appears here too — as one of 12
+     possible pairings, not as the "Assigned" party.** This is very likely why every earlier session
+     assumed she was the target: her name genuinely does appear on this exact popup, just in the
+     wrong field.
+   - **Remarks** — a free-text box, left EMPTY in this recording (not filled with the
+     nature-of-work + WO-number string the current driver code composes for the employee-flow
+     equivalent).
+8. **[6:52]** Ticks **INFIGO** in "To Pair With" (not ECOCARE) — consistent with this WO's Job Sheet
+   `A25-01086` having an alphabetic prefix, which the existing `resolve_project_code()` logic (and
+   the doc's Project Site rule) already maps to Infigo/2000069. This is the FIRST live confirmation
+   that the "To Pair With" choice follows the SAME alphabetic/numeric Job Sheet rule as Project
+   Site — genuinely likely but not independently proven from a second example in this recording.
+9. **[7:00]** **From** date manually changed to `03/07/2026` — the WO Date (top of the PDF), not the
+   job/service date shown elsewhere on the form. **Paired With** field now shows `INFIGO`,
+   confirming the checkbox tick committed.
+10. **[7:03]** **To** date also changed to `03/07/2026` — same-day event, both fields equal.
+11. **[7:10–7:20]** Cursor lingers near the checklist and Remarks box but Remarks is never filled in
+    this recording, and no other checkbox is ticked.
+12. **[7:30]** Clicks the popup's own confirm (checkmark) button -> a **"Confirmation: Are you
+    sure?"** dialog appears -> clicks **Yes**.
+13. **[7:32–7:40]** Popup closes. The Unscheduled Service Orders grid reverts to its unfiltered
+    default view (all 45 rows) — the filter is NOT preserved after the popup closes. Order
+    Details[SV00008851] remains open on the right, still showing "⚠ This Service Order has not been
+    submitted" — the popup's own confirm does NOT submit the Service Order by itself, matching this
+    project's existing documented understanding ("a SECOND, separate Submit action" — this part of
+    the prior understanding was correct).
+14. **[7:40–7:50]** Clicks **Submit** (top of the Order Details panel, next to "Order
+    Details[SV00008851]"). No visible confirmation dialog for this specific click in the recording.
+15. **[7:50]** **Confirmed success**: the "not submitted" warning is gone, and the **Upcoming
+    Service** tab (top-right of the page, next to Customer Info) now shows a real populated entry —
+    `16/07/2026, SV00008851, Jalan Besar Town Council - 4C ST. GEORGE'S LANE, ... WO-PO/000080291` —
+    with the full remarks/description text. The bottom of the Order Details panel shows a
+    **"Schedule"** section listing **`INFIGO`**, confirming the Work Team + Pair-With assignment is
+    what actually persisted, not an employee name.
+
+**Assumptions this session is making, to be clarified with the client (per the user's explicit
+instruction, 2026-08-31: "i dont know just follow the WO, state your assumptions and i will clarify
+with the client"):**
+
+- **`Assigned = 800SUPER` is assumed to be a fixed default for JBTC**, since nothing on the WO or in
+  the doc ties it to any WO-specific field. This may be wrong — it could vary by council, by date
+  (whoever's on duty that week), by job type, or be a dropdown the human operator picks from
+  domain knowledge not captured anywhere in the automation's inputs. **Needs client confirmation.**
+- **"To Pair With" (INFIGO vs ECOCARE) is assumed to follow the same alphabetic/numeric Job Sheet
+  rule as Project Site** (`resolve_project_code()`), since the one example in the video is
+  consistent with that rule. Only one data point — **not independently proven, needs client
+  confirmation or a second video/example.**
+- **Filtering the grid by the WO-PO WITH its "WO-PO/" prefix** is what's proven to work in the
+  video; whether the bare-number form (what the driver currently sends) also works, or whether that
+  was the actual latent bug this whole time, is not yet re-tested live as of this writing.
+- **Remarks was left blank** in the one recorded example — assumed optional/not required for a
+  successful Submit, since Submit succeeded without it. Not explicitly confirmed as intentional
+  vs. an omission in the recording.
+
+**Next step once these are confirmed:** rewrite `_schedule_stage_c_attempt` in
+`src/synergix_driver.py` around the row-checkbox selection + Work Team "Assigned" dropdown +
+"To Pair With" checklist flow instead of the Employee/`SCHEDULE_EMPLOYEE` checklist flow it
+currently targets. This is a structural rewrite, not a small patch — nearly every helper in that
+method (`_mouse_click_ui_button` targeting Employee/Work Team, the `employee_checkbox_js` lookup,
+`SCHEDULE_EMPLOYEE` itself) was built for the wrong target field and will need to be re-pointed or
+replaced.
 
 ## ⚠️ Cloudflare bot protection
 `taskhub.ls2.sg` sits behind **Cloudflare bot protection**. HEADLESS Chromium gets blocked
