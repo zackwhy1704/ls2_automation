@@ -1056,16 +1056,20 @@ class SynergixDriver:
         # that screenshots proved was plainly visible (WO-PO/99999m5, m7, m8, m10, m12). Switched to
         # `[id*="searchResultTable"]` (contains, not ends-with) and scoped to `<table>` specifically
         # to avoid also matching the column-header `<th>` elements that share the same id substring.
+        # SIMPLIFIED (2026-09-01): both the ends-with (`[id$=...]`) and contains (`[id*=...]`) table-id
+        # selector approaches kept silently failing live on rows a screenshot proved were plainly
+        # visible (WO-PO/99999m5, m7, m8, m10, m12, m13, live1) -- confirmed the SAME run's popup
+        # right after the user manually clicked the identical visible "OCBC BANK DETAIL" row
+        # themselves and it worked instantly, no special handling needed. The whole table/tbody/tr
+        # scoping was solving a problem that doesn't exist: a human doesn't care what table element
+        # wraps the row, they just look at the text and click it. Replaced with the same, much
+        # simpler approach -- find any visible <a> anywhere on the page whose own text contains the
+        # target remark code, exactly matching what a human actually does.
         js = """([needle, marker]) => {
-                const table = [...document.querySelectorAll('table[id*="searchResultTable"]')]
-                    .find(t => t.offsetParent !== null);
-                if (!table) return false;
-                const rows = [...table.querySelectorAll('tbody tr')];
-                const match = rows.find(r => r.innerText.includes(needle));
-                if (!match) return false;
-                const link = match.querySelector('a');
-                if (!link) return false;
-                link.setAttribute(marker, '1');
+                const links = [...document.querySelectorAll('a')]
+                    .filter(a => a.offsetParent !== null && a.textContent.includes(needle));
+                if (!links.length) return false;
+                links[0].setAttribute(marker, '1');
                 return true;
             }"""
         found = False
