@@ -27,7 +27,12 @@ SUFFIX = sys.argv[1] if len(sys.argv) > 1 else "hoff1"
 _char_sum = sum(ord(c) * (i + 1) for i, c in enumerate(SUFFIX))
 _suffix_digits = f"{_char_sum % 90000000 + 10000000:08d}"
 WO_NUMBER = f"WO-PO/9{_suffix_digits}"
-_day_offset = sum(ord(c) for c in SUFFIX) % 300
+# Widened % 300 -> % 3650 (2026-09-01), see the detailed comment in run_synthetic_stage_c_test.py:
+# a narrow date range + every test WO sharing the same hardcoded ASSIGNED_WORK_TEAM ("800SUPER")
+# caused real, confirmed date collisions across a single day's testing (the same team can't
+# logically be booked twice on the same date, which Synergix correctly refuses to render an "add
+# event" cell for). Reuses the better-distributed _char_sum above instead of a separate hash.
+_day_offset = _char_sum % 3650
 JOB_DATE = date.today() - timedelta(days=1 + _day_offset)
 
 

@@ -61,7 +61,21 @@ WO_NUMBER = f"WO-PO/9{_suffix_digits}"
 # only apply to past/current dates) that a real WO would never trigger. Offset BACKWARD from
 # "yesterday" instead, so every synthetic test WO looks like a real one: recent, distinct, never
 # future-dated.
-_day_offset = sum(ord(c) for c in SUFFIX) % 300
+#
+# CORRECTED AGAIN (2026-09-01, caught live by the user): a `% 300` range with a plain
+# `sum(ord(c))` hash is far too narrow -- with the ~30 synthetic test suffixes used across a single
+# day's testing, birthday-paradox math makes date collisions common, and EVERY synthetic test WO is
+# assigned the SAME hardcoded ASSIGNED_WORK_TEAM ("800SUPER" in src/synergix_driver.py). Two test
+# WOs landing on the same job_date are therefore both trying to book the identical team at the
+# identical date -- a real, sensible Synergix constraint (the same team logically cannot do two jobs
+# at once), which correctly refuses to render an "add event" cell for the second one. This was
+# initially misdiagnosed as "an intermittent UI render lag" (a re-click sometimes incidentally
+# landed on a genuinely different, open slot) -- it is actually a genuine, reproducible date
+# collision. CONFIRMED: m22 and m13, m23 and m14, m21 and m12, m20 and m11 all collided on the same
+# day of testing under the old `% 300` formula. Fixed by widening the range to `% 3650` (10 years)
+# and reusing the much better-distributed _char_sum already computed for the WO number above,
+# instead of a separate, narrower sum(ord(c)) hash.
+_day_offset = _char_sum % 3650
 JOB_DATE = date.today() - timedelta(days=1 + _day_offset)
 
 
