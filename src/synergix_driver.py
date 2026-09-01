@@ -2287,6 +2287,69 @@ class SynergixDriver:
         # docs/synergix_workflow.md) and which several of today's bugs (5, 6) trace back to skipping.
         await page.wait_for_timeout(5000)
 
+        # CRITICAL FIX (2026-09-01), caught directly by the user from a live screenshot: a genuinely
+        # FRESH WO's calendar is white/empty (matching the video's own 6:00-8:00 starting state --
+        # "a fresh work order is supposed to be white and calendar no input"). But on a RETRY (this
+        # method's own outer wrapper, _schedule_stage_c, hard-resets and calls this method again from
+        # scratch after any failure), the calendar can ALREADY show a green "Schedule of Current
+        # Service Order" block from attempt 1's Confirm having genuinely succeeded server-side even
+        # though attempt 1 then failed at the LATER Submit step. Every previous version of this
+        # method never checked for this and just re-ran the full row-select -> Employee toggle ->
+        # newEventButton -> Event Details -> Confirm sequence again -- clicking Confirm a second time
+        # on an already-booked date/team/pairing collides with itself and raises repeated SV9104
+        # "you can only book one task on the same Timeslot" errors (confirmed live via a screenshot
+        # showing four stacked SV9104 toasts, all for the same date, after a retry). The user's own
+        # framing: "you keep repeating on a logged (look at the green inputs in the calendars) means
+        # you already have valid orders logged and saved all you have to do is submit when this
+        # happens. thats why the same WO doesn't work repeatedly because theres a saved order
+        # unsubmitted." Check for this BEFORE touching the Employee toggle or Event Details at all --
+        # if the Order Details panel already shows a "Schedule" section (order_no's own calendar
+        # entry already committed), skip the entire assignment flow and go straight to finding and
+        # clicking Submit.
+        already_scheduled = await page.locator('text=Schedule').locator("visible=true").filter(
+            has=page.locator("xpath=following-sibling::*[contains(., '800SUPER') or "
+                              "contains(., 'INFIGO') or contains(., 'ECOCARE')]")
+        ).count() > 0
+        if not already_scheduled:
+            # Simpler, more robust fallback check: the Order Details panel's own "Schedule" heading
+            # exists AND is followed by a team name -- the above xpath is best-effort (PrimeFaces
+            # markup can vary), so also just check for the literal "Schedule" section text alongside
+            # a Work Team name anywhere currently visible on the page.
+            already_scheduled = (
+                await page.locator("text=Schedule").locator("visible=true").count() > 0
+                and (await page.locator("text=800SUPER").locator("visible=true").count() > 0
+                     or await page.locator("text=INFIGO").locator("visible=true").count() > 0
+                     or await page.locator("text=ECOCARE").locator("visible=true").count() > 0)
+            )
+        if already_scheduled:
+            logger.info("Stage C: %s already shows a committed Schedule (green calendar entry from "
+                        "a prior attempt) -- skipping straight to Submit, not re-running Confirm", wo)
+            submit_btn = page.locator('button:has(span.fa-vote-yea)').locator("visible=true").first
+            if not await submit_btn.count():
+                logger.warning("Stage C: already-scheduled but no Submit button found for %s", wo)
+                return False
+            try:
+                await self._click_when_clear(submit_btn, timeout_ms=30000, overlay_wait_ms=30000)
+            except Exception as exc:
+                logger.exception("Stage C: Submit click failed on already-scheduled order for %s (%s)",
+                                  wo, exc)
+                await self._screenshot(f"stage_c_submit_disabled_{wo.replace('/', '-')}")
+                return False
+            await page.wait_for_timeout(1500)
+            yes_btn = page.get_by_role("button", name="Yes").locator("visible=true")
+            if await yes_btn.count():
+                await yes_btn.first.click(timeout=10000)
+            await page.wait_for_timeout(20000)
+            upcoming = await page.locator("text=Upcoming Service").locator("visible=true").count()
+            confirmed = (upcoming
+                         and await page.get_by_text(order_no, exact=False).locator("visible=true").count() > 0)
+            if not confirmed:
+                logger.warning("Stage C: %s (%s) not found in Upcoming Service after submit "
+                                "(already-scheduled path)", wo, order_no)
+                return False
+            logger.info("Stage C submitted (already-scheduled path) for %s (%s)", wo, order_no)
+            return True
+
         async def _mouse_click_ui_button(label: str) -> bool:
             # Confirmed live (2026-08-28): a JS-dispatched btn.click() on this toggle is a no-op as
             # far as the server is concerned -- checkbox count on the page measured 0 change after
@@ -2663,10 +2726,27 @@ class SynergixDriver:
         # elsewhere in this method for a closely related action (the Event Details Confirm).
         await page.wait_for_timeout(20000)
 
+        # Corrected (2026-09-01), per the user's direct instruction to check this against the video:
+        # the earlier comment here claiming the "not submitted" warning disappears at the EARLIER
+        # Event Details Confirm step (not at Submit) was WRONG -- the frame-by-frame record in
+        # docs/synergix_workflow.md's "Stage C ground truth" section shows the warning still visibly
+        # present at 7:45.0 (right before the Submit click) and gone at 7:48.5 (right after) -- i.e.
+        # it disappears exactly AT Submit succeeding, not one step earlier. Check it explicitly here
+        # as an additional, independent success signal alongside "Upcoming Service" (not a
+        # replacement -- "Upcoming Service" is still the one CONFIRMED-authoritative signal per the
+        # user; this banner check is a second, corroborating data point, logged as a warning rather
+        # than a hard failure if it disagrees, since the video is the more reliable source of truth).
+        not_submitted_banner = page.locator("text=This Service Order has not been submitted").locator(
+            "visible=true"
+        )
+        if await not_submitted_banner.count() > 0:
+            logger.warning("Stage C: 'not submitted' banner is STILL visible after Submit+Yes for "
+                            "%s -- the video shows this should have cleared; Submit may not have "
+                            "actually succeeded despite reaching this point", wo)
+
         # Verify via "Upcoming Service" showing a new entry -- confirmed live this is the only signal
-        # that reflects real server-side persistence; the "not submitted" warning disappearing alone
-        # is NOT sufficient (it disappears one step earlier, at the popup's own checkmark). Also the
-        # exact signal the user pointed to directly from the video at 7:53 as proof Submit succeeded.
+        # that reflects real server-side persistence. This is the exact signal the user pointed to
+        # directly from the video at 7:53 as proof Submit succeeded.
         upcoming = await page.locator("text=Upcoming Service").locator("visible=true").count()
         if not upcoming:
             logger.warning("Stage C: could not find 'Upcoming Service' panel to verify %s", wo)
