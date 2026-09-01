@@ -2530,10 +2530,18 @@ class SynergixDriver:
                 const label = [...document.querySelectorAll('*')]
                     .find(el => el.children.length === 0 && (el.textContent || '').trim() === 'Week of');
                 if (!label) return null;
-                const container = label.closest('div');
-                const input = container ? container.parentElement.querySelector('input[type="text"]')
-                    : null;
-                return input ? input.id : null;
+                // Walk up through ancestors (not just one fixed level) searching each one for a
+                // visible text input, since the exact nesting depth between the "Week of" label and
+                // its date input isn't confirmed -- more robust than assuming a specific structure.
+                let node = label;
+                for (let depth = 0; depth < 6 && node; depth++) {
+                    const input = node.querySelector && node.querySelector(
+                        'input[type="text"]:not([type=hidden])'
+                    );
+                    if (input && input.offsetParent !== null) return input.id;
+                    node = node.parentElement;
+                }
+                return null;
             }"""
         )
         week_of_input = (
