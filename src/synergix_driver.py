@@ -1030,9 +1030,19 @@ class SynergixDriver:
             return False
 
         marker = "data-claude-remark-target"
+        # Confirmed live (2026-09-01) via a real error-log DOM excerpt that the actual table id is
+        # "searchResultsForm:searchResultTable" with PrimeFaces column-header ids suffixed further
+        # (e.g. "...:searchResultTable:j_idt8132") -- `[id$="searchResultTable"]` (ends-with) can
+        # only match an element whose id LITERALLY ENDS at that string, so it was silently matching
+        # nothing (or the wrong element) whenever the real table/header ids continued past that
+        # point, exactly the kind of "no match found" false negative repeatedly seen live on a row
+        # that screenshots proved was plainly visible (WO-PO/99999m5, m7, m8, m10, m12). Switched to
+        # `[id*="searchResultTable"]` (contains, not ends-with) and scoped to `<table>` specifically
+        # to avoid also matching the column-header `<th>` elements that share the same id substring.
         js = """([needle, marker]) => {
-                const table = document.querySelector('[id$="searchResultTable"]');
-                if (!table || table.offsetParent === null) return false;
+                const table = [...document.querySelectorAll('table[id*="searchResultTable"]')]
+                    .find(t => t.offsetParent !== null);
+                if (!table) return false;
                 const rows = [...table.querySelectorAll('tbody tr')];
                 const match = rows.find(r => r.innerText.includes(needle));
                 if (!match) return false;
@@ -1051,30 +1061,30 @@ class SynergixDriver:
             await page.wait_for_timeout(step_ms)
             elapsed += step_ms
         if not found:
-            # Confirmed live across FOUR attempts before this one got it right (2026-08-31/09-01,
-            # WO-PO/99999m5, m7, m8, m10) that this popup does not close the way it looks like it
-            # should. The first three attempts were all based on guesses from screenshots/partial
-            # error-log DOM excerpts and were each wrong in a different way:
-            #  - Attempt 1: Escape alone -- didn't work.
-            #  - Attempt 2: looked for a titlebar close icon scoped under `#searchPanel` directly --
-            #    wrong scope (see below).
-            #  - Attempt 3: assumed `#searchPanel` itself toggles visibility to indicate the popup is
-            #    open/closed, and clicked outside if so -- ALSO wrong, and this is what a proper live
-            #    DOM dump (2026-09-01, via a temporary discovery script that walked the ancestor
-            #    chain from the "Remark Code" text up) finally revealed why: `#searchPanel` is a
-            #    permanent, always-present, always-"invisible" (no styling of its own) OUTER wrapper
-            #    -- checking ITS visibility can never distinguish popup-open from popup-closed. The
-            #    REAL popup is a child of it: a PrimeFaces `ui-dialog` with a dynamic, reused id
-            #    (confirmed as `j_idt737` this run -- the SAME id family already seen recurring on
-            #    Event Details' own dialog/mask elsewhere in this file, so it is NOT stable across
-            #    page loads and must not be hardcoded). Its real titlebar, captured directly from the
-            #    live DOM, is genuinely a normal PrimeFaces close icon:
-            #    `<span class="ui-dialog-title">Remarks</span>
-            #     <a class="ui-dialog-titlebar-close" aria-label="Close">...</a>`
-            #    -- meaning attempt 2's ORIGINAL close-icon idea was the right shape all along; it
-            #    just queried the wrong scope (`#searchPanel a...` matches nothing, since the real
-            #    dialog is `#searchPanel`'s CHILD with its own generated id, not `#searchPanel`
-            #    itself) instead of finding the dialog by its stable title text.
+            # REAL ROOT CAUSE finally found (2026-09-01) via frame-by-frame video review (every
+            # single 30fps frame, 4:55-5:05 in JBTC WO Synergix.mp4, pixel-diffed to localize the
+            # exact click): the whole premise of this "not found" branch -- that a working flow ever
+            # needs to explicitly DISMISS this popup -- was wrong. The video shows the popup closes
+            # ITSELF, automatically, the instant the matching row is clicked (one frame: popup open
+            # with rows highlighted on hover -> next frame: popup gone, External Remarks filled).
+            # There is no separate close step in the real flow at all, matching this method's own
+            # docstring ("the row's actual click handler... both sets the textarea and fires a
+            # PrimeFaces ajax update"). Every live failure (WO-PO/99999m5, m7, m8, m10, m12) was NOT
+            # a dismiss-mechanism bug -- it was the JS match query above failing to find a row that a
+            # screenshot proved was plainly visible, meaning `found` stayed False and this whole
+            # branch fired for a popup that a human would have simply clicked through normally.
+            # FIXED (see the js string above): `[id$="searchResultTable"]` (ends-with) could only
+            # match an id that LITERALLY ENDS at that string -- a live error-log DOM excerpt showed
+            # the real ids continue further (e.g. "...:searchResultTable:j_idt8132" on the column
+            # header), so the ends-with selector was silently matching nothing. Switched to a
+            # `table[id*="searchResultTable"]` contains-selector.
+            #
+            # This Escape+close-button fallback is kept as a defensive last resort ONLY (e.g. a
+            # genuinely different remark code with zero real matches, which the video never exercised
+            # since the human always found a match) -- it should rarely if ever fire now that the
+            # match query itself is fixed. If it does fire and this still leaves the popup open,
+            # that's a new, separate incident worth its own fresh investigation, not a sign this
+            # comment's diagnosis was wrong.
             await page.keyboard.press("Escape")
             await page.wait_for_timeout(300)
             close_btn = page.locator(
