@@ -2221,7 +2221,9 @@ class SynergixDriver:
             await filter_input.click()
             await filter_input.fill(wo_bare)
             await filter_input.press("Enter")
-            await page.wait_for_timeout(3000)
+            # Widened 3000 -> 5000 (2026-09-01) to match the user's literal instruction: "filter for
+            # WO first, wait 5s" -- see the fuller comment on the fixed-wait pattern after row select.
+            await page.wait_for_timeout(5000)
 
         async def _wait_for_ajax_spinner(label: str, *, timeout_s: float = 15) -> None:
             # THE REAL FIX for the employee-checklist race (found live with the user, 2026-08-31):
@@ -2274,7 +2276,16 @@ class SynergixDriver:
         order_no = (await order_no_cell.inner_text()).strip()
         await order_row.click(timeout=10000)
         await _wait_for_ajax_spinner("row selection")
-        await page.wait_for_timeout(500)  # small settle margin on top of the real ajax-done signal
+        # Fixed 5s wait after every click (2026-09-01), per the user's explicit, literal instruction
+        # after re-grounding this whole method in JBTC WO Synergix.mp4 6:00-8:00: "every click you
+        # must wait 5s... click on WO, wait 5s, select WO, wait 5s, toggle to employee, wait 5s...".
+        # This is IN ADDITION TO the real ajax-spinner wait above, not a replacement for it -- the
+        # spinner wait already proves the server's own response has landed; this fixed wait mirrors
+        # the further, real elapsed time a human naturally takes (reading the screen, moving the
+        # mouse) between actions, which the video itself shows matters (e.g. at least ~20s of real
+        # gap between Confirm closing and Submit being clicked, per the frame-by-frame record in
+        # docs/synergix_workflow.md) and which several of today's bugs (5, 6) trace back to skipping.
+        await page.wait_for_timeout(5000)
 
         async def _mouse_click_ui_button(label: str) -> bool:
             # Confirmed live (2026-08-28): a JS-dispatched btn.click() on this toggle is a no-op as
@@ -2327,6 +2338,7 @@ class SynergixDriver:
         for _ in range(3):
             await _mouse_click_ui_button("Employee")
             await _wait_for_ajax_spinner("Employee toggle")
+            await page.wait_for_timeout(5000)  # fixed 5s wait after every click, see row-select comment above
             employee_active = await page.evaluate(
                 """() => {
                     const btn = [...document.querySelectorAll('div.ui-button')]
@@ -2376,6 +2388,7 @@ class SynergixDriver:
             logger.exception("Stage C: newEventButton click failed for %s (id=%s)", wo, new_event_btn_id)
             await self._screenshot(f"stage_c_newevent_click_failed_{wo.replace('/', '-')}")
             raise
+        await page.wait_for_timeout(5000)  # fixed 5s wait after every click, see row-select comment above
 
         # Confirmed live (2026-08-28, still applicable): the "Event Details" dialog takes several
         # seconds to actually render (ajax "onstart" fires immediately but the dialog itself lags) --
@@ -2445,6 +2458,7 @@ class SynergixDriver:
         )
         await self._click_when_clear(pair_checkbox_box, timeout_ms=10000)
         await _wait_for_ajax_spinner("To Pair With tick")
+        await page.wait_for_timeout(5000)  # fixed 5s wait after every click, see row-select comment above
         # Verify the tick actually landed -- confirmed elsewhere in this file (the retired employee-
         # checklist code) that a click can report success while the underlying checkbox state
         # doesn't actually change.
@@ -2462,13 +2476,24 @@ class SynergixDriver:
         # (unchanged field-lookup mechanics, just the same From/To labels on the same popup).
         job_date_str = payload.job_date.strftime("%d/%m/%Y")
         await self._fill_labeled_input("From", job_date_str)
-        await page.wait_for_timeout(500)
+        await page.wait_for_timeout(5000)  # fixed 5s wait after every click/fill, per the user's instruction
         await page.locator('button:has-text("Close")').first.click(timeout=5000)
-        await page.wait_for_timeout(1000)
+        await page.wait_for_timeout(5000)
         await self._fill_labeled_input("To", job_date_str)
-        await page.wait_for_timeout(500)
+        await page.wait_for_timeout(5000)
         await page.locator('button:has-text("Close")').first.click(timeout=5000)
-        await page.wait_for_timeout(1000)
+        await page.wait_for_timeout(5000)
+        # Explicit "ensure correct data loaded" check (2026-09-01), per the user's instruction to
+        # verify the calendar shows the correct date before proceeding, not just assume the fill
+        # landed. Warn (don't fail outright) on a mismatch -- the fields are re-readable and the
+        # existing _fill_labeled_input dispatches its own 'change' event, so a transient read race
+        # here is more likely than a genuine stuck value.
+        from_value = await self._read_labeled_value("From")
+        to_value = await self._read_labeled_value("To")
+        if job_date_str not in from_value or job_date_str not in to_value:
+            logger.warning("Stage C: From/To read back as %r/%r after setting %r for %s -- "
+                            "proceeding anyway, but this may indicate the date fill did not stick",
+                            from_value, to_value, job_date_str, wo)
         # Remarks left blank -- per the video, the one confirmed successful example never filled
         # this field and Submit still succeeded. ASSUMPTION: optional, not independently confirmed
         # as intentional vs. an omission in that one recording.
@@ -2551,6 +2576,14 @@ class SynergixDriver:
         # checking Submit, instead of relying solely on the polling loop below to eventually catch a
         # DOM update that may not have even been requested yet at the moment polling starts.
         await _wait_for_ajax_spinner("Order Details panel refresh after Confirm", timeout_s=15)
+        # Fixed wait matching the video's own observed timing (2026-09-01), per the user's explicit
+        # instruction to follow the recording literally rather than re-guess: the frame-by-frame
+        # record in docs/synergix_workflow.md measured at least ~20 seconds of real elapsed time
+        # between the Event Details Confirm closing (7:25.5) and Submit being clicked (7:45.0) in
+        # the video -- a human's natural pause (reading the screen, moving the mouse) that this
+        # method had never explicitly reproduced before today. This is on top of, not instead of,
+        # the ajax-spinner wait above.
+        await page.wait_for_timeout(20000)
 
         # CORRECTED (2026-08-31, frame-by-frame review of JBTC WO Synergix.mp4 at 7:00-7:52):
         # everything from here through Submit was WRONG in every prior version of this method. Every
@@ -2624,11 +2657,16 @@ class SynergixDriver:
         yes_btn = page.get_by_role("button", name="Yes").locator("visible=true")
         if await yes_btn.count():
             await yes_btn.first.click(timeout=10000)
-        await page.wait_for_timeout(5000)
+        # Widened 5s -> 20s (2026-09-01), per the user's explicit instruction: "press submit, yes,
+        # wait 10-20s. observe data being logged as per video then move on to stage D." Using the top
+        # of that range since Synergix's own ajax here has been measured taking up to ~18-30s
+        # elsewhere in this method for a closely related action (the Event Details Confirm).
+        await page.wait_for_timeout(20000)
 
         # Verify via "Upcoming Service" showing a new entry -- confirmed live this is the only signal
         # that reflects real server-side persistence; the "not submitted" warning disappearing alone
-        # is NOT sufficient (it disappears one step earlier, at the popup's own checkmark).
+        # is NOT sufficient (it disappears one step earlier, at the popup's own checkmark). Also the
+        # exact signal the user pointed to directly from the video at 7:53 as proof Submit succeeded.
         upcoming = await page.locator("text=Upcoming Service").locator("visible=true").count()
         if not upcoming:
             logger.warning("Stage C: could not find 'Upcoming Service' panel to verify %s", wo)
@@ -2637,7 +2675,14 @@ class SynergixDriver:
         if not confirmed:
             logger.warning("Stage C: %s (%s) not found in Upcoming Service after submit", wo, order_no)
             return False
-        logger.info("Stage C scheduled and submitted for %s (%s)", wo, order_no)
+        # "Observe data being logged" (2026-09-01), per the user's instruction: log the actual
+        # Upcoming Service entry's text, not just a boolean confirmed/not-confirmed, so a human
+        # reviewing the log can see exactly what got recorded before Stage D picks this up.
+        upcoming_entry_text = await page.get_by_text(order_no, exact=False).locator(
+            "visible=true"
+        ).first.inner_text()
+        logger.info("Stage C scheduled and submitted for %s (%s) -- Upcoming Service entry: %s",
+                    wo, order_no, upcoming_entry_text.replace("\n", " "))
         return True
 
     async def _open_service_order_performance(self) -> None:
