@@ -2263,6 +2263,35 @@ class SynergixDriver:
             logger.warning("Stage C: ajax spinner still visible %.1fs after %s -- proceeding anyway",
                             timeout_s, label)
 
+        async def _close_stray_event_dialog() -> None:
+            # Found live (2026-09-01) on WO-PO/99999live1, via a failure screenshot: a SECOND, STRAY
+            # "Event Details" popup was sitting open on top of the real Order Details panel right
+            # when Submit's click kept failing -- From/To 31/08/2026, a date that didn't even match
+            # this order's own Schedule (03/03/2026 underneath) -- almost certainly a leftover dialog
+            # from an EARLIER synthetic test WO/calendar row on the same cluttered Schedule Board
+            # (today's session has ~20+ leftover 9999xxx test WOs visible in the same calendar view)
+            # that never got dismissed. This dialog visually covers the whole page, including the
+            # real Submit button, which is exactly why Playwright's click kept timing out with
+            # "element is not enabled" even though a human's manual click on the SAME page worked
+            # instantly -- the human's click likely landed on or dismissed this stray dialog first.
+            # Close ANY visible "Event Details" dialog before ever attempting Submit, regardless of
+            # which order it's for -- there should be none open at this point in a clean flow.
+            stray = page.locator('[role="dialog"]:has-text("Event Details")').locator("visible=true")
+            count = await stray.count()
+            for i in range(count):
+                dlg = stray.nth(i)
+                close_btn = dlg.locator('a.ui-dialog-titlebar-close[aria-label="Close"]').locator(
+                    "visible=true"
+                ).first
+                if await close_btn.count():
+                    logger.warning("Stage C: closing a stray 'Event Details' dialog before Submit "
+                                    "for %s -- this should not normally be open at this point", wo)
+                    try:
+                        await close_btn.click(timeout=5000)
+                        await page.wait_for_timeout(1000)
+                    except Exception:
+                        pass
+
         await _filter_orders_by_wo()
 
         # Confirmed live (2026-08-27) on WO-PO/000077662: the row genuinely existed (verified
@@ -2347,6 +2376,7 @@ class SynergixDriver:
         if already_scheduled:
             logger.info("Stage C: %s already shows a committed Schedule (green calendar entry from "
                         "a prior attempt) -- skipping straight to Submit, not re-running Confirm", wo)
+            await _close_stray_event_dialog()
             submit_btn = page.locator('button:has(span.fa-vote-yea)').locator("visible=true").first
             if not await submit_btn.count():
                 logger.warning("Stage C: already-scheduled but no Submit button found for %s", wo)
@@ -2694,6 +2724,7 @@ class SynergixDriver:
         # to begin with -- of course it kept timing out, it was clicking into a stale, resetting grid
         # for no reason, while the real Submit button sat right there on the Order Details panel the
         # whole time, unblocked. No mask-clearing, no Escape, no re-click sequence was ever needed.
+        await _close_stray_event_dialog()
         submit_btn = page.locator('button:has(span.fa-vote-yea)').locator("visible=true").first
         if not await submit_btn.count():
             logger.warning("Stage C: no Submit button found on Order Details for %s", wo)
