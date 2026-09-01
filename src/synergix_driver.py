@@ -2525,23 +2525,23 @@ class SynergixDriver:
         # job_date. Explicitly navigate the calendar's own "Week of" date field to the WO's job date
         # before ever searching for a newEventButton.
         job_date_calendar_str = payload.job_date.strftime("%d/%m/%Y")
+        # SIMPLIFIED (2026-09-01), after two wrong guesses at the "Week of" label's DOM relationship
+        # to its date input (searching for literal "Week of" text failed live twice -- a screenshot
+        # showed this calendar view doesn't even display that label text, just the date input itself
+        # next to the << < > >> navigation arrows and a calendar icon). Stop trying to find the field
+        # via label text at all -- just find any visible text input, within the Schedule Calendar
+        # section specifically, whose CURRENT VALUE already looks like a dd/mm/yyyy date. This is
+        # exactly what a human does: they don't look for a label, they see the date box and click it.
         week_of_input_id = await page.evaluate(
             """() => {
-                const label = [...document.querySelectorAll('*')]
-                    .find(el => el.children.length === 0 && (el.textContent || '').trim() === 'Week of');
-                if (!label) return null;
-                // Walk up through ancestors (not just one fixed level) searching each one for a
-                // visible text input, since the exact nesting depth between the "Week of" label and
-                // its date input isn't confirmed -- more robust than assuming a specific structure.
-                let node = label;
-                for (let depth = 0; depth < 6 && node; depth++) {
-                    const input = node.querySelector && node.querySelector(
-                        'input[type="text"]:not([type=hidden])'
-                    );
-                    if (input && input.offsetParent !== null) return input.id;
-                    node = node.parentElement;
-                }
-                return null;
+                const section = [...document.querySelectorAll('*')]
+                    .find(el => (el.textContent || '').includes('Schedule Calendar'))
+                    ?.closest('div');
+                const scope = section || document;
+                const dateRe = /^\\d{2}\\/\\d{2}\\/\\d{4}$/;
+                const inputs = [...scope.querySelectorAll('input[type="text"]')]
+                    .filter(i => i.offsetParent !== null && dateRe.test((i.value || '').trim()));
+                return inputs.length ? inputs[0].id : null;
             }"""
         )
         week_of_input = (
