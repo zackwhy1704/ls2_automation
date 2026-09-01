@@ -2606,8 +2606,13 @@ class SynergixDriver:
         # poll-and-bail (step 1's bug) or no wait at all (step 2's bug).
         try:
             await self._click_when_clear(submit_btn, timeout_ms=30000, overlay_wait_ms=30000)
-        except Exception:
-            logger.warning("Stage C: Submit click failed outright for %s", wo)
+        except Exception as exc:
+            # logger.exception (not .warning) so the actual Playwright error/call-log is captured --
+            # confirmed live (2026-09-01) on WO-PO/99999m18 that even a 30s click timeout budget can
+            # still fail here, contradicting this method's own ~18-30s figure for the related Confirm
+            # ajax -- the real cause is still unconfirmed. A generic .warning() with no exception
+            # detail was not enough to diagnose why; capture the full error next time this fires.
+            logger.exception("Stage C: Submit click failed outright for %s (%s)", wo, exc)
             await self._screenshot(f"stage_c_submit_disabled_{wo.replace('/', '-')}")
             return False
         # Confirmed in the video (frame at 7:27.93): this Submit click raises its own separate
