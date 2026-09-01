@@ -479,12 +479,23 @@ exactly matches the verification logic already present at the end of `_schedule_
 no change was needed there -- it was already right, per this same video, from the original `fcbe03a`
 rewrite.
 
-### Overall status: RESOLVED -- genuine Stage A-D completion achieved 2026-09-01
+### Overall status (end of 2026-09-01): mostly resolved, one open Stage C blocker; next step = client-run real-WO test in copy env, then prod
 
-**A genuine, confirmed, end-to-end Stage A-D completion was achieved** on `WO-PO/99999live1` /
-Service Order `SV00008932` (Stage A/B/B.5 fully automated; Stage C completed with one manual assist
-on the final Submit click, root cause found and fixed immediately after; Stage D fully automated,
-verified via `scripts/run_stage_d_only.py`). Final bug count: 7. Summary:
+**A manual-assisted end-to-end Stage A-D completion was achieved** on `WO-PO/99999live1` / Service
+Order `SV00008932` (Stage A/B/B.5 fully automated; Stage C completed with one manual assist on the
+final Submit click; Stage D fully automated, verified via `scripts/run_stage_d_only.py`). Nine real
+bugs were found and fixed over the session (table below). **However, a final Stage C blocker remains
+OPEN**: after all fixes, the automation still cannot reliably find/open the "add event" cell
+(`[id*="newEventButton"]`) on a calendar that is provably correct (right weekly view, right job
+date, genuinely open grid). This was proven NOT to be a timing issue (~135s of patient retries vs
+the human's ~6.9s) -- a live DOM dump found no `newEvent`-id element at all, so the long-standing
+selector assumption is likely wrong, and/or heavy test-data congestion (~30+ leftover synthetic WOs)
+plus genuine intermittent Synergix-side flakiness is contributing. Full detail and the recommended
+next lead (tick the SPECIFIC employee in the filter checklist + wait for that employee's calendar to
+load, then capture the real clicked element live) are in the project memory file
+`stage-c-solved-2026-09-01`. **Agreed plan: the client will run a real WO through this `copy.` env
+first; if that succeeds, then try prod** -- rather than keep debugging on a polluted test session.
+Bug summary:
 
 | # | Bug | Status |
 |---|-----|--------|
