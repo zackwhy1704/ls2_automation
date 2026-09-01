@@ -31,7 +31,20 @@ from src.models import LineItem, WOPayload
 from src.synergix_driver import DedupResult, SynergixDriver
 
 SUFFIX = sys.argv[1] if len(sys.argv) > 1 else "01"
-WO_NUMBER = f"WO-PO/99999{SUFFIX}"
+# CRITICAL (2026-09-01, caught live by the user): do NOT build test WO numbers as a shared prefix
+# plus an incrementing/varying suffix (the old scheme was "WO-PO/99999" + SUFFIX, e.g. 99999m2 vs.
+# 99999m22) -- Synergix's own grid filtering does SUBSTRING matching, not exact matching, so a
+# filter for "99999m2" also matches "99999m22", "99999m23", etc. This caused real, confirmed
+# cross-contamination all session: stray Event Details dialogs and calendar entries from ONE test
+# WO kept interfering with a DIFFERENT, later test WO's Stage C run, purely because they shared the
+# "99999" prefix. Fixed by deriving a fixed-length numeric block from SUFFIX's characters (NOT
+# Python's hash() -- that's randomized per-process by default and gave real collisions across
+# separate script invocations, the same mistake already caught and fixed for the job-date offset
+# below) instead of concatenating SUFFIX onto a constant prefix -- no two distinct SUFFIX values can
+# ever produce a WO number that is a substring of another's, since every one is the same length.
+_char_sum = sum(ord(c) * (i + 1) for i, c in enumerate(SUFFIX))  # position-weighted, order-sensitive
+_suffix_digits = f"{_char_sum % 90000000 + 10000000:08d}"  # fixed 8 digits, never starts with 0
+WO_NUMBER = f"WO-PO/9{_suffix_digits}"
 # A unique job date per run, derived from the suffix's characters (NOT Python's hash() -- that's
 # randomized per-process by default and gave collisions across separate script invocations).
 # Multiple synthetic test WOs sharing the SAME job_date all collide on Schedule Board with

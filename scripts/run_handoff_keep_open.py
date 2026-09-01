@@ -19,7 +19,14 @@ from src.models import LineItem, WOPayload
 from src.synergix_driver import DedupResult, SynergixDriver
 
 SUFFIX = sys.argv[1] if len(sys.argv) > 1 else "hoff1"
-WO_NUMBER = f"WO-PO/99999{SUFFIX}"
+# Fixed-length numeric WO number derived from SUFFIX (2026-09-01) -- see the detailed comment in
+# run_synthetic_stage_c_test.py for why a shared "99999" prefix + varying suffix is unsafe: Synergix's
+# grid filter does substring matching, so "99999m2" also matches "99999m22" etc., causing real,
+# confirmed cross-contamination between supposedly-separate test WOs (stray Event Details dialogs,
+# calendar entries) within the same session.
+_char_sum = sum(ord(c) * (i + 1) for i, c in enumerate(SUFFIX))
+_suffix_digits = f"{_char_sum % 90000000 + 10000000:08d}"
+WO_NUMBER = f"WO-PO/9{_suffix_digits}"
 _day_offset = sum(ord(c) for c in SUFFIX) % 300
 JOB_DATE = date.today() - timedelta(days=1 + _day_offset)
 

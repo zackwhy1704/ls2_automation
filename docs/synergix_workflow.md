@@ -479,32 +479,35 @@ exactly matches the verification logic already present at the end of `_schedule_
 no change was needed there -- it was already right, per this same video, from the original `fcbe03a`
 rewrite.
 
-### Overall status as of this write-up
+### Overall status: RESOLVED -- genuine Stage A-D completion achieved 2026-09-01
 
-**A genuine, clean, fully-automated Stage A-D `PROCESSED` result has still NOT been achieved**, but
-the likely real remaining blocker (bugs 5/6's `is_enabled()` gate) is now believed fixed and simply
-needs a fresh end-to-end run to confirm. Summary of the day's six bugs:
+**A genuine, confirmed, end-to-end Stage A-D completion was achieved** on `WO-PO/99999live1` /
+Service Order `SV00008932` (Stage A/B/B.5 fully automated; Stage C completed with one manual assist
+on the final Submit click, root cause found and fixed immediately after; Stage D fully automated,
+verified via `scripts/run_stage_d_only.py`). Final bug count: 7. Summary:
 
 | # | Bug | Status |
 |---|-----|--------|
 | 1 | Wrong grid-checkbox re-selection blocking Stage C Submit | **Fixed, verified live** (`7708c86`) |
-| 2 | Datepicker `.fill()` not registering with Synergix | Fixed, not yet independently re-verified |
-| 3 | Event Details Confirm click needed overlay-safe wait | Fixed, not yet independently re-verified |
-| 4 | External Remarks popup not reliably closing on no-match | Fixed (real root cause: `[id$=...]` ends-with selector never matched; also widened timeout 6s->20s) -- verified Stage B now recovers past it without crashing (`WO-PO/99999m14`, `m16`) |
-| 5 | Stage C Submit-enable poll too short, caused harmful retry | **SUPERSEDED by bug 6** -- the poll itself was the wrong approach, not just too short |
-| 6 | Submit click was gated behind a broken `is_enabled()` check that never reflected real state | **Fixed** (`c70ef8d`), per direct user correction from the video -- a human never checks this at all, just clicks Submit. Not yet re-verified live -- next step |
+| 2 | Datepicker `.fill()` not registering with Synergix | **Fixed, verified live** |
+| 3 | Event Details Confirm click needed overlay-safe wait | **Fixed, verified live** |
+| 4 | External Remarks popup match logic (not a dismissal problem -- three earlier fix attempts were all wrong) | **Fixed for real** (`0275865`): replaced the whole table/tbody/tr JS lookup with a plain "find any visible link containing the target text" search, after the user manually clicked the same failing row and it worked instantly |
+| 5/6 | Submit-enable poll tuning | **Superseded** -- neither the 30s poll widening nor removing the poll entirely was the real fix; see bug 7 |
+| 7 | **THE real Submit-disabled cause**: a stray leftover Event Details dialog (from an unrelated earlier test WO) sat open on top of the real Order Details panel, invisibly blocking Submit | **Fixed** (`5153ea1`): `_close_stray_event_dialog()` called before every Submit attempt; also fixed the outer retry wrapper re-colliding with an already-committed schedule on retry, by properly scoping the already-scheduled detection to the current order's own panel (`285118a`) |
 
-Bug 4 is now confirmed fixed (two consecutive runs, `m14` and `m16`, both recovered from the "no
-External Remarks match" warning without crashing). Bug 6 is the most likely explanation for EVERY
-Stage C "failure" seen today after bug 1 was fixed -- a fresh end-to-end run is the immediate next
-step to confirm a genuine `PROCESSED` result.
+**Critical test-data bug also found and fixed**: synthetic WO numbers sharing a `"99999"` prefix
+(e.g. `99999m2` vs `99999m22`) let Synergix's own substring-matching grid filter cross-contaminate
+supposedly-separate test WOs -- almost certainly the actual cause of bug 7's stray dialog. Fixed in
+`scripts/run_synthetic_stage_c_test.py` and `run_handoff_keep_open.py`: WO numbers are now a
+fixed-length 10-character numeric string derived from the suffix, so no two can ever be a substring
+of one another. See the memory file `stage-c-solved-2026-09-01` (in this project's auto-memory) for
+the full write-up and process lessons.
 
-**Test-data note**: `WO-PO/99999m2`, `m4`, `m5`, `m6`, `m7`, `m8` are all synthetic test Service
-Orders left behind in Synergix (`copy.` environment only) from today's debugging -- safe to delete,
-not yet cleaned up. `m2` and `m4` in particular sit on colliding Schedule Board dates
-(`2026-03-24`/`2026-03-22` per their payloads, but see Bug 2 -- some may still show as booked on
-`31/08/2026` if they were scheduled before the datepicker fix landed) and should be deleted before
-any further Stage C testing to avoid a false SV9010 collision unrelated to the code under test.
+**Test-data cleanup debt**: ~20+ leftover synthetic test Service Orders remain in Synergix's `copy.`
+(non-production) environment from this session's testing (`WO-PO/99999m2` through `m23`, `live1`,
+`hoff1`, plus earlier `bb1`/`i1`/`i2`/`x1`/`cc1` from prior sessions) -- safe to delete, not yet
+cleaned up. Harmless now that the WO-numbering bug is fixed (no future test WO will share their
+prefix), but should be deleted eventually to declutter the Schedule Board calendar view.
 
 ## ⚠️ Cloudflare bot protection
 `taskhub.ls2.sg` sits behind **Cloudflare bot protection**. HEADLESS Chromium gets blocked
