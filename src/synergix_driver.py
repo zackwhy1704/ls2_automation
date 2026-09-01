@@ -2514,6 +2514,42 @@ class SynergixDriver:
             await self._screenshot(f"stage_c_no_employee_toggle_{wo.replace('/', '-')}")
             return False
 
+        # CRITICAL FIX (2026-09-01), found live with the user driving a handoff by hand: the
+        # calendar has TWO distinct view modes -- a weekly grid (date columns like "30 Sun Aug
+        # 2026", "31 Mon Aug 2026"...) and an hourly "Time Calendar" (columns 08:00-22:00 for a
+        # single day). The `[id*="newEventButton"]` clickable overlay this method searches for ONLY
+        # exists in the WEEKLY grid view -- clicking a blank cell in the weekly view opens Event
+        # Details correctly (confirmed live, user's own screenshot); the hourly Time Calendar view
+        # has no such overlay at all, which is the real reason multiple live runs today found "no
+        # newEventButton" even on a correctly-dated, genuinely-open calendar (WO-PO/910001912) --
+        # Synergix was rendering the hourly view, not a rendering lag or a missing element. This
+        # also retroactively explains why the "Week of" date field search kept failing: the hourly
+        # view's date field has a different structure than the weekly view's. Explicitly click
+        # "Switch to Time Calendar"'s own counterpart if that link is showing "Switch to Time
+        # Calendar" (meaning we're currently on the weekly view already, nothing to do) vs. showing
+        # something like "Switch to Week View" (meaning we're on the hourly view and need to switch
+        # back) -- checked by the link's OWN current text, not assumed.
+        switch_link_text = await page.evaluate(
+            """() => {
+                const link = [...document.querySelectorAll('a, span, div')]
+                    .find(el => el.children.length === 0 &&
+                                (el.textContent || '').trim().startsWith('Switch to'));
+                return link ? link.textContent.trim() : null;
+            }"""
+        )
+        if switch_link_text and "time calendar" not in switch_link_text.lower():
+            # Currently on the hourly Time Calendar view (the link offers to switch AWAY from it,
+            # i.e. it reads something other than "Switch to Time Calendar") -- click it to get back
+            # to the weekly grid view where newEventButton actually exists.
+            logger.warning("Stage C: calendar is on the hourly Time Calendar view (%r) -- switching "
+                            "back to the weekly grid view where newEventButton actually exists",
+                            switch_link_text)
+            switch_link = page.get_by_text(switch_link_text, exact=True).locator("visible=true").first
+            if await switch_link.count():
+                await switch_link.click(timeout=5000)
+                await _wait_for_ajax_spinner("switch to weekly view")
+                await page.wait_for_timeout(3000)
+
         # CRITICAL FIX (2026-09-01), found live on WO-PO/910001894: the Schedule Calendar does NOT
         # automatically navigate to the WO's own job date just because the row is selected -- it
         # stays on whatever date it currently happens to be showing (today, by default). A failure
