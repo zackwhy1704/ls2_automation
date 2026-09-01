@@ -452,25 +452,52 @@ temporary `await asyncio.sleep(30)` right after `_click_when_clear(page.locator(
 button...))` and inspecting the live page in devtools during that window, rather than reasoning from
 an error log's partial DOM excerpt a fourth time.
 
+### Bug 6 (the real one) -- Submit was never actually "disabled"; the code's own pre-click gate was the bug
+
+After Bug 5's fix (30s poll) still failed live on `WO-PO/99999m9` AND `/99999m14` -- both showing a
+screenshot-proven, genuinely correct schedule (right team, pairing, date; a real green calendar
+block) while `submit_btn.is_enabled()` kept reading false no matter how long the poll ran, even after
+adding a whole extra `_wait_for_ajax_spinner` call before the check -- the user stepped in directly
+and re-grounded this in the video: re-walking the exact literal sequence at 6:00-8:00 (filter WO ->
+wait -> click row, see green tick -> wait -> toggle Employee -> wait -> set calendar date -> **press
+Submit** -> wait 5s -> done) shows a human never checks whether Submit reads "enabled" before clicking
+it at all. The user's own words: **"you have successfully submitted stage C multiple times but didn't
+know and kept going on in circles."**
+
+This reframes bugs 5 (and possibly some of the earlier "failed" runs before it) entirely: every one of
+those `is_enabled()`-gated "failures" was very likely a genuinely successful Stage C schedule that the
+code's own defensive pre-check refused to act on. **Fixed** (commit `c70ef8d`): removed the
+`is_enabled()` poll/gate entirely. The method now just clicks `submit_btn` directly via the existing
+overlay-safe `_click_when_clear` helper, exactly like a human does, and only treats it as a real
+failure if the click itself throws.
+
+The user also confirmed the correct final success signal directly from the video at 7:53: the
+**"Upcoming Service" panel** (top-right tab, next to Customer Info) populates with a real entry (e.g.
+"16/07/2026, SV00008851, Jalan Besar Town Council...") the moment Submit genuinely lands -- this
+exactly matches the verification logic already present at the end of `_schedule_stage_c_attempt`
+(checking `page.locator("text=Upcoming Service")` then confirming the order number appears in it), so
+no change was needed there -- it was already right, per this same video, from the original `fcbe03a`
+rewrite.
+
 ### Overall status as of this write-up
 
-**A genuine, clean, fully-automated Stage A-D `PROCESSED` result has still NOT been achieved.**
-Summary of the day's five bugs:
+**A genuine, clean, fully-automated Stage A-D `PROCESSED` result has still NOT been achieved**, but
+the likely real remaining blocker (bugs 5/6's `is_enabled()` gate) is now believed fixed and simply
+needs a fresh end-to-end run to confirm. Summary of the day's six bugs:
 
 | # | Bug | Status |
 |---|-----|--------|
 | 1 | Wrong grid-checkbox re-selection blocking Stage C Submit | **Fixed, verified live** (`7708c86`) |
 | 2 | Datepicker `.fill()` not registering with Synergix | Fixed, not yet independently re-verified |
 | 3 | Event Details Confirm click needed overlay-safe wait | Fixed, not yet independently re-verified |
-| 4 | External Remarks popup not reliably closing on no-match | **NOT fixed** -- two attempts both wrong, real cause still unknown, likely a race |
-| 5 | Stage C Submit-enable poll too short, caused harmful retry | Fixed (widened 5s->30s), not yet independently re-verified |
+| 4 | External Remarks popup not reliably closing on no-match | Fixed (real root cause: `[id$=...]` ends-with selector never matched; also widened timeout 6s->20s) -- verified Stage B now recovers past it without crashing (`WO-PO/99999m14`, `m16`) |
+| 5 | Stage C Submit-enable poll too short, caused harmful retry | **SUPERSEDED by bug 6** -- the poll itself was the wrong approach, not just too short |
+| 6 | Submit click was gated behind a broken `is_enabled()` check that never reflected real state | **Fixed** (`c70ef8d`), per direct user correction from the video -- a human never checks this at all, just clicks Submit. Not yet re-verified live -- next step |
 
-Bugs 1, 2, 3, and 5 all look individually sound based on the evidence gathered for each (especially
-Bug 5, backed by a screenshot proving the underlying scheduling logic genuinely works end-to-end).
-Bug 4 remains the actual open blocker to a clean automated run purely because it happens early
-(Stage B) and, when it hits, prevents ever reaching Stage C to test bugs 1/2/3/5 together in the same
-run. **Next step: get a real DOM dump of the Remarks popup's actual container while it's visibly
-stuck, then fix Bug 4 correctly on the first attempt from real data, then re-run end-to-end.**
+Bug 4 is now confirmed fixed (two consecutive runs, `m14` and `m16`, both recovered from the "no
+External Remarks match" warning without crashing). Bug 6 is the most likely explanation for EVERY
+Stage C "failure" seen today after bug 1 was fixed -- a fresh end-to-end run is the immediate next
+step to confirm a genuine `PROCESSED` result.
 
 **Test-data note**: `WO-PO/99999m2`, `m4`, `m5`, `m6`, `m7`, `m8` are all synthetic test Service
 Orders left behind in Synergix (`copy.` environment only) from today's debugging -- safe to delete,
