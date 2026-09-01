@@ -2292,6 +2292,49 @@ class SynergixDriver:
                     except Exception:
                         pass
 
+        async def _submit_and_recover(submit_btn) -> str:
+            # Confirmed live (2026-09-01) by the user driving this by hand at the exact stuck point
+            # this method's own automation had hit: the "no newEventButton found" symptom was NOT a
+            # real bug -- it was Synergix's own Employee checklist/calendar rendering being
+            # intermittently slow ("an intermittent UI fault on their end"), which eventually
+            # resolved on its own after a re-click, exactly the "click too fast, page hadn't loaded"
+            # pattern already documented elsewhere in this file. Separately, the user found clicking
+            # Submit too early (before the schedule had genuinely attached in that view) surfaces a
+            # real, informative Synergix error: "SV9317: Service order: SV0000XXXX requires schedules
+            # to be set" -- a toast that appears top-right, SOMETIMES PARTIALLY OFF-SCREEN, easy to
+            # miss in a screenshot. The correct recovery, demonstrated live: re-click the calendar
+            # (forces a re-render showing the schedule now correctly attached, visible as a light-
+            # green block), then retry Submit -- which then succeeds. Returns "ok", "sv9317_retried",
+            # or "failed".
+            await self._click_when_clear(submit_btn, timeout_ms=30000, overlay_wait_ms=30000)
+            await page.wait_for_timeout(1500)
+            yes_btn = page.get_by_role("button", name="Yes").locator("visible=true")
+            if await yes_btn.count():
+                await yes_btn.first.click(timeout=10000)
+            await page.wait_for_timeout(3000)
+            sv9317_shown = await page.locator("text=/SV9317/").locator("visible=true").count() > 0
+            if not sv9317_shown:
+                return "ok"
+            logger.warning("Stage C: SV9317 (schedule not yet set) after Submit for %s -- "
+                            "re-clicking the calendar to force a refresh, then retrying Submit", wo)
+            # Re-click the calendar area to force PrimeFaces to re-render with the now-attached
+            # schedule visible (confirmed live: this is what made the light-green block appear).
+            calendar_area = page.locator("text=Schedule Calendar").locator("visible=true").first
+            if await calendar_area.count():
+                await calendar_area.click(timeout=5000)
+            await page.wait_for_timeout(5000)
+            submit_btn_retry = page.locator('button:has(span.fa-vote-yea)').locator("visible=true").first
+            if not await submit_btn_retry.count():
+                return "failed"
+            await self._click_when_clear(submit_btn_retry, timeout_ms=30000, overlay_wait_ms=30000)
+            await page.wait_for_timeout(1500)
+            yes_btn_retry = page.get_by_role("button", name="Yes").locator("visible=true")
+            if await yes_btn_retry.count():
+                await yes_btn_retry.first.click(timeout=10000)
+            await page.wait_for_timeout(3000)
+            still_sv9317 = await page.locator("text=/SV9317/").locator("visible=true").count() > 0
+            return "failed" if still_sv9317 else "sv9317_retried"
+
         await _filter_orders_by_wo()
 
         # Confirmed live (2026-08-27) on WO-PO/000077662: the row genuinely existed (verified
@@ -2382,16 +2425,17 @@ class SynergixDriver:
                 logger.warning("Stage C: already-scheduled but no Submit button found for %s", wo)
                 return False
             try:
-                await self._click_when_clear(submit_btn, timeout_ms=30000, overlay_wait_ms=30000)
+                submit_outcome = await _submit_and_recover(submit_btn)
             except Exception as exc:
                 logger.exception("Stage C: Submit click failed on already-scheduled order for %s (%s)",
                                   wo, exc)
                 await self._screenshot(f"stage_c_submit_disabled_{wo.replace('/', '-')}")
                 return False
-            await page.wait_for_timeout(1500)
-            yes_btn = page.get_by_role("button", name="Yes").locator("visible=true")
-            if await yes_btn.count():
-                await yes_btn.first.click(timeout=10000)
+            if submit_outcome == "failed":
+                logger.warning("Stage C: Submit still failing (SV9317 or no button) after retry for "
+                                "%s (already-scheduled path)", wo)
+                await self._screenshot(f"stage_c_submit_disabled_{wo.replace('/', '-')}")
+                return False
             await page.wait_for_timeout(20000)
             upcoming = await page.locator("text=Upcoming Service").locator("visible=true").count()
             confirmed = (upcoming
@@ -2755,7 +2799,7 @@ class SynergixDriver:
         # generous budget already given to every other slow step here, instead of either a manual
         # poll-and-bail (step 1's bug) or no wait at all (step 2's bug).
         try:
-            await self._click_when_clear(submit_btn, timeout_ms=30000, overlay_wait_ms=30000)
+            submit_outcome = await _submit_and_recover(submit_btn)
         except Exception as exc:
             # logger.exception (not .warning) so the actual Playwright error/call-log is captured --
             # confirmed live (2026-09-01) on WO-PO/99999m18 that even a 30s click timeout budget can
@@ -2765,15 +2809,15 @@ class SynergixDriver:
             logger.exception("Stage C: Submit click failed outright for %s (%s)", wo, exc)
             await self._screenshot(f"stage_c_submit_disabled_{wo.replace('/', '-')}")
             return False
+        if submit_outcome == "failed":
+            logger.warning("Stage C: Submit still failing (SV9317 or no button) after retry for %s",
+                            wo)
+            await self._screenshot(f"stage_c_submit_disabled_{wo.replace('/', '-')}")
+            return False
         # Confirmed in the video (frame at 7:27.93): this Submit click raises its own separate
         # "Confirmation -- Are you sure?" Yes/No dialog -- distinct from Event Details' own Confirm
-        # popup earlier in this method. The existing Yes-click below already anticipated this
-        # correctly; it just never used to get reached because the grid-checkbox re-selection this
-        # replaced was blocking every attempt before Submit was ever clicked.
-        await page.wait_for_timeout(1500)
-        yes_btn = page.get_by_role("button", name="Yes").locator("visible=true")
-        if await yes_btn.count():
-            await yes_btn.first.click(timeout=10000)
+        # popup earlier in this method. _submit_and_recover already handles this Yes-click (and, if
+        # needed, the SV9317-recovery retry with its own Yes-click) internally.
         # Widened 5s -> 20s (2026-09-01), per the user's explicit instruction: "press submit, yes,
         # wait 10-20s. observe data being logged as per video then move on to stage D." Using the top
         # of that range since Synergix's own ajax here has been measured taking up to ~18-30s
