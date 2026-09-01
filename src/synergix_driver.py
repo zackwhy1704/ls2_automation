@@ -2579,29 +2579,29 @@ class SynergixDriver:
         if not await submit_btn.count():
             logger.warning("Stage C: no Submit button found on Order Details for %s", wo)
             return False
-        # Poll for it to read enabled. Widened from 5s to 30s (2026-09-01) after WO-PO/99999m9:
-        # confirmed live via screenshot that a 5s-timeout "failure" here was a FALSE NEGATIVE -- the
-        # schedule had genuinely committed server-side (calendar showed the real, correctly-dated
-        # green event block; Order Details' own "Schedule" section showed "INFIGO / 800SUPER /
-        # 18/03/2026 - 18/03/2026") -- Submit just hadn't caught up to enabled within 5s on a slow
-        # response (the SAME "Event Details confirm" ajax call already documented above as taking up
-        # to ~18-30s). Because this false failure triggered a hard-reset retry, attempt 2 then
-        # re-opened a SECOND Event Details dialog on the now-already-scheduled event and got stuck
-        # (no SV9104 text this time, so the existing self-collision guard didn't catch it either) --
-        # the retry made things WORSE, not better. Giving Submit's own poll the same generous budget
-        # as the Confirm ajax it depends on should let genuinely-slow-but-successful runs finish on
-        # attempt 1 instead of forcing a needless, harmful retry.
-        enabled = False
-        for _ in range(60):  # ~30s
-            if await submit_btn.is_enabled():
-                enabled = True
-                break
-            await page.wait_for_timeout(500)
-        if not enabled:
-            logger.warning("Stage C: Submit button never enabled for %s", wo)
+        # CORRECTED (2026-09-01): every previous version of this step GATED the click on
+        # submit_btn.is_enabled() first, and gave up (returning False, triggering a hard-reset retry)
+        # if it never read enabled -- widening that poll from 5s to 30s (this comment's own prior
+        # version) did not fix repeated live failures (WO-PO/99999m9, m14) where a screenshot proved
+        # the schedule had ALREADY committed correctly (right team, pairing, date -- calendar showing
+        # a real green event block) while the enabled-check kept failing regardless of how long it
+        # waited. The user corrected this directly, from the SAME video already used for this whole
+        # method's design (JBTC WO Synergix.mp4, 6:00-8:00): "once managed to click calendar to
+        # correct date, press submit... you have successfully submitted stage C multiple times but
+        # didn't know and kept going in circles" -- i.e. checking is_enabled() before clicking was
+        # never something the real flow does at all; a human just clicks Submit once the date is set,
+        # full stop, with no enabled-check gating it. The disabled HTML attribute this code kept
+        # finding was very likely either a stale read of the WRONG button (a second, hidden Submit
+        # element elsewhere on the page also matching this selector) or simply not the actual gate on
+        # whether the click succeeds -- Playwright's own .click() already fails loudly if a click
+        # truly can't land, so there is no need for a separate, brittle pre-check that has now been
+        # proven to produce false negatives on genuinely-successful schedules.
+        try:
+            await self._click_when_clear(submit_btn, timeout_ms=10000, overlay_wait_ms=30000)
+        except Exception:
+            logger.warning("Stage C: Submit click failed outright for %s", wo)
             await self._screenshot(f"stage_c_submit_disabled_{wo.replace('/', '-')}")
             return False
-        await self._click_when_clear(submit_btn, timeout_ms=10000, overlay_wait_ms=30000)
         # Confirmed in the video (frame at 7:27.93): this Submit click raises its own separate
         # "Confirmation -- Are you sure?" Yes/No dialog -- distinct from Event Details' own Confirm
         # popup earlier in this method. The existing Yes-click below already anticipated this
