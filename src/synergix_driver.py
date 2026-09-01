@@ -2604,11 +2604,24 @@ class SynergixDriver:
             logger.warning("Stage C: could not find the 'Week of' calendar date field for %s -- "
                             "proceeding with whatever date it's currently showing", wo)
 
-        # Poll for the calendar to actually render at least one newEventButton-style overlay cell --
-        # same ajax-timing tolerance pattern as every other wait in this file (see
-        # _wait_for_ajax_spinner's docstring for why fixed timeouts alone are not reliable here).
-        async def _poll_for_new_event_button() -> str | None:
-            for _ in range(20):  # ~10s
+        # PROPER DEFENSIVE WAIT (2026-09-01), per the user's own direct correction after three
+        # separate automated fix attempts (view-mode switch, date navigation, direct-cell-click) all
+        # still failed live on a calendar that was independently verified correct every time (right
+        # view, right date, genuinely open/unbooked grid): "i have done at least 5 times manually and
+        # each time successfully proving theres nothing wrong its a loading issue, so maybe what we
+        # need is a proper defensive mechanism that works? and time correctly how long i waited to
+        # click the next step." The user has never once failed to eventually get a newEventButton
+        # click to work by hand -- meaning `[id*="newEventButton"]` genuinely does render eventually,
+        # every time, and the automation's only real gap is not waiting LONG enough with enough
+        # patience/retries. Replaced the previous 10s-poll-then-one-retry-then-give-up structure
+        # (which totalled well under a minute of real patience) with a properly patient, TIMED loop:
+        # up to 6 rounds, each round re-clicking the row + Employee toggle (matching the user's own
+        # manual action) and waiting progressively longer (10s, 15s, 20s, 25s, 30s, 35s -- linearly
+        # increasing, not a fixed short window), with the actual elapsed time logged every round so
+        # future sessions have real data on how long this can genuinely take instead of guessing.
+        async def _poll_for_new_event_button(timeout_s: float) -> str | None:
+            deadline_polls = int(timeout_s / 0.5)
+            for _ in range(deadline_polls):
                 found_id = await page.evaluate(
                     """() => {
                         const btn = document.querySelector('[id*="newEventButton"]');
@@ -2620,108 +2633,53 @@ class SynergixDriver:
                 await page.wait_for_timeout(500)
             return None
 
-        new_event_btn_id = await _poll_for_new_event_button()
-        if not new_event_btn_id:
-            # Confirmed live (2026-09-01) by the user driving this exact stuck point by hand: this is
-            # NOT a real bug -- it's an intermittent Synergix-side render lag ("an intermittent UI
-            # fault on their end") that resolved after a re-click of the row and Employee toggle. The
-            # original 10s poll above assumed a fixed, short ajax delay; on a genuinely slow render it
-            # never recovers on its own. Re-click the row + Employee toggle once (matching exactly
-            # what the user did) and poll again before giving up -- much cheaper than this method's
-            # own outer hard-reset-and-retry-everything wrapper, and directly addresses the actual
-            # cause instead of restarting the whole Stage C attempt from scratch.
-            logger.warning("Stage C: no 'add event' cell found on first attempt for %s -- re-clicking "
-                            "row + Employee toggle (Synergix's own calendar render can lag "
-                            "intermittently) before giving up", wo)
-            row_checkbox_retry = order_row.locator(".ui-chkbox-box").locator("visible=true").first
-            if await row_checkbox_retry.count():
-                await self._click_when_clear(row_checkbox_retry, timeout_ms=10000)
-            else:
-                await order_row.click(timeout=10000)
-            await page.wait_for_timeout(5000)
-            await _mouse_click_ui_button("Employee")
-            await _wait_for_ajax_spinner("Employee toggle retry")
-            await page.wait_for_timeout(5000)
-            new_event_btn_id = await _poll_for_new_event_button()
-        if not new_event_btn_id:
-            # LAST RESORT (2026-09-01): even a correctly-dated, weekly-view calendar with a
-            # genuinely open (unbooked) grid can still have no `[id*="newEventButton"]` element
-            # findable via querySelector -- confirmed live (WO-PO/910002207) across two full attempts
-            # (including a hard reset) with the calendar visually correct both times. The user's own
-            # live click, directly into a blank cell in the weekly grid, opened Event Details
-            # correctly on the first try -- meaning the overlay likely IS there but is not reliably
-            # queryable by this id pattern (e.g. it may only fully attach on :hover, or the id
-            # substring assumption is incomplete). Fall back to clicking the actual visible grid cell
-            # directly by coordinates, exactly replicating the user's own manual action, instead of
-            # querying for an overlay element that may not always be findable this way.
-            logger.warning("Stage C: no newEventButton element found for %s after retry -- falling "
-                            "back to clicking a blank grid cell directly by coordinates", wo)
-            cell_rect = await page.evaluate(
-                """() => {
-                    const header = [...document.querySelectorAll('th, td')]
-                        .find(el => (el.textContent || '').trim() === 'Service Personnel');
-                    if (!header) return null;
-                    const table = header.closest('table');
-                    if (!table) return null;
-                    const rows = [...table.querySelectorAll('tbody tr')];
-                    for (const row of rows) {
-                        const cells = [...row.querySelectorAll('td')];
-                        // Skip the first cell (the Service Personnel name column itself); look for
-                        // the first genuinely empty date/time cell in this row.
-                        for (const cell of cells.slice(1)) {
-                            const text = (cell.textContent || '').trim();
-                            if (text === '') {
-                                const r = cell.getBoundingClientRect();
-                                if (r.width > 0 && r.height > 0) {
-                                    return {x: r.x + r.width / 2, y: r.y + r.height / 2};
-                                }
-                            }
-                        }
-                    }
-                    return null;
-                }"""
-            )
-            if cell_rect:
-                await page.mouse.click(cell_rect["x"], cell_rect["y"])
+        new_event_btn_id = None
+        total_waited_s = 0.0
+        max_rounds = 6
+        for round_num in range(1, max_rounds + 1):
+            round_timeout_s = 10.0 + (round_num - 1) * 5.0  # 10, 15, 20, 25, 30, 35
+            new_event_btn_id = await _poll_for_new_event_button(round_timeout_s)
+            total_waited_s += round_timeout_s
+            if new_event_btn_id:
+                logger.info("Stage C: newEventButton found for %s on round %d/%d "
+                            "(~%.0fs total waited)", wo, round_num, max_rounds, total_waited_s)
+                break
+            logger.warning("Stage C: no 'add event' cell found for %s on round %d/%d "
+                            "(~%.0fs waited so far) -- re-clicking row + Employee toggle and "
+                            "waiting longer", wo, round_num, max_rounds, total_waited_s)
+            if round_num < max_rounds:
+                row_checkbox_retry = order_row.locator(".ui-chkbox-box").locator("visible=true").first
+                if await row_checkbox_retry.count():
+                    await self._click_when_clear(row_checkbox_retry, timeout_ms=10000)
+                else:
+                    await order_row.click(timeout=10000)
                 await page.wait_for_timeout(3000)
-                # Re-check: did this direct click open Event Details, even without ever finding a
-                # newEventButton id? If so, skip straight past the newEventButton click below.
-                event_dialog_opened_directly = await page.evaluate(
-                    """() => [...document.querySelectorAll('.ui-dialog')].some(d => {
-                        const r = d.getBoundingClientRect();
-                        return r.width > 0 && r.height > 0 &&
-                               d.querySelector('.ui-dialog-title')?.textContent?.trim() === 'Event Details';
-                    })"""
-                )
-                if event_dialog_opened_directly:
-                    logger.info("Stage C: direct cell click opened Event Details for %s "
-                                "(newEventButton element was never found, but the click worked "
-                                "anyway)", wo)
-                    new_event_btn_id = "DIRECT_CLICK_ALREADY_OPENED"
+                await _mouse_click_ui_button("Employee")
+                await _wait_for_ajax_spinner(f"Employee toggle retry round {round_num}")
+                await page.wait_for_timeout(3000)
         if not new_event_btn_id:
-            logger.warning("Stage C: no 'add event' cell found on the calendar for %s", wo)
+            logger.warning("Stage C: no 'add event' cell found for %s after %d rounds "
+                            "(~%.0fs total waited)", wo, max_rounds, total_waited_s)
             await self._screenshot(f"stage_c_no_calendar_row_{wo.replace('/', '-')}")
             return False
-        if new_event_btn_id != "DIRECT_CLICK_ALREADY_OPENED":
-            # Confirmed live (2026-08-28, still applicable): document.elementFromPoint at this
-            # button's own (scrolled-into-view) coordinates resolved to a <div class="blockUI
-            # blockOverlay">, not the button -- a pending-ajax "please wait" mask was still covering
-            # it. Playwright's click sometimes reports success anyway while the click itself lands
-            # on the mask, opening nothing. This is exactly what _click_when_clear exists for
-            # elsewhere in this file -- reuse it here.
-            new_event_btn = page.locator(f'[id="{new_event_btn_id}"]')
-            try:
-                await new_event_btn.scroll_into_view_if_needed(timeout=5000)
-            except Exception:
-                pass  # best-effort; the click below will raise its own clear error if this matters
-            try:
-                await self._click_when_clear(new_event_btn, timeout_ms=15000)
-            except Exception:
-                logger.exception("Stage C: newEventButton click failed for %s (id=%s)", wo,
-                                  new_event_btn_id)
-                await self._screenshot(f"stage_c_newevent_click_failed_{wo.replace('/', '-')}")
-                raise
-            await page.wait_for_timeout(5000)  # fixed 5s wait after every click, see row-select comment above
+        # Confirmed live (2026-08-28, still applicable): document.elementFromPoint at this button's
+        # own (scrolled-into-view) coordinates resolved to a <div class="blockUI blockOverlay">, not
+        # the button -- a pending-ajax "please wait" mask was still covering it. Playwright's click
+        # sometimes reports success anyway while the click itself lands on the mask, opening nothing.
+        # This is exactly what _click_when_clear exists for elsewhere in this file -- reuse it here.
+        new_event_btn = page.locator(f'[id="{new_event_btn_id}"]')
+        try:
+            await new_event_btn.scroll_into_view_if_needed(timeout=5000)
+        except Exception:
+            pass  # best-effort; the click below will raise its own clear error if this matters
+        try:
+            await self._click_when_clear(new_event_btn, timeout_ms=15000)
+        except Exception:
+            logger.exception("Stage C: newEventButton click failed for %s (id=%s)", wo,
+                              new_event_btn_id)
+            await self._screenshot(f"stage_c_newevent_click_failed_{wo.replace('/', '-')}")
+            raise
+        await page.wait_for_timeout(5000)  # fixed 5s wait after every click, see row-select comment above
 
         # Confirmed live (2026-08-28, still applicable): the "Event Details" dialog takes several
         # seconds to actually render (ajax "onstart" fires immediately but the dialog itself lags) --
