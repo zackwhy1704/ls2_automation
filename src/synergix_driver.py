@@ -2604,6 +2604,96 @@ class SynergixDriver:
             logger.warning("Stage C: could not find the 'Week of' calendar date field for %s -- "
                             "proceeding with whatever date it's currently showing", wo)
 
+        # ATTEMPTED FIX (2026-09-01) for the open blocker documented above: live reproduction
+        # (screenshot stage_c_no_calendar_row_WO-PO-910006534.png) showed the calendar genuinely
+        # correct -- weekly view, right date range, "Employee" active -- with ASSIGNED_WORK_TEAM's
+        # own row ("800SUPER") visible in the "Service Personnel" column, yet every cell in that row
+        # was blank across all 7 days, and no OTHER resource row rendered at all. The Employee/Work
+        # Team toggle switches VIEW MODE only; it does not make any specific resource's row become
+        # interactive. A separate "Filter" control opens an "Employee Job Type" checklist (same
+        # underlying PrimeFaces ui-chkbox pattern as the "To Pair With" checklist below -- a hidden
+        # <input type=checkbox> in a ui-helper-hidden-accessible div, with the sibling .ui-chkbox-box
+        # div as the real clickable target) that governs which resource's row actually gets its
+        # clickable cells. ASSUMPTION, not yet confirmed against the client's video: ticking
+        # ASSIGNED_WORK_TEAM there is what makes its own row's newEventButton overlays exist.
+        async def _click_filter_link() -> bool:
+            for _ in range(3):
+                rect = await page.evaluate(
+                    """() => {
+                        const span = [...document.querySelectorAll('span.ui-button-text')]
+                          .find(el => el.textContent.trim() === 'Filter' && el.offsetParent !== null);
+                        const target = span && span.closest('a, button, div.ui-button');
+                        if (!target) return null;
+                        const r = target.getBoundingClientRect();
+                        return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+                    }"""
+                )
+                if rect:
+                    await page.mouse.click(rect["x"], rect["y"])
+                    return True
+                await page.wait_for_timeout(500)
+            return False
+
+        async def _find_team_checkbox() -> tuple[str | None, bool]:
+            """(checkbox id, already checked) for ASSIGNED_WORK_TEAM -- queryable via plain
+            querySelectorAll regardless of whether the Filter panel is currently visually open."""
+            result = await page.evaluate(
+                """(label) => {
+                    const input = [...document.querySelectorAll('input[type=checkbox]')]
+                      .find(i => (i.value || '').includes(`oa_code=${label}`));
+                    return input ? {id: input.id, checked: input.checked} : null;
+                }""",
+                ASSIGNED_WORK_TEAM,
+            )
+            if not result:
+                return None, False
+            return result["id"], result["checked"]
+
+        async def _tick_assigned_team_in_filter() -> None:
+            # Confirmed live (2026-09-01): "Filter" is a TOGGLE, not a one-way "open" action --
+            # this method is called again on every retry round (row + Employee toggle also
+            # re-clicked each round), and blindly re-clicking Filter on a round where the checkbox
+            # was ALREADY ticked by an earlier round closed the panel instead of opening it,
+            # producing a genuinely confusing "Locator.click: element is not visible" failure on an
+            # element whose own class already read ui-state-active (i.e. already checked). Check
+            # the checked state FIRST -- it's queryable via plain DOM regardless of panel
+            # visibility -- and skip touching Filter at all once it's already ticked.
+            existing_id, already_checked = await _find_team_checkbox()
+            if already_checked:
+                return
+            if not await _click_filter_link():
+                logger.warning("Stage C: could not open the Filter panel for %s", wo)
+                return
+            await _wait_for_ajax_spinner("Filter panel open")
+            await page.wait_for_timeout(2000)
+            team_checkbox_id, already_checked = await _find_team_checkbox()
+            if already_checked:
+                return
+            if not team_checkbox_id:
+                logger.warning("Stage C: %r not found in the Employee Job Type filter checklist "
+                                "for %s", ASSIGNED_WORK_TEAM, wo)
+                return
+            team_checkbox_box = page.locator(f'input[id="{team_checkbox_id}"]').locator(
+                "xpath=ancestor::div[contains(@class,'ui-chkbox')][1]//div[contains(@class,'ui-chkbox-box')]"
+            )
+            try:
+                await team_checkbox_box.scroll_into_view_if_needed(timeout=5000)
+            except Exception:
+                pass  # best-effort; the click below raises its own clear error if this matters
+            try:
+                # Widened 10000 -> 20000 (2026-09-01): the first live attempt of this fix found the
+                # checkbox (its id resolved fine) but timed out clicking it within 10s -- the same
+                # blockUI-overlay class of delay _click_when_clear exists for elsewhere in this
+                # method, just needing a longer budget for this specific panel.
+                await self._click_when_clear(team_checkbox_box, timeout_ms=20000, overlay_wait_ms=15000)
+                await _wait_for_ajax_spinner(f"tick {ASSIGNED_WORK_TEAM} in Employee Job Type filter")
+                await page.wait_for_timeout(3000)
+            except Exception as exc:
+                logger.warning("Stage C: could not tick %r in the Employee Job Type filter for %s "
+                                "(%s)", ASSIGNED_WORK_TEAM, wo, exc)
+
+        await _tick_assigned_team_in_filter()
+
         # PROPER DEFENSIVE WAIT (2026-09-01), per the user's own direct correction after three
         # separate automated fix attempts (view-mode switch, date navigation, direct-cell-click) all
         # still failed live on a calendar that was independently verified correct every time (right
@@ -2657,6 +2747,7 @@ class SynergixDriver:
                 await _mouse_click_ui_button("Employee")
                 await _wait_for_ajax_spinner(f"Employee toggle retry round {round_num}")
                 await page.wait_for_timeout(3000)
+                await _tick_assigned_team_in_filter()
         if not new_event_btn_id:
             logger.warning("Stage C: no 'add event' cell found for %s after %d rounds "
                             "(~%.0fs total waited)", wo, max_rounds, total_waited_s)
