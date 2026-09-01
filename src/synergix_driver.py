@@ -2317,25 +2317,33 @@ class SynergixDriver:
         # framing: "you keep repeating on a logged (look at the green inputs in the calendars) means
         # you already have valid orders logged and saved all you have to do is submit when this
         # happens. thats why the same WO doesn't work repeatedly because theres a saved order
-        # unsubmitted." Check for this BEFORE touching the Employee toggle or Event Details at all --
-        # if the Order Details panel already shows a "Schedule" section (order_no's own calendar
-        # entry already committed), skip the entire assignment flow and go straight to finding and
-        # clicking Submit.
-        already_scheduled = await page.locator('text=Schedule').locator("visible=true").filter(
-            has=page.locator("xpath=following-sibling::*[contains(., '800SUPER') or "
-                              "contains(., 'INFIGO') or contains(., 'ECOCARE')]")
-        ).count() > 0
-        if not already_scheduled:
-            # Simpler, more robust fallback check: the Order Details panel's own "Schedule" heading
-            # exists AND is followed by a team name -- the above xpath is best-effort (PrimeFaces
-            # markup can vary), so also just check for the literal "Schedule" section text alongside
-            # a Work Team name anywhere currently visible on the page.
-            already_scheduled = (
-                await page.locator("text=Schedule").locator("visible=true").count() > 0
-                and (await page.locator("text=800SUPER").locator("visible=true").count() > 0
-                     or await page.locator("text=INFIGO").locator("visible=true").count() > 0
-                     or await page.locator("text=ECOCARE").locator("visible=true").count() > 0)
-            )
+        # unsubmitted."
+        #
+        # RETRACTED-AND-FIXED same day: the first version of this check searched for "Schedule" +
+        # a team name ANYWHERE visible on the page. The user caught this live, watching a run land
+        # on a genuinely NEW Service Order (SV00008932) but still trigger the skip-to-Submit path --
+        # because the Schedule Calendar shows a WHOLE WEEK of entries at once, and today's ~20+
+        # leftover synthetic test WOs (all in the 9999xxx range) cluttered nearby cells with their
+        # own real "800SUPER"/"INFIGO"/"ECOCARE" schedule text, which the old, unscoped check happily
+        # matched even though none of it belonged to the CURRENT order. Scoped correctly now: only
+        # the Order Details panel's OWN "Schedule" section, found via order_no (e.g. "SV00008932")
+        # as an anchor, counts -- not any text visible elsewhere on the page.
+        order_details_panel = page.locator(f'text=Order Details[{order_no}]').locator(
+            "visible=true"
+        ).first
+        already_scheduled = False
+        if await order_details_panel.count():
+            panel_container = order_details_panel.locator(
+                "xpath=ancestor::div[contains(@class,'ui-panel') or contains(@class,'ui-widget')][1]"
+            ).first
+            if await panel_container.count():
+                already_scheduled = await panel_container.locator("text=Schedule").locator(
+                    "visible=true"
+                ).count() > 0 and (
+                    await panel_container.locator("text=800SUPER").locator("visible=true").count() > 0
+                    or await panel_container.locator("text=INFIGO").locator("visible=true").count() > 0
+                    or await panel_container.locator("text=ECOCARE").locator("visible=true").count() > 0
+                )
         if already_scheduled:
             logger.info("Stage C: %s already shows a committed Schedule (green calendar entry from "
                         "a prior attempt) -- skipping straight to Submit, not re-running Confirm", wo)
