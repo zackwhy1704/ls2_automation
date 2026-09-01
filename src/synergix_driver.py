@@ -2579,25 +2579,33 @@ class SynergixDriver:
         if not await submit_btn.count():
             logger.warning("Stage C: no Submit button found on Order Details for %s", wo)
             return False
-        # CORRECTED (2026-09-01): every previous version of this step GATED the click on
-        # submit_btn.is_enabled() first, and gave up (returning False, triggering a hard-reset retry)
-        # if it never read enabled -- widening that poll from 5s to 30s (this comment's own prior
-        # version) did not fix repeated live failures (WO-PO/99999m9, m14) where a screenshot proved
-        # the schedule had ALREADY committed correctly (right team, pairing, date -- calendar showing
-        # a real green event block) while the enabled-check kept failing regardless of how long it
-        # waited. The user corrected this directly, from the SAME video already used for this whole
-        # method's design (JBTC WO Synergix.mp4, 6:00-8:00): "once managed to click calendar to
-        # correct date, press submit... you have successfully submitted stage C multiple times but
-        # didn't know and kept going in circles" -- i.e. checking is_enabled() before clicking was
-        # never something the real flow does at all; a human just clicks Submit once the date is set,
-        # full stop, with no enabled-check gating it. The disabled HTML attribute this code kept
-        # finding was very likely either a stale read of the WRONG button (a second, hidden Submit
-        # element elsewhere on the page also matching this selector) or simply not the actual gate on
-        # whether the click succeeds -- Playwright's own .click() already fails loudly if a click
-        # truly can't land, so there is no need for a separate, brittle pre-check that has now been
-        # proven to produce false negatives on genuinely-successful schedules.
+        # CORRECTED (2026-09-01), in two steps:
+        #
+        # Step 1: every earlier version of this method GATED the click behind a manual
+        # submit_btn.is_enabled() poll-then-give-up loop (5s, then widened to 30s), which kept
+        # failing live (WO-PO/99999m9, m14) even when a screenshot proved the schedule had ALREADY
+        # committed correctly (right team, pairing, date). The user corrected this directly from the
+        # video (JBTC WO Synergix.mp4, 6:00-8:00): a human never explicitly checks whether Submit
+        # reads "enabled" before clicking it -- they just click it once the date is set.
+        #
+        # Step 2 (this version): removing that manual check entirely and clicking immediately
+        # (previous commit, c70ef8d) ALSO failed live on WO-PO/99999m17 -- Playwright's own click
+        # genuinely refused, because the button's `disabled` HTML attribute was still truly present
+        # at that exact instant (confirmed via the same screenshot pattern as m9/m14: correct
+        # schedule, but this time the click itself threw rather than a manual check reading false).
+        # The real lesson from the user's correction was narrower than "never wait" -- it was "don't
+        # manually poll is_enabled() and BAIL if it's slow"; a human still implicitly waits (reading
+        # the screen, moving the mouse) long enough for the button to become clickable before their
+        # click lands. Playwright's own click() already does exactly this waiting AS PART OF its
+        # normal actionability checks (it will not click a genuinely disabled element and will retry
+        # until it becomes actionable or its own timeout_ms elapses) -- the ONLY problem was
+        # timeout_ms=10000 was too short for this specific button, the same slow-ajax-dependent
+        # class of wait already documented multiple times elsewhere in this method (up to ~18-30s).
+        # Widened to 30000ms so Playwright's own built-in wait-until-actionable has the same
+        # generous budget already given to every other slow step here, instead of either a manual
+        # poll-and-bail (step 1's bug) or no wait at all (step 2's bug).
         try:
-            await self._click_when_clear(submit_btn, timeout_ms=10000, overlay_wait_ms=30000)
+            await self._click_when_clear(submit_btn, timeout_ms=30000, overlay_wait_ms=30000)
         except Exception:
             logger.warning("Stage C: Submit click failed outright for %s", wo)
             await self._screenshot(f"stage_c_submit_disabled_{wo.replace('/', '-')}")
