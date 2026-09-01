@@ -1334,3 +1334,108 @@ failure each time), but the underlying Schedule Board widget's flakiness -- flag
 genuinely non-deterministic since session 6 -- has still not been fully defeated.
 
 115 passed, 22 skipped after every commit this session.
+
+## Stage C ground truth: literal frame-by-frame record, JBTC WO Synergix.mp4, 6:00-8:00 (2026-09-01)
+
+The user explicitly instructed that this exact video segment is the SOURCE OF TRUTH for Stage C, and
+that this session had been going in circles re-guessing steps instead of following it literally.
+Re-extracted every 0.5s across the full 6:00-8:00 window (241 frames), pixel-diffed to find every real
+transition, then extracted single-frame density around each transition to pin the exact moment. This
+section is the literal, verified record -- do not re-derive or second-guess these steps; if a future
+session's driver code disagrees with this record, the record is right and the code is wrong.
+
+**Recorded, in order, with timestamps:**
+
+1. **6:00-6:12 -- Navigate to Schedule Board and filter.** From the app's home menu (Servicing ->
+   General Service -> Enquiry Call & Order -> Schedule Board), the Schedule Board opens showing
+   "Unscheduled Service Orders" (a paginated grid) above "Schedule Calendar" (initially empty, no
+   filter applied). At **6:08.5**, the "Enquiry/Subject" column's filter input is clicked (cursor
+   blinking, empty). At **6:12.0**, the filter box shows the FULL WO number **WITH its `WO-PO/`
+   prefix** ("WO-PO/000080291", not just "000080291") and Enter has been pressed -- the grid narrows
+   to exactly one row: `SV00008851 | 16/07/2026 | QUO0006213 | JALAN BESAR TOWN COUNCIL`. This
+   confirms filtering WITH the prefix is correct and was never the bug some earlier sessions suspected.
+
+2. **6:40.0 -- Row ticked, Order Details opens.** The row's own checkbox (not the row body) is now
+   green-checked. The right-hand panel changes from "Customer Search" to **"Order Details[SV00008851]"**
+   with a **"Submit"** link (top-left of that panel's own header) and **"Abort"** (top-right), and a
+   yellow **"This Service Order has not been submitted"** warning banner already showing. At this
+   exact moment, the Employee/Work Team toggle (top-right of the Schedule Calendar section) already
+   shows **"Work Team" highlighted (blue)** -- Work Team, not Employee, is the DEFAULT state
+   immediately after row selection, before any toggle click.
+
+3. **6:43.0 -- Employee toggle clicked.** The toggle now shows **"Employee" highlighted (blue)**
+   instead of Work Team. The calendar grid itself is still showing the same empty week (12-18 Jul
+   2026) with no "Service Personnel" rows populated yet.
+
+4. **6:46.6 -- Calendar re-renders for Employee view.** The "Service Personnel" column header and the
+   date columns (12 Sun - 18 Sat, Jul 2026) are visible, but the grid body is still blank (no
+   personnel rows, no "This schedule is empty" text either -- just blank cells).
+
+5. **6:49.9 -- Click on a blank calendar cell.** Cursor lands in the blank grid area under the "14 Tue
+   Jul 2026" column (approximately). This is a click on an EMPTY cell in the calendar body, not on any
+   visible "new event" button or named row -- the calendar has no visible rows/resources listed at all
+   at this point, so the click target is just empty grid space under the target date's column.
+   Immediately after, the **Event Details** dialog opens.
+
+6. **6:50.0 -- Event Details dialog opens, pre-filled.** From/To both default to **15/07/2026**
+   (one day before the WO's Enquiry Date of 16/07/2026 seen earlier -- NOT the WO Date of 03-Jul-2026
+   from the original PDF; this default appears tied to the clicked calendar cell's date, not fixed).
+   **Assigned = "800SUPER"** already pre-filled (a Work Team, not a person). "To Pair With" checklist
+   shows 12 names/companies (CADILLAX, ECOCARE, GREENCARE, HERBERT LIM PIN HENG, INFIGO, NEWS, SUSAN
+   LEE SUN SUN, TAN WEI YING, TAN ZHEN YUAN BENEDICT, TOMMY TOH GIM POR, VINCENT TEO BOON WAH, VISHAL
+   ANAND SINGH) -- none checked yet, cursor hovering near CADILLAX.
+
+7. **~7:00-7:04 -- To Pair With: INFIGO ticked, dates corrected.** (From the earlier, separate
+   frame-by-frame pass documented above under "Stage C, frame-by-frame... corrects a multi-session
+   mistake".) INFIGO gets checked. The **To date is changed from its default `15/07/2026` down to
+   `03/07/2026`** -- matching the WO's own Date field from the original PDF (03-Jul-2026) exactly.
+   This confirms: the popup's own default date (tied to the clicked calendar cell) is NOT necessarily
+   correct and must be overwritten to match the WO's actual date.
+
+8. **~7:04-7:25 -- Confirm clicked, dialog closes.** The checkmark (Confirm) button at the dialog's
+   bottom-left is clicked. Between this and the next observed frame the dialog fully closes (exact
+   sub-second timing not resolved in this pass; a separate live-polling pass elsewhere in this doc
+   measured this specific ajax call taking up to ~18-30s on a slower live run -- the video itself may
+   have been recorded against a faster/cached session).
+
+9. **7:25.5 -- Left grid resets; ignore it.** The LEFT "Unscheduled Service Orders" grid has reset to
+   page 2 of an unfiltered, unrelated list (SV00007476-494, completely different customers) -- the
+   Enquiry/Subject filter box is blank again. **This is cosmetic noise and is never touched again for
+   the rest of the flow.** The RIGHT-hand Order Details[SV00008851] panel is unaffected and still shows
+   the correct order, still with the "not submitted" warning, Employee/Work Team toggle both grayed
+   out (no row currently grid-selected, but the panel itself persists).
+
+10. **7:45.0 -- Submit clicked.** Cursor hovers directly over the **"Submit"** link at the Order
+    Details panel's own header (NOT any button in the left grid, NOT any calendar element) -- confirmed
+    by the browser's own hover-link preview in the status bar reading
+    `https://copy.taskhub.ls2.sg/TH6/index.xhtml#`. The "not submitted" warning is still showing at
+    this exact frame (about to clear).
+
+11. **7:48.5 -- Submit succeeded; "Upcoming Service" updates.** The "not submitted" warning is GONE.
+    The **"Upcoming Service"** tab (top-right, next to "Customer Info" / "Service History") now shows
+    a real, populated entry: **"16/07/2026, SV00008851, Jalan Besar Town Council -- 4C ST. GEORGE'S
+    LANE... Job Sheet: A25-01086... WO-PO/000080291"**. **This is THE definitive, authoritative success
+    signal for Stage C being complete** -- confirmed directly by the user. No separate "Are you sure?"
+    Yes/No confirmation dialog was visibly captured between frames 7:45.0 and 7:48.5 in this specific
+    recording (it may have appeared and been dismissed within that single ~3.5s gap faster than this
+    pass's 0.5s sampling could catch, or Submit succeeded without one on this specific run -- a
+    separate frame at 7:27.93 from an earlier pass THIS SAME SESSION did capture a "Confirmation -- Are
+    you sure?" dialog appearing right after a Submit click, so treat that dialog as a real, expected
+    possibility even though this particular 6:00-8:00 pass didn't resolve its exact timing).
+
+**What this record corrects in the driver's own historical assumptions, explicitly:**
+- Work Team is the DEFAULT toggle state after row selection (item 2) -- Employee must be explicitly
+  clicked (item 3), confirming the existing toggle-click step is necessary and correctly ordered.
+- The Event Details popup's own default date is tied to the CLICKED CALENDAR CELL, not the WO date --
+  it must always be overwritten to the WO's real date (item 7), never trusted as-is.
+- Submit is clicked directly from the Order Details panel's own header link -- never gated on any
+  `is_enabled()`/`disabled`-attribute check, never preceded by re-selecting anything in the left grid
+  (items 9-10). A human's own natural pause between actions (reading the screen, moving the mouse) is
+  what gives the server enough time to actually enable the button before the click lands -- there is no
+  explicit "wait for enabled" step in the real flow, but there IS real elapsed time between Confirm
+  closing and Submit being clicked (at least ~20 seconds elapsed between frame 7:25.5 and 7:45.0 in
+  this recording).
+- "Upcoming Service" populating with the correct order number is the ONLY verification that matters
+  (item 11) -- not the disappearance of the "not submitted" banner alone (which the earlier, separate
+  frame-by-frame pass already correctly noted disappears one step earlier, at the Event Details
+  popup's own Confirm, and is therefore not sufficient on its own).
