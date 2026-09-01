@@ -2644,26 +2644,84 @@ class SynergixDriver:
             await page.wait_for_timeout(5000)
             new_event_btn_id = await _poll_for_new_event_button()
         if not new_event_btn_id:
+            # LAST RESORT (2026-09-01): even a correctly-dated, weekly-view calendar with a
+            # genuinely open (unbooked) grid can still have no `[id*="newEventButton"]` element
+            # findable via querySelector -- confirmed live (WO-PO/910002207) across two full attempts
+            # (including a hard reset) with the calendar visually correct both times. The user's own
+            # live click, directly into a blank cell in the weekly grid, opened Event Details
+            # correctly on the first try -- meaning the overlay likely IS there but is not reliably
+            # queryable by this id pattern (e.g. it may only fully attach on :hover, or the id
+            # substring assumption is incomplete). Fall back to clicking the actual visible grid cell
+            # directly by coordinates, exactly replicating the user's own manual action, instead of
+            # querying for an overlay element that may not always be findable this way.
+            logger.warning("Stage C: no newEventButton element found for %s after retry -- falling "
+                            "back to clicking a blank grid cell directly by coordinates", wo)
+            cell_rect = await page.evaluate(
+                """() => {
+                    const header = [...document.querySelectorAll('th, td')]
+                        .find(el => (el.textContent || '').trim() === 'Service Personnel');
+                    if (!header) return null;
+                    const table = header.closest('table');
+                    if (!table) return null;
+                    const rows = [...table.querySelectorAll('tbody tr')];
+                    for (const row of rows) {
+                        const cells = [...row.querySelectorAll('td')];
+                        // Skip the first cell (the Service Personnel name column itself); look for
+                        // the first genuinely empty date/time cell in this row.
+                        for (const cell of cells.slice(1)) {
+                            const text = (cell.textContent || '').trim();
+                            if (text === '') {
+                                const r = cell.getBoundingClientRect();
+                                if (r.width > 0 && r.height > 0) {
+                                    return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+                                }
+                            }
+                        }
+                    }
+                    return null;
+                }"""
+            )
+            if cell_rect:
+                await page.mouse.click(cell_rect["x"], cell_rect["y"])
+                await page.wait_for_timeout(3000)
+                # Re-check: did this direct click open Event Details, even without ever finding a
+                # newEventButton id? If so, skip straight past the newEventButton click below.
+                event_dialog_opened_directly = await page.evaluate(
+                    """() => [...document.querySelectorAll('.ui-dialog')].some(d => {
+                        const r = d.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0 &&
+                               d.querySelector('.ui-dialog-title')?.textContent?.trim() === 'Event Details';
+                    })"""
+                )
+                if event_dialog_opened_directly:
+                    logger.info("Stage C: direct cell click opened Event Details for %s "
+                                "(newEventButton element was never found, but the click worked "
+                                "anyway)", wo)
+                    new_event_btn_id = "DIRECT_CLICK_ALREADY_OPENED"
+        if not new_event_btn_id:
             logger.warning("Stage C: no 'add event' cell found on the calendar for %s", wo)
             await self._screenshot(f"stage_c_no_calendar_row_{wo.replace('/', '-')}")
             return False
-        # Confirmed live (2026-08-28, still applicable): document.elementFromPoint at this button's
-        # own (scrolled-into-view) coordinates resolved to a <div class="blockUI blockOverlay">, not
-        # the button -- a pending-ajax "please wait" mask was still covering it. Playwright's click
-        # sometimes reports success anyway while the click itself lands on the mask, opening nothing.
-        # This is exactly what _click_when_clear exists for elsewhere in this file -- reuse it here.
-        new_event_btn = page.locator(f'[id="{new_event_btn_id}"]')
-        try:
-            await new_event_btn.scroll_into_view_if_needed(timeout=5000)
-        except Exception:
-            pass  # best-effort; the click below will raise its own clear error if this matters
-        try:
-            await self._click_when_clear(new_event_btn, timeout_ms=15000)
-        except Exception:
-            logger.exception("Stage C: newEventButton click failed for %s (id=%s)", wo, new_event_btn_id)
-            await self._screenshot(f"stage_c_newevent_click_failed_{wo.replace('/', '-')}")
-            raise
-        await page.wait_for_timeout(5000)  # fixed 5s wait after every click, see row-select comment above
+        if new_event_btn_id != "DIRECT_CLICK_ALREADY_OPENED":
+            # Confirmed live (2026-08-28, still applicable): document.elementFromPoint at this
+            # button's own (scrolled-into-view) coordinates resolved to a <div class="blockUI
+            # blockOverlay">, not the button -- a pending-ajax "please wait" mask was still covering
+            # it. Playwright's click sometimes reports success anyway while the click itself lands
+            # on the mask, opening nothing. This is exactly what _click_when_clear exists for
+            # elsewhere in this file -- reuse it here.
+            new_event_btn = page.locator(f'[id="{new_event_btn_id}"]')
+            try:
+                await new_event_btn.scroll_into_view_if_needed(timeout=5000)
+            except Exception:
+                pass  # best-effort; the click below will raise its own clear error if this matters
+            try:
+                await self._click_when_clear(new_event_btn, timeout_ms=15000)
+            except Exception:
+                logger.exception("Stage C: newEventButton click failed for %s (id=%s)", wo,
+                                  new_event_btn_id)
+                await self._screenshot(f"stage_c_newevent_click_failed_{wo.replace('/', '-')}")
+                raise
+            await page.wait_for_timeout(5000)  # fixed 5s wait after every click, see row-select comment above
 
         # Confirmed live (2026-08-28, still applicable): the "Event Details" dialog takes several
         # seconds to actually render (ajax "onstart" fires immediately but the dialog itself lags) --
