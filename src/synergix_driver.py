@@ -2514,6 +2514,52 @@ class SynergixDriver:
             await self._screenshot(f"stage_c_no_employee_toggle_{wo.replace('/', '-')}")
             return False
 
+        # CRITICAL FIX (2026-09-01), found live on WO-PO/910001894: the Schedule Calendar does NOT
+        # automatically navigate to the WO's own job date just because the row is selected -- it
+        # stays on whatever date it currently happens to be showing (today, by default). A failure
+        # screenshot showed the calendar sitting on today's date (01/09/2026, NOT this WO's job date
+        # of 24/06/2021) with every single hourly cell under "800SUPER" reading "Taken by day tasks"
+        # -- genuinely, correctly unavailable on THAT date, not a rendering bug at all. The earlier
+        # "date collision" fix (widening the test-date range) does not help here since the collision
+        # was against TODAY's date, which every test run implicitly starts on regardless of its own
+        # job_date. Explicitly navigate the calendar's own "Week of" date field to the WO's job date
+        # before ever searching for a newEventButton.
+        job_date_calendar_str = payload.job_date.strftime("%d/%m/%Y")
+        week_of_input_id = await page.evaluate(
+            """() => {
+                const label = [...document.querySelectorAll('*')]
+                    .find(el => el.children.length === 0 && (el.textContent || '').trim() === 'Week of');
+                if (!label) return null;
+                const container = label.closest('div');
+                const input = container ? container.parentElement.querySelector('input[type="text"]')
+                    : null;
+                return input ? input.id : null;
+            }"""
+        )
+        week_of_input = (
+            page.locator(f'[id="{week_of_input_id}"]').locator("visible=true").first
+            if week_of_input_id else page.locator("__never_match__")
+        )
+        if await week_of_input.count():
+            try:
+                await week_of_input.click(timeout=5000)
+                await week_of_input.fill(job_date_calendar_str)
+                await week_of_input.press("Enter")
+                await week_of_input.evaluate(
+                    "(el) => el.dispatchEvent(new Event('change', {bubbles: true}))"
+                )
+                await _wait_for_ajax_spinner("calendar date navigation")
+                await page.wait_for_timeout(5000)
+                logger.info("Stage C: navigated calendar to job date %s for %s",
+                            job_date_calendar_str, wo)
+            except Exception:
+                logger.warning("Stage C: could not navigate calendar to job date %s for %s -- "
+                                "proceeding with whatever date it's currently showing",
+                                job_date_calendar_str, wo)
+        else:
+            logger.warning("Stage C: could not find the 'Week of' calendar date field for %s -- "
+                            "proceeding with whatever date it's currently showing", wo)
+
         # Poll for the calendar to actually render at least one newEventButton-style overlay cell --
         # same ajax-timing tolerance pattern as every other wait in this file (see
         # _wait_for_ajax_spinner's docstring for why fixed timeouts alone are not reliable here).
