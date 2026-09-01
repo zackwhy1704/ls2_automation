@@ -2517,17 +2517,42 @@ class SynergixDriver:
         # Poll for the calendar to actually render at least one newEventButton-style overlay cell --
         # same ajax-timing tolerance pattern as every other wait in this file (see
         # _wait_for_ajax_spinner's docstring for why fixed timeouts alone are not reliable here).
-        new_event_btn_id = None
-        for _ in range(20):  # ~10s
-            new_event_btn_id = await page.evaluate(
-                """() => {
-                    const btn = document.querySelector('[id*="newEventButton"]');
-                    return btn ? btn.id : null;
-                }"""
-            )
-            if new_event_btn_id:
-                break
-            await page.wait_for_timeout(500)
+        async def _poll_for_new_event_button() -> str | None:
+            for _ in range(20):  # ~10s
+                found_id = await page.evaluate(
+                    """() => {
+                        const btn = document.querySelector('[id*="newEventButton"]');
+                        return btn ? btn.id : null;
+                    }"""
+                )
+                if found_id:
+                    return found_id
+                await page.wait_for_timeout(500)
+            return None
+
+        new_event_btn_id = await _poll_for_new_event_button()
+        if not new_event_btn_id:
+            # Confirmed live (2026-09-01) by the user driving this exact stuck point by hand: this is
+            # NOT a real bug -- it's an intermittent Synergix-side render lag ("an intermittent UI
+            # fault on their end") that resolved after a re-click of the row and Employee toggle. The
+            # original 10s poll above assumed a fixed, short ajax delay; on a genuinely slow render it
+            # never recovers on its own. Re-click the row + Employee toggle once (matching exactly
+            # what the user did) and poll again before giving up -- much cheaper than this method's
+            # own outer hard-reset-and-retry-everything wrapper, and directly addresses the actual
+            # cause instead of restarting the whole Stage C attempt from scratch.
+            logger.warning("Stage C: no 'add event' cell found on first attempt for %s -- re-clicking "
+                            "row + Employee toggle (Synergix's own calendar render can lag "
+                            "intermittently) before giving up", wo)
+            row_checkbox_retry = order_row.locator(".ui-chkbox-box").locator("visible=true").first
+            if await row_checkbox_retry.count():
+                await self._click_when_clear(row_checkbox_retry, timeout_ms=10000)
+            else:
+                await order_row.click(timeout=10000)
+            await page.wait_for_timeout(5000)
+            await _mouse_click_ui_button("Employee")
+            await _wait_for_ajax_spinner("Employee toggle retry")
+            await page.wait_for_timeout(5000)
+            new_event_btn_id = await _poll_for_new_event_button()
         if not new_event_btn_id:
             logger.warning("Stage C: no 'add event' cell found on the calendar for %s", wo)
             await self._screenshot(f"stage_c_no_calendar_row_{wo.replace('/', '-')}")
