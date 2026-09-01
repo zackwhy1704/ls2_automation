@@ -2278,7 +2278,18 @@ class SynergixDriver:
             return False
         order_no_cell = order_row.locator("td").nth(1)
         order_no = (await order_no_cell.inner_text()).strip()
-        await order_row.click(timeout=10000)
+        # Click the row's own CHECKBOX specifically (2026-09-01), not the row body -- the user
+        # directly observed a live run and corrected this: "i manually click on the green tick to
+        # select the correct order." This method already uses the exact same .ui-chkbox-box pattern
+        # elsewhere (the To Pair With tick) for the same PrimeFaces checkbox structure -- a native
+        # <input type="checkbox"> wrapped in a hidden-accessible div, with the sibling .ui-chkbox-box
+        # div as the real clickable element. Falls back to clicking the row itself if no checkbox is
+        # found, so this doesn't regress on a page layout without one.
+        row_checkbox = order_row.locator(".ui-chkbox-box").locator("visible=true").first
+        if await row_checkbox.count():
+            await self._click_when_clear(row_checkbox, timeout_ms=10000)
+        else:
+            await order_row.click(timeout=10000)
         await _wait_for_ajax_spinner("row selection")
         # Fixed 5s wait after every click (2026-09-01), per the user's explicit, literal instruction
         # after re-grounding this whole method in JBTC WO Synergix.mp4 6:00-8:00: "every click you
