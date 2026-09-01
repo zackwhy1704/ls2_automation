@@ -2536,6 +2536,22 @@ class SynergixDriver:
                     await self._screenshot(f"stage_c_dialog_stuck_{wo.replace('/', '-')}")
                     return False
 
+        # Confirmed live (2026-09-01) on WO-PO/99999m9 and /99999m14: even after the Event Details
+        # dialog itself is confirmed hidden, the Order Details panel's own Submit button can still
+        # take a further, SEPARATE ajax round-trip to actually refresh into its enabled state --
+        # both runs' failure screenshots showed the Schedule section already correctly populated
+        # (right team, right pairing, right date) while Submit's own `disabled` HTML attribute was
+        # still literally present in the DOM (confirmed via a live discovery script's direct
+        # attribute dump, not just is_enabled()) -- meaning the panel had not yet re-rendered from
+        # its OWN trailing ajax call, a second, distinct cycle from the one already waited out above
+        # for the dialog's own close. The user's own framing of this exact class of bug: "if you see
+        # [stale data right after a popup opens], it means you clicked too fast and the UI hasn't
+        # loaded the correct API response yet" -- the same principle applies here to READING Submit's
+        # state, not just clicking. Give the page one more explicit ajax-spinner wait before ever
+        # checking Submit, instead of relying solely on the polling loop below to eventually catch a
+        # DOM update that may not have even been requested yet at the moment polling starts.
+        await _wait_for_ajax_spinner("Order Details panel refresh after Confirm", timeout_s=15)
+
         # CORRECTED (2026-08-31, frame-by-frame review of JBTC WO Synergix.mp4 at 7:00-7:52):
         # everything from here through Submit was WRONG in every prior version of this method. Every
         # earlier session (including the 2026-08-26/28/31 comments preserved in git blame for this
