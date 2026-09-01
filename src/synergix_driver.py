@@ -1051,24 +1051,37 @@ class SynergixDriver:
             await page.wait_for_timeout(step_ms)
             elapsed += step_ms
         if not found:
-            # Confirmed live across THREE separate attempts (2026-08-31/09-01, WO-PO/99999m5, m7,
-            # m8) that this popup does not close the way it looks like it should:
-            #  - Attempt 1: Escape alone -- didn't work, popup stayed open both times it was hit.
-            #  - Attempt 2: assumed a `.ui-dialog-mask` modal (like Event Details) and looked for a
-            #    titlebar close (X) icon -- also wrong. WO-PO/99999m8's own error log proved the
-            #    actual intercepting element is `<div id="searchPanel" class="ui-outputpanel
-            #    ui-widget">` itself, NOT a `.ui-dialog-mask` -- meaning this is a NON-modal
-            #    PrimeFaces overlay panel (the same family as an autocomplete/selectOneMenu dropdown
-            #    panel), which has no titlebar or close icon at all -- there was never a button for
-            #    that second attempt's close_btn.click() to find.
-            # A non-modal overlay panel like this is dismissed the standard PrimeFaces way: a click
-            # anywhere outside the panel. Click a neutral, always-present point (the page's own
-            # header bar) rather than guessing at another in-panel selector a third time.
+            # Confirmed live across FOUR attempts before this one got it right (2026-08-31/09-01,
+            # WO-PO/99999m5, m7, m8, m10) that this popup does not close the way it looks like it
+            # should. The first three attempts were all based on guesses from screenshots/partial
+            # error-log DOM excerpts and were each wrong in a different way:
+            #  - Attempt 1: Escape alone -- didn't work.
+            #  - Attempt 2: looked for a titlebar close icon scoped under `#searchPanel` directly --
+            #    wrong scope (see below).
+            #  - Attempt 3: assumed `#searchPanel` itself toggles visibility to indicate the popup is
+            #    open/closed, and clicked outside if so -- ALSO wrong, and this is what a proper live
+            #    DOM dump (2026-09-01, via a temporary discovery script that walked the ancestor
+            #    chain from the "Remark Code" text up) finally revealed why: `#searchPanel` is a
+            #    permanent, always-present, always-"invisible" (no styling of its own) OUTER wrapper
+            #    -- checking ITS visibility can never distinguish popup-open from popup-closed. The
+            #    REAL popup is a child of it: a PrimeFaces `ui-dialog` with a dynamic, reused id
+            #    (confirmed as `j_idt737` this run -- the SAME id family already seen recurring on
+            #    Event Details' own dialog/mask elsewhere in this file, so it is NOT stable across
+            #    page loads and must not be hardcoded). Its real titlebar, captured directly from the
+            #    live DOM, is genuinely a normal PrimeFaces close icon:
+            #    `<span class="ui-dialog-title">Remarks</span>
+            #     <a class="ui-dialog-titlebar-close" aria-label="Close">...</a>`
+            #    -- meaning attempt 2's ORIGINAL close-icon idea was the right shape all along; it
+            #    just queried the wrong scope (`#searchPanel a...` matches nothing, since the real
+            #    dialog is `#searchPanel`'s CHILD with its own generated id, not `#searchPanel`
+            #    itself) instead of finding the dialog by its stable title text.
             await page.keyboard.press("Escape")
             await page.wait_for_timeout(300)
-            still_open = await page.locator("#searchPanel").locator("visible=true").count() > 0
-            if still_open:
-                await page.mouse.click(10, 10)
+            close_btn = page.locator(
+                '#searchPanel [role="dialog"]:has-text("Remarks") a.ui-dialog-titlebar-close'
+            ).locator("visible=true").first
+            if await close_btn.count():
+                await close_btn.click(timeout=5000)
                 await page.wait_for_timeout(500)
             return False
         try:
