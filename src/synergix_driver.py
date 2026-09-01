@@ -992,7 +992,7 @@ class SynergixDriver:
         # non-datepicker field this method is also used for (Enquiry/Subject, Reference No., etc.).
         await field.evaluate("(el) => el.dispatchEvent(new Event('change', {bubbles: true}))")
 
-    async def _select_external_remark(self, remark_code: str, *, timeout_ms: int = 6000) -> bool:
+    async def _select_external_remark(self, remark_code: str, *, timeout_ms: int = 20000) -> bool:
         """Set the 'External Remarks' field via its magnifying-glass search picker, selecting the
         row whose Remark Code matches `remark_code` (e.g. "OCBC BANK DETAIL"). Returns whether a
         match was found and selected; leaves the field untouched otherwise.
@@ -1006,6 +1006,23 @@ class SynergixDriver:
         on empty cell space next to the link and left the textarea untouched, with no error â€” the
         same silent-failure shape documented throughout this file, just with the wrong element
         being the row instead of the link inside it.
+
+        Confirmed the popup closes ITSELF the instant the matching row is clicked (frame-by-frame
+        video review, 2026-09-01, JBTC WO Synergix.mp4 4:55-5:05) -- no separate dismiss step exists
+        in a working flow, matching the click-handler description above.
+
+        `timeout_ms` widened from 6000 to 20000 (2026-09-01) after five straight live "no match"
+        failures (WO-PO/99999m5, m7, m8, m10, m12, m13) all showed "OCBC BANK DETAIL" plainly visible
+        in the results table on the failure screenshot, yet the match poll gave up first. Timestamps
+        from the m13 run showed only ~6.8s elapsed between the prior step finishing and this method's
+        own "no match" warning firing -- i.e. right at the OLD 6000ms budget's edge -- consistent with
+        this being a genuine, occasional server-response-time race (the same class already documented
+        elsewhere in this file for the Event Details Confirm ajax, which can take up to ~18-30s), not
+        a permanently-broken selector. A `[id$="searchResultTable"]` (ends-with) vs.
+        `table[id*="searchResultTable"]` (contains) selector fix was also tried and shipped
+        separately (commit 9e3c20b) since a live error-log DOM excerpt showed the real ids continue
+        past that substring -- keep both fixes; if failures still recur after this widening, that
+        selector is the next thing to re-verify live, not this timeout.
         """
         assert self.page is not None
         page = self.page
