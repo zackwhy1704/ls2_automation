@@ -2363,16 +2363,15 @@ class SynergixDriver:
         else:
             await order_row.click(timeout=10000)
         await _wait_for_ajax_spinner("row selection")
-        # Fixed 5s wait after every click (2026-09-01), per the user's explicit, literal instruction
-        # after re-grounding this whole method in JBTC WO Synergix.mp4 6:00-8:00: "every click you
-        # must wait 5s... click on WO, wait 5s, select WO, wait 5s, toggle to employee, wait 5s...".
-        # This is IN ADDITION TO the real ajax-spinner wait above, not a replacement for it -- the
-        # spinner wait already proves the server's own response has landed; this fixed wait mirrors
-        # the further, real elapsed time a human naturally takes (reading the screen, moving the
-        # mouse) between actions, which the video itself shows matters (e.g. at least ~20s of real
-        # gap between Confirm closing and Submit being clicked, per the frame-by-frame record in
-        # docs/synergix_workflow.md) and which several of today's bugs (5, 6) trace back to skipping.
-        await page.wait_for_timeout(5000)
+        # Fixed 10s wait after clicking the quotation/order row (widened from 5s, 2026-09-02) per the
+        # user's explicit, live-demonstrated instruction: "click on quotation after filter and wait
+        # for the details to load 10s, then click on employee 10s and wait for employees list to
+        # load. then click on calendar entry." The Order Details panel on the right genuinely takes
+        # ~10s to fully load after selecting the row, and clicking Employee before it finishes leaves
+        # the calendar in a state where its clickable event cells never render -- the real cause of
+        # the "no add event cell found" blocker chased for a full session. IN ADDITION TO the
+        # ajax-spinner wait above, not a replacement.
+        await page.wait_for_timeout(10000)
 
         # CRITICAL FIX (2026-09-01), caught directly by the user from a live screenshot: a genuinely
         # FRESH WO's calendar is white/empty (matching the video's own 6:00-8:00 starting state --
@@ -2498,7 +2497,12 @@ class SynergixDriver:
         for _ in range(3):
             await _mouse_click_ui_button("Employee")
             await _wait_for_ajax_spinner("Employee toggle")
-            await page.wait_for_timeout(5000)  # fixed 5s wait after every click, see row-select comment above
+            # Fixed 10s wait after the Employee toggle (widened from 5s, 2026-09-02) per the user's
+            # live-demonstrated instruction: "click on employee 10s and wait for employees list to
+            # load. then click on calendar entry." The employees list / calendar cells need the full
+            # ~10s to render; clicking on before they're ready is what left the calendar with no
+            # findable add-event cell.
+            await page.wait_for_timeout(10000)
             employee_active = await page.evaluate(
                 """() => {
                     const btn = [...document.querySelectorAll('div.ui-button')]
@@ -2653,10 +2657,10 @@ class SynergixDriver:
                     await self._click_when_clear(row_checkbox_retry, timeout_ms=10000)
                 else:
                     await order_row.click(timeout=10000)
-                await page.wait_for_timeout(3000)
+                await page.wait_for_timeout(10000)  # 10s for Order Details to load, per the user
                 await _mouse_click_ui_button("Employee")
                 await _wait_for_ajax_spinner(f"Employee toggle retry round {round_num}")
-                await page.wait_for_timeout(3000)
+                await page.wait_for_timeout(10000)  # 10s for employees list/calendar to load
         if not new_event_btn_id:
             logger.warning("Stage C: no 'add event' cell found for %s after %d rounds "
                             "(~%.0fs total waited)", wo, max_rounds, total_waited_s)
